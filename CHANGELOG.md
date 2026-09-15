@@ -17,6 +17,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `browser_wait_for_navigation`: match a redirect by URL pattern and read its
   query parameters, backed by a navigation ring buffer, for OAuth/SSO/payment
   return flows
+- `npm run mcp:install`: run the server as a launchd daemon, so the bridge
+  outlives any single client and survives login
 - Optional launchd host-helper that spawns the browser on request
 - Accessibility-tree perception with redaction of password, OTP, and card fields
 - Kill switch (`npm run halt` / `npm run resume`) and audit log
@@ -30,3 +32,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   after a back/forward-cache restore
 - Dead-click escalation no longer fires on a pending navigation, which could
   double-submit a non-idempotent button
+- The bridge no longer drops after ~30s of inactivity. Chrome suspends an idle
+  extension service worker, and the alarm backstop only fires once a minute, so
+  tool calls could fail for up to a minute at a time. A 20s server heartbeat
+  keeps the worker resident, and callers now wait briefly for a genuine
+  reconnect instead of failing on a race

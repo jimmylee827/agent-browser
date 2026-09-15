@@ -11,6 +11,9 @@ interface Pending {
   timer: NodeJS.Timeout;
 }
 
+/** Comfortably inside Chrome's ~30s service-worker idle timeout. */
+const HEARTBEAT_MS = 20_000;
+
 /**
  * Localhost-only bridge. The MV3 extension service worker connects OUT to this
  * server (browser WebSocket can't set headers, so auth is the first message).
@@ -68,7 +71,24 @@ export class Bridge {
         this.audit.log("bridge.connected", { ip });
         ws.send(JSON.stringify({ type: "auth_ok" }));
         ws.on("message", (b) => this.onMessage(b.toString()));
+
+        // Keep the MV3 service worker alive.
+        //
+        // An extension service worker is torn down after ~30s idle, which
+        // closes this socket. The extension's chrome.alarms backstop rebuilds
+        // it, but alarms fire at most once a minute, leaving a window where
+        // the bridge is simply down and every tool call fails. Chrome resets
+        // the idle timer whenever the worker *receives* a WebSocket message,
+        // so a steady heartbeat from this side keeps it resident for as long
+        // as the browser is open. The extension ignores these frames.
+        const heartbeat = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "keepalive", ts: Date.now() }));
+          }
+        }, HEARTBEAT_MS);
+
         ws.on("close", () => {
+          clearInterval(heartbeat);
           if (this.client === ws) this.client = undefined;
           this.audit.log("bridge.disconnected", {});
         });
@@ -97,6 +117,24 @@ export class Bridge {
 
   connected(): boolean {
     return !!this.client && this.client.readyState === WebSocket.OPEN;
+  }
+
+  /**
+   * Resolve once the extension is attached, or false at the deadline.
+   *
+   * The heartbeat keeps the worker resident while it's connected, but there
+   * are still gaps where it isn't: the browser just started, the worker was
+   * evicted under memory pressure, or the extension was reloaded. In those
+   * cases it reconnects within seconds, so a caller should wait briefly
+   * rather than fail on a race it would have won.
+   */
+  async waitForConnection(timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (!this.connected()) {
+      if (Date.now() >= deadline) return false;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    return true;
   }
 
   /** Global kill switch: `touch ~/.agent-chrome/HALT` stops all browser actions. */

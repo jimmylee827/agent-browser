@@ -100,6 +100,8 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
     { timeoutMs: z.number().int().default(45_000) },
     async ({ timeoutMs }) => {
       if (ctx.bridge.connected()) return ok({ already: true, bridgeConnected: true });
+      if (await ctx.bridge.waitForConnection(8_000))
+        return ok({ already: true, bridgeConnected: true, waited: true });
       if (!hostHelper.available())
         return fail(
           "stealth Chrome not running and host helper unavailable",
@@ -131,6 +133,11 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
     },
     async ({ url }) => {
       // ensure running
+      if (!ctx.bridge.connected()) {
+        // The worker may just be reconnecting (browser starting, extension
+        // reloaded). Give it a moment before concluding nothing is there.
+        await ctx.bridge.waitForConnection(8_000);
+      }
       if (!ctx.bridge.connected()) {
         if (!hostHelper.available())
           return fail("agent browser not running", "install host helper, or run `npm run launch` on host");
@@ -222,6 +229,9 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
           return fail("HALTED: kill switch active", "rm ~/.agent-chrome/HALT to resume");
 
         // Ensure browser is running (same idempotent pattern as agent_browser_visit).
+        if (!ctx.bridge.connected()) {
+          await ctx.bridge.waitForConnection(8_000);
+        }
         if (!ctx.bridge.connected()) {
           if (!hostHelper.available())
             return fail("agent browser not running", "install host helper, or call agent_browser_ensure_running first");

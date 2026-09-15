@@ -43,6 +43,10 @@ function connect() {
       console.log("[agent-bridge] connected");
       return;
     }
+    // Server heartbeat. Nothing to do with the payload — simply RECEIVING it
+    // resets this worker's ~30s idle timer, which is what keeps the bridge up
+    // between tool calls instead of dying and waiting on the alarm backstop.
+    if (msg.type === "keepalive") return;
     if (!msg.id || !msg.method) return;
     try {
       const result = await dispatch(msg.method, msg.params || {});

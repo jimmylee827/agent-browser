@@ -50,10 +50,11 @@ npm run launch                       # opens Chrome on the agent profile
 Then, once: `chrome://extensions` → Developer mode → **Load unpacked** →
 select `packages/extension`.
 
-Register with Claude Code:
+Install the server as a background daemon, and point your client at it:
 
 ```bash
-claude mcp add agent-browser --scope user -- node "$PWD/packages/mcp-server/dist/index.js"
+npm run mcp:install     # launchd agent, starts at login, restarts on crash
+claude mcp add --transport http agent-browser http://127.0.0.1:8788/mcp --scope user
 ```
 
 Optional — auto-launch Chrome when it isn't running:
@@ -64,6 +65,25 @@ npm run host-helper:install
 
 Without it the browser tools still work; you just run `npm run launch` yourself
 when Chrome is closed.
+
+### Why a daemon rather than stdio
+
+The extension holds a persistent WebSocket to the bridge, so the bridge has to
+outlive any one client. A stdio MCP server lives only as long as the client that
+spawned it — between sessions the extension has nothing to connect to. And since
+the server owns fixed ports and exits if they're taken, two concurrent stdio
+clients fight and the second one dies. One long-lived server fixes both: any
+number of clients attach over HTTP.
+
+Stdio still works (`npm run mcp`) if you'd rather run it per-session; just don't
+run both.
+
+| | |
+| --- | --- |
+| `npm run mcp:status` | is it up? |
+| `npm run mcp:restart` | reload after `npm run build` |
+| `npm run mcp:logs` | follow stderr |
+| `npm run mcp:uninstall` | remove the launchd agent |
 
 ## Tools
 
@@ -136,14 +156,17 @@ there to make them fully autonomous.
 | Symptom | Fix |
 | ------- | --- |
 | `bridge not connected` | Is Chrome open on the agent profile? Is the extension loaded and enabled? |
-| Tools vanish in a second Claude Code session | The bridge port is single-owner; see below. |
 | Extension loaded but never connects | Re-run `node scripts/sync-ext-secret.mjs`, then reload the extension. |
+| Edited extension code, nothing changed | Chrome caches unpacked extensions. Hit reload ↻ on `chrome://extensions` — restarting the browser is often not enough. |
+| Daemon crash-looping in the logs | Something else holds `8787`/`8788`. The ports are single-owner; stop the other instance. |
 
-**Single-owner ports.** The server binds `8787`/`8788` and exits if they're
-taken, so only one instance can run at a time. Under stdio each Claude Code
-session spawns its own — so the second session's server dies on startup. If you
-routinely run parallel sessions, run one persistent server (`npm run mcp`) and
-point clients at the HTTP transport on `127.0.0.1:8788/mcp` instead.
+**Service-worker lifetime.** Chrome tears down an extension service worker after
+~30s idle, which would drop the bridge between tool calls and leave it down until
+the extension's alarm backstop fired up to a minute later. The server sends a
+heartbeat every 20s; receiving a WebSocket message resets that idle timer, so the
+worker stays resident while the browser is open. Calls that do arrive during a
+genuine reconnect (browser just started, extension reloaded) wait up to 8s rather
+than failing immediately.
 
 ## Uninstall
 
