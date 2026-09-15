@@ -1,0 +1,34 @@
+{
+  "profileDir": "~/.agent-chrome/profile",
+  "stateDir": "~/.agent-chrome",
+  "bridge": {
+    "host": "127.0.0.1",
+    "port": 8787,
+    "controlPort": 8788,
+    "secretFile": "~/.agent-chrome/bridge-secret",
+    "requestTimeoutMs": 30000
+  },
+  "policy": {
+    "comment": "Navigation and ordinary interaction are allowed everywhere. Only the action classes below escalate, and only off the trusted list. Add domains you want fully autonomous to trustedDomains.",
+    "trustedDomains": [],
+    "sensitiveActionClasses": [
+      "payment",
+      "delete_destructive",
+      "credential_entry",
+      "file_upload"
+    ],
+    "redactSelectors": [
+      "input[type=password]",
+      "input[autocomplete*=cc-]",
+      "input[autocomplete=one-time-code]",
+      "input[name*=otp]"
+    ]
+  },
+  "perception": {
+    "maxSnapshotTokensApprox": 4000,
+    "screenshotOnAmbiguity": true
+  },
+  "audit": {
+    "file": "~/.agent-chrome/audit.log"
+  }
+}

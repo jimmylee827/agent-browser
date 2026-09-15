@@ -1,0 +1,35 @@
+{
+  "name": "@agent-browser/mcp-server",
+  "version": "0.0.1",
+  "description": "MCP server for agent-browser: bridge + control plane + Streamable HTTP MCP + Claude CLI auth tools.",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "homepage": "https://github.com/jimmylee827/agent-browser/tree/main/packages/mcp-server#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jimmylee827/agent-browser.git",
+    "directory": "packages/mcp-server"
+  },
+  "bugs": {
+    "url": "https://github.com/jimmylee827/agent-browser/issues"
+  },
+  "bin": {
+    "agent-browser-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "node --experimental-strip-types --watch src/index.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "ws": "^8.18.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.12",
+    "typescript": "^5.6.0"
+  }
+}

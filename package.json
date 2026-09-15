@@ -1,0 +1,38 @@
+{
+  "name": "agent-browser",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "General-purpose AI browser-control platform (MV3 extension + MCP server). Stealth-first: no CDP.",
+  "license": "MIT",
+  "author": "jimmylee827",
+  "homepage": "https://github.com/jimmylee827/agent-browser#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jimmylee827/agent-browser.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jimmylee827/agent-browser/issues"
+  },
+  "workspaces": [
+    "packages/mcp-server"
+  ],
+  "scripts": {
+    "launch": "bin/launch-chrome.sh",
+    "build": "npm run build -w packages/mcp-server",
+    "mcp": "npm run start -w packages/mcp-server",
+    "mcp:dev": "npm run dev -w packages/mcp-server",
+    "host-helper:install": "node host-helper/install.mjs",
+    "host-helper:uninstall": "node host-helper/install.mjs --uninstall",
+    "host-helper:status": "curl -s http://127.0.0.1:8789/health || echo '(host helper not reachable)'",
+    "smoke": "node scripts/smoke.mjs",
+    "act-test": "node scripts/act-test.mjs",
+    "reset-profile": "bin/reset-profile.sh",
+    "halt": "mkdir -p ~/.agent-chrome && touch ~/.agent-chrome/HALT && echo 'KILL SWITCH ON — all browser actions blocked'",
+    "resume": "rm -f ~/.agent-chrome/HALT && echo 'kill switch off'",
+    "activity": "tail -f ~/.agent-chrome/audit.log"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
