@@ -126,7 +126,10 @@ async function waitForNavigation(params = {}) {
 
 // Read-only engine methods: re-running one after a dropped port changes nothing,
 // so they're safe to retry. Anything absent from this set may have side effects.
-const RETRY_SAFE = new Set(["ping", "observe", "locate", "waitForStable", "clearMarks"]);
+const RETRY_SAFE = new Set([
+  "ping", "observe", "locate", "waitForStable", "clearMarks",
+  "pageMetrics", "rectOf", "scrollToY", "hideFixed", "restoreFixed",
+]);
 
 async function callEngine(tabId, method, params) {
   // Target the TOP frame only — broadcasting lets cross-origin tracking
@@ -140,7 +143,9 @@ async function callEngine(tabId, method, params) {
     const neverDelivered = /Receiving end does not exist|Could not establish connection/.test(msg);
     // The port died mid-call because the document was torn down or pushed into
     // the back/forward cache. Whatever we sent MAY already have run.
-    const portClosed = /back\/forward cache|message channel is closed/.test(msg);
+    // Chrome words this two ways: "…message channel is closed" and "…the
+    // message channel closed before a response was received".
+    const portClosed = /back\/forward cache|message channel (is )?closed/.test(msg);
     if (!neverDelivered && !portClosed) throw e;
 
     // A closed port on a state-changing method is the signature of a SUCCESSFUL
@@ -180,8 +185,147 @@ async function callEngine(tabId, method, params) {
   }
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Chrome allows two captures a second; space them so stitching never trips it.
+let lastCaptureAt = 0;
+
+// The first capture after a navigation regularly fails with "image readback
+// failed" while the window is behind others: Chrome has no fresh frame for it
+// yet, and the failed request is what prompts one. Measured: fail, then an
+// immediate retry succeeds. So retry a few times before giving up.
 async function captureViewport(windowId) {
-  return await chrome.tabs.captureVisibleTab(windowId, { format: "png" });
+  let lastErr;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const wait = lastCaptureAt + 550 - Date.now();
+    if (wait > 0) await sleep(wait);
+    lastCaptureAt = Date.now();
+    try {
+      return await chrome.tabs.captureVisibleTab(windowId, { format: "png" });
+    } catch (e) {
+      lastErr = e;
+      if (!/readback|MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND/i.test(String(e.message || e))) break;
+    }
+  }
+  throw lastErr;
+}
+
+function bytesToBase64(buf) {
+  const bytes = new Uint8Array(buf);
+  let s = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+
+// Output images stay under 4000px per side: models reject images past 8000px,
+// and one tall strip is unreadable once scaled down, so long captures come
+// back as several tiles in page order.
+const TILE_MAX = 4000;
+// Bound a full-page capture: an infinite feed would otherwise scroll forever.
+const FULL_PAGE_MAX_CSS = 20000;
+
+// Capture a region of the page given in CSS pixels, page coordinates. Scrolls
+// slice by slice when the region is taller than the viewport and stitches the
+// slices; restores the scroll position afterwards. Regions are cut to the
+// viewport's width — horizontal scrolling is not stitched.
+async function captureRegion(tab, region, opts = {}) {
+  const m = await callEngine(tab.id, "pageMetrics", {});
+  const notes = [];
+  let { x, y, width, height } = region;
+  if (x < 0) { width += x; x = 0; }
+  if (x + width > m.innerWidth) { width = m.innerWidth - x; notes.push("cut to the viewport's width"); }
+  if (y < 0) { height += y; y = 0; }
+  if (y + height > m.scrollHeight) height = m.scrollHeight - y;
+  if (height > FULL_PAGE_MAX_CSS) { height = FULL_PAGE_MAX_CSS; notes.push(`cut at ${FULL_PAGE_MAX_CSS}px of page height`); }
+  if (width < 1 || height < 1) throw new Error("EMPTY_REGION: the region is outside the page");
+
+  const scale = opts.scale ?? m.devicePixelRatio;
+  const outW = Math.round(width * scale);
+  const outH = Math.round(height * scale);
+  const tiles = [];
+  for (let top = 0; top < outH; top += TILE_MAX) {
+    const h = Math.min(TILE_MAX, outH - top);
+    const canvas = new OffscreenCanvas(outW, h);
+    tiles.push({ canvas, ctx: canvas.getContext("2d"), top, h });
+  }
+
+  const fitsInView = y >= m.scrollY && y + height <= m.scrollY + m.innerHeight;
+  const maxScroll = Math.max(0, m.scrollHeight - m.innerHeight);
+  let hid = false;
+  let slices = 0;
+  let cur = y;
+  try {
+    while (cur < y + height) {
+      const viewTop = fitsInView ? m.scrollY : (await callEngine(tab.id, "scrollToY", { y: Math.min(cur, maxScroll) })).scrollY;
+      const sliceEnd = Math.min(y + height, viewTop + m.innerHeight);
+      if (sliceEnd <= cur) break; // the page would not scroll far enough
+      const bmp = await createImageBitmap(await (await fetch(await captureViewport(tab.windowId))).blob());
+      const k = bmp.width / m.innerWidth; // captured pixels per CSS pixel
+      // Paint this slice into every output tile it overlaps.
+      const dTop = (cur - y) * scale;
+      const dBottom = (sliceEnd - y) * scale;
+      for (const t of tiles) {
+        const a = Math.max(dTop, t.top);
+        const b = Math.min(dBottom, t.top + t.h);
+        if (b <= a) continue;
+        const srcY = (cur - viewTop + (a - dTop) / scale) * k;
+        const srcH = ((b - a) / scale) * k;
+        t.ctx.drawImage(bmp, x * k, srcY, width * k, srcH, 0, a - t.top, outW, b - a);
+      }
+      bmp.close();
+      slices += 1;
+      cur = sliceEnd;
+      if (!hid && cur < y + height) {
+        await callEngine(tab.id, "hideFixed", {});
+        hid = true;
+      }
+    }
+  } finally {
+    if (hid) await callEngine(tab.id, "restoreFixed", {}).catch(() => {});
+    if (!fitsInView) await callEngine(tab.id, "scrollToY", { y: m.scrollY }).catch(() => {});
+  }
+  if (cur < y + height)
+    notes.push(`only the top ${Math.round(cur - y)}px could be captured: the page stopped scrolling (it may scroll inside an inner element)`);
+
+  const type = opts.format === "jpeg" ? "image/jpeg" : "image/png";
+  const images = [];
+  for (const t of tiles) {
+    const blob = await t.canvas.convertToBlob({ type, quality: 0.85 });
+    images.push(`data:${type};base64,${bytesToBase64(await blob.arrayBuffer())}`);
+  }
+  return {
+    images,
+    region: { x, y, width, height },
+    scale,
+    slices,
+    viewport: { scrollX: m.scrollX, scrollY: m.scrollY, width: m.innerWidth, height: m.innerHeight, pageHeight: m.scrollHeight },
+    ...(notes.length ? { notes } : {}),
+  };
+}
+
+// Full page, one element (by ref), or a region; otherwise the viewport.
+async function screenshot(tab, params = {}) {
+  if (!params.fullPage && params.ref == null && !params.clip) {
+    const m = await callEngine(tab.id, "pageMetrics", {}).catch(() => null);
+    return {
+      screenshot: await captureViewport(tab.windowId),
+      url: tab.url,
+      ...(m ? { viewport: { scrollX: m.scrollX, scrollY: m.scrollY, width: m.innerWidth, height: m.innerHeight, pageHeight: m.scrollHeight } } : {}),
+    };
+  }
+  let region;
+  if (params.fullPage) {
+    const m = await callEngine(tab.id, "pageMetrics", {});
+    region = { x: 0, y: 0, width: m.innerWidth, height: m.scrollHeight };
+  } else if (params.ref != null) {
+    region = (await callEngine(tab.id, "rectOf", { ref: params.ref })).rect;
+  } else {
+    region = params.clip;
+  }
+  // A full page at device resolution is huge; default it to 1 image pixel per
+  // CSS pixel. Elements and regions keep full sharpness.
+  const scale = params.scale ?? (params.fullPage ? 1 : undefined);
+  return { url: tab.url, ...(await captureRegion(tab, region, { scale, format: params.format })) };
 }
 
 async function dispatch(method, params) {
@@ -205,13 +349,39 @@ async function dispatch(method, params) {
       const created = await chrome.tabs.create({ url: params.url, active: true });
       return { navigating: true, to: params.url, tabId: created.id, mode: "created_tab" };
     }
-    const tabForNav = (await chrome.tabs.query({ lastFocusedWindow: true, active: true }))[0];
-    if (!tabForNav) throw new Error("no tab for back/forward/reload");
-    if (params.action === "back") await chrome.tabs.goBack(tabForNav.id);
-    else if (params.action === "forward") await chrome.tabs.goForward(tabForNav.id);
-    else if (params.action === "reload") await chrome.tabs.reload(tabForNav.id);
-    else throw new Error("navigate: need url or back/forward/reload");
-    return { navigating: true, to: params.action, tabId: tabForNav.id };
+    const tabForNav = await activeTab();
+    if (params.action === "reload") {
+      await chrome.tabs.reload(tabForNav.id);
+      return { navigating: true, to: "reload", tabId: tabForNav.id };
+    }
+    if (params.action !== "back" && params.action !== "forward")
+      throw new Error("navigate: need url or back/forward/reload");
+    // Go through the page's own history.back()/forward(). chrome.tabs.goBack
+    // is the browser's Back button, and Chrome's Back button skips entries the
+    // user left without a gesture — which is every page this tool clicks away
+    // from. It went back two pages, or refused with "Cannot find a next page
+    // in history." when every earlier entry was skippable.
+    try {
+      const r = await callEngine(tabForNav.id, "navigate", { action: params.action });
+      if (r && r.error) throw new Error(r.error);
+      return { navigating: true, to: params.action, tabId: tabForNav.id, via: "page", ...r };
+    } catch (e) {
+      const msg = String(e.message || e);
+      // A port that closed as the page unloaded means the navigation started.
+      if (/PORT_CLOSED_AFTER_ACTION/.test(msg))
+        return { navigating: true, to: params.action, tabId: tabForNav.id, via: "page" };
+      // Fall back to the browser's own Back only when the page call never ran
+      // (no content script: chrome:// pages, PDFs). After any other failure
+      // the page may already be navigating, and a second Back would skip a page.
+      if (!/Receiving end does not exist|Could not establish connection|Cannot access/.test(msg)) throw e;
+      try {
+        if (params.action === "back") await chrome.tabs.goBack(tabForNav.id);
+        else await chrome.tabs.goForward(tabForNav.id);
+      } catch (browserErr) {
+        throw new Error(`${params.action} failed in the page (${msg}) and in the browser (${browserErr.message || browserErr})`);
+      }
+      return { navigating: true, to: params.action, tabId: tabForNav.id, via: "browser" };
+    }
   }
   const tab = await activeTab();
   if (method === "engine.ping") {
@@ -246,9 +416,7 @@ async function dispatch(method, params) {
   if (method === "engine.waitForNavigation") return await waitForNavigation(params);
   if (method === "engine.navHistory") return { navigations: NAV_LOG.slice(-25) };
   if (method === "engine.waitForStable") return await callEngine(tab.id, "waitForStable", params);
-  if (method === "engine.screenshot") {
-    return { screenshot: await captureViewport(tab.windowId), url: tab.url };
-  }
+  if (method === "engine.screenshot") return await screenshot(tab, params);
   throw new Error(`unknown method: ${method}`);
 }
 
@@ -458,4 +626,31 @@ chrome.alarms.onAlarm.addListener((a) => {
 chrome.runtime.onStartup.addListener(ensureConnected);
 chrome.runtime.onInstalled.addListener(ensureConnected);
 
+// Chrome keeps running an unpacked extension's cached service worker after
+// sw.js changes on disk — across browser restarts, and even past a manifest
+// version bump — until someone presses Reload on chrome://extensions. The
+// content engine is read fresh from disk, so after an update the two halves
+// silently disagree (this worker sat on a September build for a month). On
+// every start, check the code actually running against the file on disk and
+// reload once if they differ.
+async function reloadIfStale() {
+  try {
+    const disk = await (await fetch(chrome.runtime.getURL("src/sw.js"), { cache: "no-store" })).text();
+    const running = [connect, dispatch, callEngine, screenshot, captureRegion, robustClick, reloadIfStale];
+    if (running.every((fn) => disk.includes(String(fn)))) return;
+    // Remember which disk version we reloaded for, in storage that survives
+    // the reload, so a reload that doesn't take can never loop.
+    let h = 5381;
+    for (let i = 0; i < disk.length; i++) h = ((h * 33) ^ disk.charCodeAt(i)) >>> 0;
+    const { swReloadedFor } = await chrome.storage.local.get("swReloadedFor");
+    if (swReloadedFor === h) return;
+    await chrome.storage.local.set({ swReloadedFor: h });
+    console.log("[agent-bridge] running worker differs from src/sw.js on disk — reloading");
+    chrome.runtime.reload();
+  } catch (e) {
+    console.warn("[agent-bridge] stale-worker check failed", e);
+  }
+}
+
+reloadIfStale();
 ensureConnected();

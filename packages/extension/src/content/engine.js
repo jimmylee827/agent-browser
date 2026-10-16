@@ -7,7 +7,9 @@
 
 (() => {
   // Idempotent: re-injection (self-heal path) must not register a 2nd listener.
-  if (window.__ab_engine_loaded) return;
+  // An instance orphaned by an extension reload has lost chrome.runtime and
+  // can no longer answer, so it must not block its replacement.
+  if (window.__ab_engine_loaded && chrome.runtime?.id) return;
   window.__ab_engine_loaded = true;
   const AB = (window.__AB = window.__AB || { gen: 0, refs: new Map() });
   const REDACT_SEL = [
@@ -82,14 +84,9 @@
       if (lbl) n = lbl.textContent || "";
     }
     if (!n) n = el.closest("label")?.textContent || "";
-    if (!n)
-      n =
-        el.getAttribute("placeholder") ||
-        el.getAttribute("alt") ||
-        el.getAttribute("title") ||
-        "";
-    if (!n) {
-      const r = role(el);
+    if (!n) n = el.getAttribute("placeholder") || el.getAttribute("alt") || "";
+    const r = role(el);
+    if (!n.trim()) {
       if (r === "button" || r === "link" || /^h[1-6]$/i.test(el.tagName))
         n = el.textContent || "";
       // Icon-only controls (vote arrows, close buttons) carry their label on a
@@ -99,14 +96,29 @@
         n = c?.getAttribute("aria-label") || c?.getAttribute("alt") || c?.getAttribute("title") || "";
       }
     }
+    // A checkbox drawn by its neighbour (<input><label>Walk dog</label>, as in
+    // TodoMVC) has no programmatic label; the adjacent text is what a person reads.
+    if (!n.trim() && (r === "checkbox" || r === "radio")) {
+      const sib = [el.nextElementSibling, el.previousElementSibling].find((s) => s?.tagName === "LABEL");
+      n = sib?.textContent || "";
+    }
+    // title is a tooltip: the last resort, after the visible text. Taking it
+    // first named Wikipedia's links after their targets ("Special:Statistics").
+    if (!n.trim()) n = el.getAttribute("title") || "";
     return clip(n, 100);
   }
+
+  // Form controls at opacity 0 are still on top and still take the click: it
+  // is how custom-styled checkboxes and radios are built (the page paints a
+  // fake box underneath). Dropping them made those controls unreachable.
+  const FORM_CONTROL = new Set(["INPUT", "SELECT", "TEXTAREA"]);
 
   function visible(el) {
     const r = el.getBoundingClientRect();
     if (r.width <= 0 || r.height <= 0) return false;
     const s = getComputedStyle(el);
-    return s.visibility !== "hidden" && s.display !== "none" && s.opacity !== "0";
+    if (s.visibility === "hidden" || s.display === "none") return false;
+    return s.opacity !== "0" || FORM_CONTROL.has(el.tagName);
   }
 
   const inViewport = (el) => {
@@ -225,7 +237,7 @@
       ref += 1;
       el.setAttribute("data-ab-ref", String(ref));
       AB.refs.set(ref, el);
-      if (out.length >= maxNodes) {
+      if (out.length >= maxNodes || (opts.viewportOnly && !inViewport(el))) {
         omitted += 1;
         continue;
       }
@@ -282,22 +294,97 @@
   }
   const clearMarks = () => document.getElementById("__ab_marks")?.remove();
 
-  function observe(params = {}) {
+  // Resolve after the next painted frame, or after `ms` if frames are
+  // throttled (a hidden or occluded window never runs rAF).
+  const nextPaint = (ms = 150) =>
+    new Promise((r) => {
+      requestAnimationFrame(() => requestAnimationFrame(r));
+      setTimeout(r, ms);
+    });
+
+  // The page's visible text, with line breaks kept (collapsing every newline
+  // to a space ran headings into their paragraphs) and paged by offset so a
+  // long article is never cut off silently.
+  function readText(params = {}) {
+    // Leading indentation is kept (it carries the structure of JSON and code);
+    // runs of spaces inside a line and trailing spaces are squeezed.
+    const all = (document.body?.innerText || "")
+      .replace(/ /g, " ")
+      .replace(/(\S)[ \t]{2,}/g, "$1 ")
+      .replace(/[ \t]+\n/g, "\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+    const offset = Math.max(0, params.offset || 0);
+    const maxChars = params.maxChars || 8000;
+    const end = Math.min(all.length, offset + maxChars);
+    return {
+      text: all.slice(offset, end),
+      totalChars: all.length,
+      ...(end < all.length ? { truncated: true, nextOffset: end } : {}),
+    };
+  }
+
+  async function observe(params = {}) {
     const mode = params.mode || "semantic";
-    if (mode === "read") {
-      return {
-        url: location.href,
-        title: document.title,
-        text: clip(document.body?.innerText, 8000),
-      };
-    }
+    if (mode === "read") return { url: location.href, title: document.title, ...readText(params) };
     const snap = buildTree(params);
     if (mode === "marks") {
       drawMarks();
+      // The overlay has to reach the screen before the SW captures it, or the
+      // image comes back without it.
+      await nextPaint();
       snap.marksDrawn = true;
       snap.needsScreenshot = true; // SW captures via chrome.tabs.captureVisibleTab
     }
     return snap;
+  }
+
+  // ---- screenshot support: the SW captures the viewport; these let it scroll
+  //      the page and map an element or region to page coordinates.
+  function pageMetrics() {
+    const se = document.scrollingElement || document.documentElement;
+    return {
+      scrollX, scrollY, innerWidth, innerHeight,
+      scrollHeight: Math.max(se.scrollHeight, innerHeight),
+      devicePixelRatio,
+    };
+  }
+
+  async function scrollToY(p = {}) {
+    window.scrollTo({ top: p.y || 0, left: scrollX, behavior: "instant" });
+    await nextPaint(250);
+    return { scrollY };
+  }
+
+  function rectOf(p = {}) {
+    const el = resolve(p.ref, p.gen);
+    const r = el.getBoundingClientRect();
+    return { rect: { x: r.left + scrollX, y: r.top + scrollY, width: r.width, height: r.height } };
+  }
+
+  // Fixed and sticky elements (headers, cookie bars) would repeat in every
+  // slice of a stitched capture. Hide them after the first slice, then restore.
+  function hideFixed() {
+    // Already hidden: a second pass would record "hidden" as the original
+    // value and never restore it.
+    if (AB.hiddenFixed?.length) return { hidden: AB.hiddenFixed.length };
+    const hidden = [];
+    for (const el of document.body.querySelectorAll("*")) {
+      const pos = getComputedStyle(el).position;
+      if (pos !== "fixed" && pos !== "sticky") continue;
+      hidden.push([el, el.style.getPropertyValue("visibility"), el.style.getPropertyPriority("visibility")]);
+      el.style.setProperty("visibility", "hidden", "important");
+    }
+    AB.hiddenFixed = hidden;
+    return { hidden: hidden.length };
+  }
+  function restoreFixed() {
+    for (const [el, v, prio] of AB.hiddenFixed || []) {
+      if (v) el.style.setProperty("visibility", v, prio);
+      else el.style.removeProperty("visibility");
+    }
+    AB.hiddenFixed = [];
+    return { ok: true };
   }
 
   // Used by the action engine (task #6). Stale refs must be detectable.
@@ -458,16 +545,63 @@
     fire(el, "change");
   }
 
+  const NOT_TEXT = new Set(["checkbox", "radio", "button", "submit", "reset", "file", "image", "range", "color", "hidden"]);
+  const isTextField = (el) => el.tagName === "INPUT" && !NOT_TEXT.has((el.type || "text").toLowerCase());
+
+  // HTML implicit submission: Enter in a single-line field activates the
+  // form's default button, or submits a form that has only one such field.
+  // A real key press gets this from the browser; a synthetic keydown does not,
+  // so without it "fill, then press Enter" silently did nothing on
+  // Wikipedia's search box.
+  function implicitSubmit(form) {
+    const fields = [...form.elements];
+    const button = fields.find((f) => f.type === "submit" || f.type === "image");
+    if (button) {
+      if (!button.disabled) button.click();
+      return !button.disabled;
+    }
+    if (fields.filter(isTextField).length !== 1) return false;
+    form.requestSubmit();
+    return true;
+  }
+
   async function pressKey(el, key) {
     const t = el || document.activeElement || document.body;
-    fire(t, "keydown", { key });
-    fire(t, "keyup", { key });
+    const init = { key, bubbles: true, cancelable: true, composed: true };
+    // A handler that cancels the keydown owns the key; then the browser
+    // performs no default action, and neither do we.
+    const proceed = t.dispatchEvent(new KeyboardEvent("keydown", init));
+    if (proceed && (key === "Enter" || key.length === 1))
+      t.dispatchEvent(new KeyboardEvent("keypress", init));
+    t.dispatchEvent(new KeyboardEvent("keyup", init));
+    if (proceed && key === "Enter" && isTextField(t) && t.form) return { submitted: implicitSubmit(t.form) };
+    return {};
+  }
+
+  // Select by option value, or failing that by the text a person sees.
+  function selectOption(el, want) {
+    if (el.tagName !== "SELECT") {
+      const e = new Error("NOT_ACTIONABLE: select needs a <select> element"); e.code = "NOT_ACTIONABLE"; throw e;
+    }
+    const w = String(want ?? "").toLowerCase();
+    const opt =
+      [...el.options].find((o) => o.value === want) ||
+      [...el.options].find((o) => o.text.trim().toLowerCase() === w) ||
+      [...el.options].find((o) => o.text.toLowerCase().includes(w));
+    if (!opt) {
+      const e = new Error(`NO_SUCH_OPTION: no option matching "${want}"`); e.code = "NOT_ACTIONABLE"; throw e;
+    }
+    el.value = opt.value;
+    fire(el, "input");
+    fire(el, "change");
   }
 
   async function act(p = {}) {
     const el = resolve(p.ref, p.gen); // throws STALE_SNAPSHOT / REF_NOT_FOUND
     const before = { url: location.href, value: "value" in el ? el.value : undefined };
+    const checkedBefore = el.checked;
     let mutated = 0;
+    let extra = {};
     const mo = new MutationObserver((recs) => (mutated += recs.length));
     mo.observe(document.documentElement, { subtree: true, childList: true, attributes: true });
     try {
@@ -479,19 +613,14 @@
         case "type": await humanType(el, p.value ?? "", false); break;
         case "fill": await humanType(el, p.value ?? "", true); break;
         case "clear": await humanType(el, "", true); break;
-        case "press": await pressKey(el, p.value ?? "Enter"); break;
+        case "press": extra = await pressKey(el, p.value ?? "Enter"); break;
         case "check":
         case "uncheck": {
           const want = p.action === "check";
           if (!!el.checked !== want) await humanClick(el, cx, cy);
           break;
         }
-        case "select": {
-          const setter = nativeSetter(el) || ((v) => (el.value = v));
-          setter.call(el, p.value);
-          fire(el, "input"); fire(el, "change");
-          break;
-        }
+        case "select": selectOption(el, p.value); break;
         case "submit": (el.form || el.closest("form"))?.requestSubmit?.(); break;
         default: {
           const e = new Error(`unknown action: ${p.action}`); e.code = "BAD_ACTION"; throw e;
@@ -502,11 +631,14 @@
       mo.disconnect();
     }
     const after = { url: location.href, value: "value" in el ? el.value : undefined };
+    // A field's value and a checkbox's state are properties, not DOM
+    // mutations, so domMutations alone reads 0 for a fill that worked.
+    const valueChanged = before.value !== after.value || el.checked !== checkedBefore;
     return {
       acted: true,
       action: p.action,
-      changed: before.url !== after.url || before.value !== after.value || mutated > 0,
-      signals: { navigated: before.url !== after.url, domMutations: mutated },
+      changed: before.url !== after.url || valueChanged || mutated > 0 || !!extra.submitted,
+      signals: { navigated: before.url !== after.url, domMutations: mutated, valueChanged, ...extra },
       snapshotStale: true, // caller should re-observe
     };
   }
@@ -540,6 +672,7 @@
   }
 
   async function navigate(p = {}) {
+    const historyLength = history.length;
     if (p.action === "back") history.back();
     else if (p.action === "forward") history.forward();
     else if (p.action === "reload") location.reload();
@@ -547,7 +680,7 @@
     else {
       const e = new Error("navigate: need url or back/forward/reload"); e.code = "BAD_ACTION"; throw e;
     }
-    return { navigating: true, to: p.url || p.action };
+    return { navigating: true, to: p.url || p.action, historyLength };
   }
 
   // Re-injection must REPLACE the previous listener, never stack on it.
@@ -566,7 +699,12 @@
         const m = msg.method;
         if (m === "ping")
           sendResponse({ pong: true, url: location.href, title: document.title, ts: Date.now() });
-        else if (m === "observe") sendResponse(observe(msg.params));
+        else if (m === "observe") sendResponse(await observe(msg.params));
+        else if (m === "pageMetrics") sendResponse(pageMetrics());
+        else if (m === "scrollToY") sendResponse(await scrollToY(msg.params));
+        else if (m === "rectOf") sendResponse(rectOf(msg.params));
+        else if (m === "hideFixed") sendResponse(hideFixed());
+        else if (m === "restoreFixed") sendResponse(restoreFixed());
         else if (m === "locate") sendResponse(locate(msg.params));
         else if (m === "act") sendResponse(await act(msg.params));
         else if (m === "waitForStable") sendResponse(await waitForStable(msg.params));

@@ -11,14 +11,16 @@ description: |
   - "Find the link / button / field that says X and ..."
 
   Primary tools (use these — no `ref` / `snapshotGeneration` to track):
-  - `agent_browser_visit(url)` — navigate + wait + return accessibility tree
-  - `agent_browser_act({ name, role?, action, value? })` — find element by name + perform action + return new accessibility tree
+  - `agent_browser_visit({ url } | { history: "back" }, text?)` — navigate (or go back/forward/reload) + wait + return accessibility tree; `text: true` adds the page's visible text
+  - `agent_browser_act({ name, role?, action, value?, snapshot? })` — find element by name + perform action + return new accessibility tree
+  - `browser_observe({ mode: "read", offset? })` — the page's text, paged (prices, scores, articles, JSON)
+  - `browser_screenshot({ fullPage? | name? | ref? | clip? })` — viewport, whole page, one element, or a region
 
   Status / lifecycle:
   - `agent_browser_status()` — is the browser ready? (no side effects)
   - `agent_browser_ensure_running()` — idempotent launch (auto-fires on first visit, rarely needed manually)
 
-  Advanced primitives (`[advanced]` in their tool descriptions) — you almost never need these directly: `browser_observe`, `browser_locate`, `browser_navigate`, `browser_act`, `browser_wait`, `browser_screenshot`, `browser_robust_click`, `browser_wait_for_navigation`. They're available for surgical control when the high-level tools aren't enough.
+  Advanced primitives (`[advanced]` in their tool descriptions) — rarely needed: `browser_locate`, `browser_navigate`, `browser_act`, `browser_wait`, `browser_robust_click`, `browser_wait_for_navigation`.
 user-invocable: false
 ---
 
@@ -37,12 +39,22 @@ That's the whole pattern. No refs, no generations, no manual re-observation. Eac
 ## Patterns by intent
 
 ### "Get information from a page"
+
+The tree lists what you can act on — links, buttons, fields, headings. Plain
+text (paragraphs, prices, scores, a JSON response) is not in it. Ask for the
+text when you need to read:
+
 ```text
-snap = agent_browser_visit(url="https://example.com/article")
-# snap.tree[] has interactive + landmark nodes:
-#   { ref, role, name, interactive?, state? }
-# Use snap.title, snap.url, and walk snap.tree for headings/links.
+snap = agent_browser_visit({ url: "https://example.com/article", text: true })
+# snap.tree[]  — { ref, role, name, interactive?, state? }
+# snap.text    — the visible text, first 8000 chars, line breaks kept
+# snap.textTruncated / textNextOffset — there is more:
+browser_observe({ mode: "read", offset: snap.textNextOffset })   # next page of text
 ```
+
+A page with nothing interactive (a JSON response, a plain document) gets its
+text automatically. A long tree is capped at 220 nodes and says how many it
+`omitted`; `agent_browser_act` still finds the omitted ones by name.
 
 ### "Click a link or button by name"
 ```text
@@ -53,9 +65,33 @@ agent_browser_act({ name: "Pricing", action: "click" })
 ### "Search for something"
 ```text
 agent_browser_visit(url="https://google.com")
-agent_browser_act({ name: "Search", action: "fill", value: "accessibility tree" })  # fill input
-agent_browser_act({ name: "Search", action: "press", value: "Enter" })          # submit via Enter
+agent_browser_act({ name: "Search", action: "fill", value: "accessibility tree", snapshot: "none" })
+agent_browser_act({ name: "Search", action: "press", value: "Enter" })   # submits the form, like a real Enter
 ```
+
+If a result says `noEffect: true`, the action changed nothing — try another way
+(click the search button, or `action: "submit"`) instead of assuming it worked.
+
+### "Keep results small"
+
+Every act returns a snapshot. For a run of fills, pass `snapshot: "none"` (just
+url and title) or `"viewport"` (only what is on screen), and take a full one at
+the end.
+
+### "Go back"
+```text
+agent_browser_visit({ history: "back" })      # also "forward", "reload"
+```
+
+### "Take a screenshot"
+```text
+browser_screenshot()                                   # what is on screen
+browser_screenshot({ fullPage: true })                 # whole page, stitched; long pages come as several images
+browser_screenshot({ name: "Infobox", role: "table" }) # one element
+browser_screenshot({ clip: { x, y, width, height } })  # region, CSS px from the page's top-left
+```
+The result's `viewport.scrollY` converts what you see on screen into page
+coordinates for `clip`.
 
 ### "Fill out a form"
 ```text
@@ -119,6 +155,7 @@ Recent history is checked first, so a redirect that already landed still counts.
 | `focus` | move keyboard focus to element | no |
 | `check` / `uncheck` | for checkboxes/radios | no |
 | `submit` | submit the form containing the element | no |
+| `select` | pick a dropdown option, by its text or value | yes |
 
 ## Reading the result of `agent_browser_act`
 
@@ -130,10 +167,12 @@ Recent history is checked first, so a redirect that already landed still counts.
   "navigated": true,                                   // did the URL change?
   "urlBefore": "https://news.ycombinator.com/",
   "urlAfter":  "https://news.ycombinator.com/newest",
-  "signals": { "navigated": true, "domMutations": 87 },
+  "signals": { "navigated": true, "domMutations": 87, "valueChanged": false },
   "snapshotAfter": { url, title, counts, tree[] }      // fresh AX tree of the new state
 }
 ```
+
+When nothing changed, the result adds `"noEffect": true` and a `warning`.
 
 Feed `snapshotAfter.tree[]` to your next decision — you never have to call `observe` separately.
 
@@ -145,11 +184,14 @@ If `agent_browser_act` returns:
   "recovery": "call agent_browser_visit to refresh the page snapshot, OR widen the name ..." }
 ```
 
-Try in this order:
+When something similar exists, the recovery names it (`similar elements:
+combobox "Search Wikipedia"`) — pages change an element's role under you.
+
+Otherwise, try in this order:
 1. Drop the `role` filter (maybe it's a `link` not a `button`)
 2. Try a shorter or different substring of the visible label
 3. Call `agent_browser_visit` again to refresh — the page may have changed
-4. Fall back to `browser_observe` ([advanced]) to inspect the actual nodes on the page
+4. Fall back to `browser_observe` to inspect the actual nodes on the page
 
 ## Safety / policy
 

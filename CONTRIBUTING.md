@@ -38,9 +38,20 @@ npm run smoke    # in another
 
 ### Working on the extension
 
-Chrome caches unpacked extensions aggressively. After editing anything under
-`packages/extension/`, click the reload icon on `chrome://extensions` — a
-browser restart alone is often not enough.
+The content engine (`src/content/engine.js`) is read from disk on each
+injection, so reloading the page picks up changes.
+
+The service worker (`src/sw.js`) is different: Chrome keeps running its cached
+copy across browser restarts, and even past a manifest version bump. The
+worker checks itself on every start: if its running code no longer matches
+`src/sw.js` on disk, it reloads the extension once. So after editing it,
+restart the agent Chrome — or just wait: the worker wakes at least once a
+minute — and the new code takes over. Reload on `chrome://extensions` still
+works too.
+
+One caveat: the check compares function bodies, so a change confined to a
+top-level constant is not detected. Restarting Chrome won't pick that up
+either — press reload on `chrome://extensions`.
 
 ## Commit style
 

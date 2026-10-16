@@ -94,20 +94,23 @@ run both.
 
 | Tool | What it does |
 | ---- | ------------ |
-| `agent_browser_visit(url)` | Navigate, wait for the page to settle, return an accessibility tree. |
-| `agent_browser_act({name, role?, action, value?})` | Find an element by accessible name, act on it, wait, return the new tree. |
+| `agent_browser_visit({url} \| {history}, text?)` | Navigate — or go back / forward / reload — wait for the page to settle, return an accessibility tree. `text: true` adds the visible text. |
+| `agent_browser_act({name, role?, action, value?, snapshot?})` | Find an element by accessible name, act on it, wait, return the new tree. Says `noEffect` when nothing changed. |
+| `browser_observe({mode: "read", offset?})` | The page's visible text, paged. |
+| `browser_screenshot({fullPage? \| name? \| ref? \| clip?})` | Viewport, whole page (stitched), one element, or a region. |
 | `agent_browser_status()` | Is the browser ready? No side effects. |
 | `agent_browser_ensure_running()` | Idempotent launch (auto-fires on first visit). |
 
 `action` is one of `click | type | fill | clear | press | hover | focus |
-check | uncheck | submit`. Name matching is case-insensitive substring; pass
-`role` when a name is ambiguous.
+check | uncheck | submit | select`. Name matching is case-insensitive
+substring; pass `role` when a name is ambiguous. `snapshot` is `full`
+(default), `viewport`, or `none` — use the smaller ones for a run of fills.
 
 ### Advanced primitives
 
-`browser_status` · `browser_ping` · `browser_observe` · `browser_locate` ·
-`browser_navigate` · `browser_act` · `browser_wait` · `browser_screenshot` ·
-`browser_robust_click` · `browser_wait_for_navigation`
+`browser_status` · `browser_ping` · `browser_locate` · `browser_navigate` ·
+`browser_act` · `browser_wait` · `browser_robust_click` ·
+`browser_wait_for_navigation`
 
 Ref-based, for surgical control. Most agents never need them.
 

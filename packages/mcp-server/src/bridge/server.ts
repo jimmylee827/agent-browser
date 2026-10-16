@@ -143,11 +143,15 @@ export class Bridge {
   }
 
   /** Send a command to the extension engine and await its correlated reply. */
-  request<T = unknown>(method: string, params: Record<string, unknown> = {}): Promise<T> {
+  request<T = unknown>(
+    method: string,
+    params: Record<string, unknown> = {},
+    timeoutMs = this.cfg.bridge.requestTimeoutMs,
+  ): Promise<T> {
     if (this.halted()) {
       this.audit.log("bridge.halted", { method });
       return Promise.reject(
-        new Error("HALTED: kill switch active (~/.agent-chrome/HALT). rm it to resume."),
+        new Error("HALTED: kill switch active — the user stopped all browser actions"),
       );
     }
     if (!this.connected()) {
@@ -160,7 +164,7 @@ export class Bridge {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`bridge request timeout: ${method}`));
-      }, this.cfg.bridge.requestTimeoutMs);
+      }, timeoutMs);
       this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer });
       this.client!.send(JSON.stringify({ id, method, params }));
     });

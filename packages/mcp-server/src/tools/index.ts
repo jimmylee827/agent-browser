@@ -22,7 +22,7 @@ const DRY_RUN = process.env.AB_DRY_RUN === "1";
  * Matched on the raw text as well as our own tagged error, because the string
  * can reach us from either the extension or the bridge.
  */
-const PORT_DIED = /PORT_CLOSED_AFTER_ACTION|back\/forward cache|message channel is closed|Receiving end does not exist/i;
+const PORT_DIED = /PORT_CLOSED_AFTER_ACTION|back\/forward cache|message channel (is )?closed|Receiving end does not exist/i;
 
 interface Ctx {
   bridge: Bridge;
@@ -43,6 +43,13 @@ function imageContent(dataUrl: unknown) {
   if (!m) return null;
   return { type: "image" as const, data: m[2], mimeType: m[1] };
 }
+// The kill switch is the human's. Telling an agent how to remove it — as the
+// old "rm ~/.agent-chrome/HALT to resume" did — invites it to.
+const HALT_ADVICE = "the user has switched on the kill switch: stop and tell them; do not try to turn it off";
+// Same principle for the policy gate: the decision belongs to the user.
+const POLICY_ADVICE =
+  "this needs the user's approval: stop and ask them. Do not retry it, relabel it, or change the policy yourself";
+
 const fail = (msg: string, recovery: string) => ({
   isError: true,
   content: [{ type: "text" as const, text: JSON.stringify({ error: msg, recovery }, null, 2) }],
@@ -71,8 +78,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
     // The worker may just be reconnecting (browser starting, extension
     // reloaded). Give it a moment before concluding nothing is there.
     if (await ctx.bridge.waitForConnection(8_000)) return { already: true };
-    if (existsSync(resolve(ctx.cfg.stateDir, "HALT")))
-      return fail("HALTED: kill switch active", "rm ~/.agent-chrome/HALT to resume");
+    if (existsSync(resolve(ctx.cfg.stateDir, "HALT"))) return fail("HALTED: kill switch active", HALT_ADVICE);
     const launchedVia = await launchBrowser();
     ctx.audit.log("browser.launch", { via: launchedVia });
     const t0 = Date.now();
@@ -85,6 +91,57 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
     );
   }
   const isFail = (r: object): r is ReturnType<typeof fail> => "isError" in r;
+
+  /**
+   * Recovery advice that matches the actual state. A fixed "ensure agent
+   * Chrome is launched" sent agents chasing a browser that was running fine.
+   */
+  const advise = (e: unknown, fallback: string) => {
+    const msg = (e as Error).message ?? String(e);
+    if (/HALTED/.test(msg)) return HALT_ADVICE;
+    if (!ctx.bridge.connected()) return "the browser is not connected: call agent_browser_ensure_running, then retry";
+    if (/STALE_SNAPSHOT|REF_NOT_FOUND/.test(msg)) return "the page changed: take a fresh snapshot (agent_browser_visit / browser_observe), then retry";
+    if (/NOT_ACTIONABLE/.test(msg)) return "element not actionable (hidden, disabled, or covered): wait or scroll, then retry";
+    return fallback;
+  };
+  const failWith = (e: unknown, fallback: string) => fail((e as Error).message ?? String(e), advise(e, fallback));
+
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const ping = async () =>
+    (await ctx.bridge.request("engine.ping", {})) as {
+      tab?: { url?: string; title?: string; status?: string };
+      engine?: { error?: string };
+    };
+
+  type Snap = Record<string, unknown> & { url?: string; tree?: unknown[] };
+  const settleAndObserve = async (observe: Record<string, unknown> = {}) => {
+    await ctx.bridge.request("engine.waitForStable", { timeout: 8000, quietMs: 600 }).catch(() => {});
+    return (await ctx.bridge.request("engine.observe", { mode: "semantic", ...observe })) as Snap;
+  };
+
+  /**
+   * Add the page's visible text to a snapshot when asked, and always when the
+   * tree is empty — a JSON response or a page of prose has nothing to click,
+   * and an empty tree with no hint left agents stuck.
+   */
+  const attachText = async (snap: Snap, wanted: boolean): Promise<Snap> => {
+    const empty = Array.isArray(snap.tree) && snap.tree.length === 0;
+    if (!wanted && !empty) return snap;
+    const r = (await ctx.bridge.request("engine.observe", { mode: "read" }).catch(() => null)) as {
+      text?: string;
+      truncated?: boolean;
+      nextOffset?: number;
+    } | null;
+    if (!r) return snap;
+    return {
+      ...snap,
+      ...(empty && !wanted ? { hint: "nothing interactive on this page; its text is included" } : {}),
+      text: r.text,
+      ...(r.truncated
+        ? { textTruncated: true, textNextOffset: r.nextOffset, textHint: "more text: browser_observe({mode:\"read\", offset: textNextOffset})" }
+        : {}),
+    };
+  };
 
   // ============================================================
   // HIGH-LEVEL INTENT TOOLS — preferred for AI agents
@@ -140,20 +197,57 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
   server.tool(
     "agent_browser_visit",
     [
-      "Navigate the persistent agent browser to a URL (policy-gated), wait for it to ",
-      "settle, and return a compact accessibility-tree snapshot. Auto-ensures the ",
-      "browser is running first. Use this for read/observe tasks.",
+      "Navigate the persistent agent browser to a URL — or go back / forward / reload — ",
+      "wait for it to settle, and return a compact accessibility-tree snapshot of the ",
+      "links, buttons, fields and headings. Pass text:true to also get the page's ",
+      "visible text (paragraphs, prices, scores, JSON); it is included automatically ",
+      "when the page has nothing interactive. Auto-ensures the browser is running first.",
     ].join(""),
     {
-      url: z.string().url(),
+      url: z.string().url().optional().describe("Page to open. Give this or `history`."),
+      history: z
+        .enum(["back", "forward", "reload"])
+        .optional()
+        .describe("Move through this tab's history instead of opening a URL."),
+      text: z.boolean().default(false).describe("Also return the page's visible text (first 8000 chars; the result says how to page on)."),
     },
-    async ({ url }) => {
+    async ({ url, history, text }) => {
+      if (!url === !history) return fail("give exactly one of url or history", "e.g. {url:\"https://…\"} or {history:\"back\"}");
       const up = await ensureBrowser(45_000);
       if (isFail(up)) return up;
+      if (history) {
+        try {
+          const before = (await ping()).tab?.url ?? "";
+          await ctx.bridge.request("engine.navigate", { action: history });
+          // Done when the URL moves (back/forward) or the reload has finished
+          // and the content engine answers again.
+          const t0 = Date.now();
+          let landed = false;
+          while (!landed && Date.now() - t0 < 10_000) {
+            await sleep(300);
+            const p = await ping().catch(() => null);
+            if (!p || p.engine?.error) continue;
+            landed = history === "reload"
+              ? Date.now() - t0 > 600 && p.tab?.status === "complete"
+              : (p.tab?.url ?? "") !== before;
+          }
+          if (!landed)
+            return fail(
+              `${history} did not change the page (still on ${before})`,
+              `there may be no ${history === "back" ? "earlier" : "later"} page in this tab's history; open the page with agent_browser_visit({url}) instead`,
+            );
+          const snap = await attachText(await settleAndObserve(), text);
+          ctx.audit.log("tool.agent_browser_visit", { history, from: before, to: snap.url });
+          return ok(snap);
+        } catch (e) {
+          return failWith(e, "retry; if it repeats, open the page with agent_browser_visit({url})");
+        }
+      }
       // Navigation is read-only and unrestricted — any URL is fair game. The
       // sensitive-action gate lives in agent_browser_act, and only for the
       // action classes a caller explicitly labels.
       try {
+        url = url!;
         await ctx.bridge.request("engine.navigate", { url });
 
         // Poll until the active tab has committed to the new origin AND the
@@ -175,10 +269,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
             if (!tabUrl) continue;
             const h = new URL(tabUrl).hostname;
             if (h === wantHost || h.endsWith("." + wantHost) || wantHost.endsWith("." + h)) {
-              await ctx.bridge
-                .request("engine.waitForStable", { timeout: 8000, quietMs: 600 })
-                .catch(() => {});
-              const snap = await ctx.bridge.request("engine.observe", { mode: "semantic" });
+              const snap = await attachText(await settleAndObserve(), text);
               ctx.audit.log("tool.agent_browser_visit", { url });
               return ok(snap);
             }
@@ -201,16 +292,21 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
       "the action, waits for the page to settle, and returns the post-action accessibility-tree ",
       "snapshot. No ref/snapshot-generation bookkeeping needed — this tool handles it. ",
       "Pair with agent_browser_visit (read) for the full read-and-do agentic loop. ",
+      "If the action changed nothing on the page, the result says so (noEffect + warning). ",
       "Policy-gated; sensitive actions on untrusted domains escalate.",
     ].join(""),
     {
       name: z.string().describe("Accessible name (button label, link text, input placeholder/label) — case-insensitive substring match"),
       role: z.string().optional().describe("Optional role filter: button, link, textbox, checkbox, combobox, etc. Recommended when the name is ambiguous."),
       action: z
-        .enum(["click", "type", "fill", "clear", "press", "hover", "focus", "check", "uncheck", "submit"])
+        .enum(["click", "type", "fill", "clear", "press", "hover", "focus", "check", "uncheck", "submit", "select"])
         .default("click")
-        .describe("click (default) | type (append text) | fill (replace text) | clear | press (key, value=key) | hover | focus | check | uncheck | submit"),
-      value: z.string().optional().describe("Required for type/fill/press; for press it's the key (e.g. \"Enter\")"),
+        .describe("click (default) | type (append text) | fill (replace text) | clear | press (key, value=key; Enter in a form field submits it) | hover | focus | check | uncheck | submit | select (dropdown; value = option text or value)"),
+      value: z.string().optional().describe("Required for type/fill/press/select; for press it's the key (e.g. \"Enter\")"),
+      snapshot: z
+        .enum(["full", "viewport", "none"])
+        .default("full")
+        .describe("What snapshotAfter holds: full (default), viewport (only what is on screen — much smaller), none (just url and title; use for a run of fills)"),
       actionClass: z
         .string()
         .optional()
@@ -225,24 +321,18 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         ),
       session: z.string().default("default"),
     },
-    async ({ name, role, action, value, actionClass, robust, session }) => {
+    async ({ name, role, action, value, actionClass, robust, snapshot, session }) => {
       try {
-        if (existsSync(resolve(ctx.cfg.stateDir, "HALT")))
-          return fail("HALTED: kill switch active", "rm ~/.agent-chrome/HALT to resume");
+        if (existsSync(resolve(ctx.cfg.stateDir, "HALT"))) return fail("HALTED: kill switch active", HALT_ADVICE);
 
         const up = await ensureBrowser(45_000);
         if (isFail(up)) return up;
 
         // Policy gate: only fires for an explicitly labelled sensitive class.
         // A plain click/type/submit is an ordinary action anywhere on the web.
-        const ping = (await ctx.bridge.request("engine.ping", {})) as { tab?: { url?: string } };
-        const tabUrl = ping.tab?.url ?? "";
+        const tabUrl = (await ping()).tab?.url ?? "";
         const d = ctx.policy.evaluate({ url: tabUrl, actionClass });
-        if (!d.allow)
-          return fail(
-            `blocked by policy: ${d.reason}`,
-            "sensitive action needs human approval — add the domain to policy.trustedDomains in config/default.json if you want it autonomous",
-          );
+        if (!d.allow) return fail(`blocked by policy: ${d.reason}`, POLICY_ADVICE);
 
         if (DRY_RUN)
           return ok({
@@ -259,11 +349,24 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
             matches?: { ref: number; role: string; name: string }[];
           };
           const match = loc.matches?.[0];
-          if (!match)
+          if (!match) {
+            // Say what IS there. Pages change an element's role under you
+            // (Wikipedia's search box turns from searchbox into combobox once
+            // its suggestions open), and a bare "no element" hides that.
+            const near = async (q: { role?: string; name?: string }) =>
+              ((await ctx.bridge.request("engine.locate", q).catch(() => ({}))) as typeof loc).matches ?? [];
+            let similar = role ? await near({ name }) : [];
+            if (!similar.length) {
+              const word = name.split(/\s+/).sort((a, b) => b.length - a.length)[0];
+              if (word && word.length >= 3 && word !== name) similar = await near({ name: word });
+            }
             return fail(
               `no element matching role=${role ?? "any"} name="${name}" on ${tabUrl}`,
-              "call agent_browser_visit to refresh the page snapshot, OR widen the name to a less specific substring",
+              similar.length
+                ? `similar elements: ${similar.slice(0, 5).map((m) => `${m.role} "${m.name}"`).join(", ")} — retry with one of those`
+                : "call agent_browser_visit to refresh the page snapshot, OR widen the name to a less specific substring",
             );
+          }
 
           // 2. Act with the just-located ref + matching generation.
           //
@@ -330,47 +433,64 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
           // chrome:// is in the way — that's a degraded result, not a failed
           // action. Reporting it as an error would invite the agent to retry
           // and perform the action twice.
-          let after: Record<string, unknown>;
+          let after: Snap;
           try {
-            after = (await ctx.bridge.request("engine.observe", { mode: "semantic" })) as Record<
-              string,
-              unknown
-            >;
+            if (snapshot === "none") {
+              const p = await ping();
+              after = { url: p.tab?.url, title: p.tab?.title };
+            } else {
+              after = await attachText(
+                (await ctx.bridge.request("engine.observe", {
+                  mode: "semantic",
+                  viewportOnly: snapshot === "viewport",
+                })) as Snap,
+                false,
+              );
+            }
           } catch (obsErr) {
-            const ping = (await ctx.bridge
-              .request("engine.ping", {})
-              .catch(() => ({}))) as { tab?: { url?: string; title?: string } };
+            const p = await ping().catch(() => ({}) as Awaited<ReturnType<typeof ping>>);
             ctx.audit.log("act.observe_failed", { name, action, msg: (obsErr as Error).message });
             after = {
-              url: ping.tab?.url,
-              title: ping.tab?.title,
+              url: p.tab?.url,
+              title: p.tab?.title,
               snapshotUnavailable: (obsErr as Error).message,
               hint: "action succeeded; call agent_browser_visit or browser_observe for a fresh tree",
             };
           }
 
-          ctx.audit.log("tool.agent_browser_act", { name, role, action, urlBefore: tabUrl, urlAfter: (after as { url?: string }).url });
+          // One answer to "did we navigate", measured after the settle. The
+          // engine's own flag is taken 60ms after the action, before most
+          // navigations commit, so the two used to disagree.
+          const navigated = tabUrl !== after.url;
+          // An action meant to change something that changed nothing is not a
+          // success. The Enter that did nothing on Wikipedia came back as a
+          // plain `acted: true`; say so instead, so the caller tries another way.
+          const noEffect =
+            !["hover", "focus"].includes(action) && !navigated && result.changed === false;
+          const warning = !noEffect
+            ? undefined
+            : escalated === "robust"
+              ? "the first click changed nothing; a page-world retry ran and the URL did not change. Check snapshotAfter before assuming it worked"
+              : "nothing on the page changed (no navigation, no DOM or value change): this probably did not do what you intended";
+
+          ctx.audit.log("tool.agent_browser_act", { name, role, action, urlBefore: tabUrl, urlAfter: after.url, noEffect });
           return ok({
             acted: true,
             target: { ref: match.ref, role: match.role, name: match.name },
             action,
             value,
-            signals: result.signals ?? {},
+            signals: { ...(result.signals ?? {}), navigated },
             escalated,
-            navigated: tabUrl !== (after as { url?: string }).url,
+            navigated,
+            ...(noEffect ? { noEffect, warning } : {}),
             urlBefore: tabUrl,
-            urlAfter: (after as { url?: string }).url,
+            urlAfter: after.url,
             snapshotAfter: after,
           });
         });
       } catch (e) {
-        const msg = (e as Error).message;
-        const recovery = /STALE_SNAPSHOT|REF_NOT_FOUND/.test(msg)
-          ? "the page changed under us — call agent_browser_visit OR re-call agent_browser_act with the same name (a fresh locate runs internally)"
-          : /NOT_ACTIONABLE/.test(msg)
-            ? "element not actionable (hidden/disabled/covered); wait or scroll, then retry"
-            : "retry after agent_browser_status reports bridgeConnected:true";
-        return fail(msg, recovery);
+        // The action may already have run, so never advise a blind retry.
+        return failWith(e, "check the page (agent_browser_visit) before retrying — the action may have run");
       }
     },
   );
@@ -399,22 +519,28 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         ctx.audit.log("tool.browser_ping", { session });
         return ok(r);
       } catch (e) {
-        return fail((e as Error).message, "ensure agent Chrome is launched and a tab is open");
+        return failWith(e, "open a tab, then retry");
       }
     },
   );
 
   server.tool(
     "browser_observe",
-    "[advanced] Observe the active tab. Prefer `agent_browser_visit` for read tasks. semantic=compact synthetic accessibility tree w/ stable refs (default); read=distilled text; marks=tree + numbered screenshot overlay.",
+    [
+      "Observe the active tab without navigating. semantic = the accessibility tree with refs ",
+      "(default); read = the page's visible text, paged with offset/maxChars (the result gives ",
+      "nextOffset while there is more); marks = tree plus a screenshot with each ref's number drawn on.",
+    ].join(""),
     {
       session: z.string().default("default"),
       mode: z.enum(["semantic", "read", "marks"]).default("semantic"),
+      offset: z.number().int().min(0).optional().describe("read mode: character offset to start from"),
+      maxChars: z.number().int().min(100).max(50_000).optional().describe("read mode: how much text to return (default 8000)"),
     },
-    async ({ session, mode }) => {
+    async ({ session, mode, offset, maxChars }) => {
       try {
         const r = (await ctx.sessions.withLock(session, () =>
-          ctx.bridge.request("engine.observe", { session, mode }),
+          ctx.bridge.request("engine.observe", { session, mode, offset, maxChars }),
         )) as Record<string, unknown>;
         ctx.audit.log("tool.browser_observe", { session, mode });
         const img = imageContent(r.screenshot);
@@ -425,7 +551,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         ];
         return { content };
       } catch (e) {
-        return fail((e as Error).message, "re-launch agent Chrome or open a tab, then retry");
+        return failWith(e, "retry; if it repeats, call agent_browser_status");
       }
     },
   );
@@ -446,7 +572,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         ctx.audit.log("tool.browser_locate", { session, role, name });
         return ok(r);
       } catch (e) {
-        return fail((e as Error).message, "open a page then retry");
+        return failWith(e, "open a page, then retry");
       }
     },
   );
@@ -460,7 +586,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
 
   server.tool(
     "browser_navigate",
-    "[advanced] Low-level navigate. Prefer `agent_browser_visit`. url=go to URL, or action=back|forward|reload. Policy-gated.",
+    "[advanced] Start a navigation and return at once, without waiting for the page or returning a snapshot. Prefer `agent_browser_visit` ({url} or {history}), which waits and returns the new page. url=go to URL, or action=back|forward|reload.",
     {
       session: z.string().default("default"),
       url: z.string().url().optional(),
@@ -479,7 +605,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         ctx.audit.log("tool.browser_navigate", { session, target });
         return ok(r);
       } catch (e) {
-        return fail((e as Error).message, "ensure agent Chrome is launched");
+        return failWith(e, "retry; or open the page with agent_browser_visit({url})");
       }
     },
   );
@@ -504,28 +630,28 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         const d = ctx.policy.evaluate({ url, actionClass });
         if (!d.allow) {
           ctx.audit.log("policy.block", { tool: "browser_act", url, action, reason: d.reason });
-          return fail(
-            `blocked by policy: ${d.reason}`,
-            "sensitive action needs human approval — add the domain to policy.trustedDomains in config/default.json if you want it autonomous",
-          );
+          return fail(`blocked by policy: ${d.reason}`, POLICY_ADVICE);
         }
         if (DRY_RUN) {
           ctx.audit.log("dryrun.browser_act", { url, action, ref });
           return ok({ dryRun: true, wouldAct: { action, ref, value }, url, policy: d.reason });
         }
-        const r = await ctx.sessions.withLock(session, () =>
-          ctx.bridge.request("engine.act", { ref, gen, action, value }),
-        );
+        let r: unknown;
+        try {
+          r = await ctx.sessions.withLock(session, () =>
+            ctx.bridge.request("engine.act", { ref, gen, action, value }),
+          );
+        } catch (e) {
+          // Same rule as agent_browser_act: a port that closed mid-action means
+          // the action navigated — it ran. This used to come back as an error
+          // advising "re-observe and retry", i.e. firing it a second time.
+          if (!PORT_DIED.test((e as Error).message)) throw e;
+          r = { acted: true, changed: true, signals: { navigated: true, portClosed: true }, snapshotStale: true };
+        }
         ctx.audit.log("tool.browser_act", { session, url, action, ref });
         return ok(r);
       } catch (e) {
-        const msg = (e as Error).message;
-        const recovery = /STALE_SNAPSHOT|REF_NOT_FOUND/.test(msg)
-          ? "call browser_observe again to refresh refs, then retry"
-          : /NOT_ACTIONABLE/.test(msg)
-            ? "element not actionable; wait or scroll, then re-observe"
-            : "re-observe and retry";
-        return fail(msg, recovery);
+        return failWith(e, "re-observe before retrying — the action may have run");
       }
     },
   );
@@ -553,7 +679,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         ctx.audit.log("tool.browser_robust_click", { session, ref });
         return ok(r);
       } catch (e) {
-        return fail((e as Error).message, "re-observe to refresh refs, then retry");
+        return failWith(e, "re-observe before retrying — the click may have run");
       }
     },
   );
@@ -593,7 +719,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
           );
         return ok(r);
       } catch (e) {
-        return fail((e as Error).message, "ensure the browser is running and a tab is open");
+        return failWith(e, "retry; if it repeats, call agent_browser_status");
       }
     },
   );
@@ -614,27 +740,75 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         ctx.audit.log("tool.browser_wait", { session });
         return ok(r);
       } catch (e) {
-        return fail((e as Error).message, "ensure a tab is open");
+        return failWith(e, "retry; if it repeats, call agent_browser_status");
       }
     },
   );
 
   server.tool(
     "browser_screenshot",
-    "[advanced] Capture the active tab's visible viewport (PNG) without CDP.",
-    { session: z.string().default("default") },
-    async ({ session }) => {
+    [
+      "Screenshot the active tab, without CDP. With no options: the visible viewport at full ",
+      "sharpness. fullPage:true: the whole page, scrolled and stitched (fixed headers appear ",
+      "once). name/role or ref: just that element. clip: a region in CSS pixels measured from ",
+      "the top-left of the page (the result's `viewport` gives scrollY to convert from what you ",
+      "see). Tall captures come back as several images in page order, each at most 4000px. ",
+      "The page's scroll position is restored afterwards.",
+    ].join(""),
+    {
+      session: z.string().default("default"),
+      fullPage: z.boolean().default(false),
+      name: z.string().optional().describe("Capture the first element whose accessible name contains this"),
+      role: z.string().optional().describe("Narrow `name` to a role (button, link, img, heading…)"),
+      ref: z.number().int().optional().describe("Capture this element from the latest snapshot"),
+      clip: z
+        .object({ x: z.number(), y: z.number(), width: z.number().positive(), height: z.number().positive() })
+        .optional()
+        .describe("Region in CSS pixels, page coordinates"),
+      scale: z
+        .number()
+        .min(0.25)
+        .max(4)
+        .optional()
+        .describe("Image pixels per CSS pixel. Default: the screen's (sharp) — or 1 for fullPage, to keep it small"),
+      format: z.enum(["png", "jpeg"]).default("png").describe("jpeg is much smaller for photos and long pages"),
+    },
+    async ({ session, fullPage, name, role, ref, clip, scale, format }) => {
+      const targets = [fullPage, name !== undefined || role !== undefined, ref !== undefined, clip !== undefined];
+      if (targets.filter(Boolean).length > 1)
+        return fail("give at most one of fullPage, name/role, ref, clip", "pick one target per screenshot");
       try {
-        const r = (await ctx.sessions.withLock(session, () =>
-          ctx.bridge.request("engine.screenshot", {}),
-        )) as Record<string, unknown>;
-        ctx.audit.log("tool.browser_screenshot", { session });
-        const img = imageContent(r.screenshot);
-        return img
-          ? { content: [{ type: "text" as const, text: JSON.stringify({ url: r.url }) }, img] }
-          : fail("no screenshot", "ensure a tab is focused");
+        return await ctx.sessions.withLock(session, async () => {
+          let target = ref;
+          if (name !== undefined || role !== undefined) {
+            const loc = (await ctx.bridge.request("engine.locate", { role, name })) as {
+              matches?: { ref: number; name: string }[];
+            };
+            target = loc.matches?.[0]?.ref;
+            if (target === undefined)
+              return fail(
+                `no element matching role=${role ?? "any"} name="${name ?? ""}"`,
+                "widen the name to a shorter substring, or drop role",
+              );
+          }
+          const r = (await ctx.bridge.request(
+            "engine.screenshot",
+            { fullPage, ref: target, clip, scale, format },
+            90_000,
+          )) as Record<string, unknown> & { screenshot?: string; images?: string[] };
+          ctx.audit.log("tool.browser_screenshot", { session, fullPage, ref: target, clip: !!clip });
+          const images = (r.images ?? [r.screenshot]).map(imageContent).filter((i) => i !== null);
+          if (!images.length) return fail("no screenshot came back", "retry; if it repeats, call agent_browser_status");
+          const { screenshot: _s, images: _i, ...meta } = r;
+          return {
+            content: [
+              { type: "text" as const, text: JSON.stringify({ ...meta, ...(images.length > 1 ? { tiles: images.length } : {}) }) },
+              ...images,
+            ],
+          };
+        });
       } catch (e) {
-        return fail((e as Error).message, "ensure agent Chrome is launched");
+        return failWith(e, "retry; if it repeats, call agent_browser_status");
       }
     },
   );

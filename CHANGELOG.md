@@ -22,8 +22,52 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Optional launchd host-helper that spawns the browser on request
 - Accessibility-tree perception with redaction of password, OTP, and card fields
 - Kill switch (`npm run halt` / `npm run resume`) and audit log
+- Screenshots beyond the viewport: `browser_screenshot` takes `fullPage`
+  (scrolled and stitched, fixed headers shown once, long pages split into
+  tiles of at most 4000px), one element by `name`/`role` or `ref`, or a `clip`
+  region; `scale` and `jpeg` keep large captures small
+- `agent_browser_visit({history: "back" | "forward" | "reload"})`, settled and
+  with a snapshot, and `text: true` to get the page's visible text with the tree
+- `agent_browser_act` takes `snapshot: "viewport" | "none"` to shrink its
+  result, and `action: "select"` picks a dropdown option by its text
+- `browser_observe({mode: "read"})` pages long text with `offset`/`maxChars`
+  and says when there is more
 
 ### Fixed
+- Custom-styled checkboxes and radios are reachable. Inputs hidden with
+  `opacity: 0` (the real control under a painted box, as in TodoMVC) were
+  dropped from the snapshot and from lookup; an unlabelled checkbox now takes
+  its name from the label beside it
+- `press Enter` in a form field submits the form, as a real key press does. A
+  synthetic keydown gets no implicit submission, so search boxes silently did
+  nothing while the result said `acted: true`
+- An action that changed nothing now says so (`noEffect` plus a warning)
+  instead of reporting plain success, and the two `navigated` flags agree
+- Back and forward work after the tool has clicked through pages. They used
+  Chrome's Back button, which skips any page left without a user gesture —
+  every page this tool clicks away from — so it went back two pages or failed
+  with "Cannot find a next page in history." They now run in the page
+- Screenshots no longer fail with "image readback failed" while the agent
+  window is behind other windows. macOS Chrome stops painting a covered
+  window; the launcher now keeps it painting
+  (`--disable-backgrounding-occluded-windows`), and a capture retries briefly
+- The numbered overlay (`browser_observe({mode: "marks"})`) is in the image;
+  the capture used to run before the overlay was painted
+- After an update, the extension's service worker runs the new code. Chrome
+  kept running the cached worker across restarts and version bumps — this
+  install ran a September build for a month beside a current content engine.
+  The worker now compares itself with `src/sw.js` on disk at every start and
+  reloads once if they differ
+- `browser_act` no longer reports a click that navigated as an error with
+  "re-observe and retry" — retrying fired the action twice
+- Error advice matches the state: no more "ensure agent Chrome is launched"
+  while it is running. A missed lookup names similar elements (a search box
+  whose role changed from searchbox to combobox). The kill-switch and policy
+  messages tell the agent to stop and ask the user, not how to remove the gate
+- A page with nothing interactive (a JSON response) returns its text instead
+  of an empty tree. Text keeps its line breaks and indentation, and links are
+  named by their visible text before their tooltip
+- Full-page captures get a longer bridge timeout than ordinary calls
 - `agent_browser_act` can reach elements past the snapshot cap. Refs were only
   assigned to the first 220 nodes the snapshot listed, so on a long page (the
   Hacker News front page, for one) any control after them — footer links,

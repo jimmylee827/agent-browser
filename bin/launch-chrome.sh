@@ -36,9 +36,15 @@ else
 fi
 echo "  ext     : load once manually via chrome://extensions -> $EXT_DIR"
 
+# --disable-backgrounding-occluded-windows: keep painting the window while it
+# sits behind others. Without it macOS Chrome stops rendering a covered window,
+# and every screenshot fails with "image readback failed" until something
+# forces a repaint. Not an automation switch, and invisible to pages — the
+# page simply stays "visible", as it would for a partly uncovered window.
 exec "$CHROME" \
   --user-data-dir="$PROFILE_DIR" \
   ${JS_FLAGS_ARG[@]+"${JS_FLAGS_ARG[@]}"} \
+  --disable-backgrounding-occluded-windows \
   --no-first-run \
   --no-default-browser-check \
   --disable-features=Translate,DisableLoadExtensionCommandLineSwitch \
