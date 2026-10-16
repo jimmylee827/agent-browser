@@ -1,4 +1,7 @@
 import { readFileSync, existsSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // Small client for the host-helper daemon. Its only job is launching the GUI
 // Chrome on the host when the bridge isn't connected — the one thing the MCP
@@ -9,6 +12,7 @@ import { readFileSync, existsSync } from "node:fs";
 const HOST = process.env.AB_HOST_HELPER_HOST || "127.0.0.1";
 const PORT = process.env.AB_HOST_HELPER_PORT || "8789";
 const SECRET_FILE = process.env.AB_HOST_HELPER_SECRET_FILE || "";
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
 function readSecret(): string | null {
   const candidates = [SECRET_FILE, `${process.env.HOME ?? ""}/.agent-chrome/host-helper-secret`];
@@ -45,3 +49,30 @@ export const hostHelper = {
   },
   launchChrome: () => call<{ ok: true; pid: number }>("/launch-chrome"),
 };
+
+/**
+ * Start the agent Chrome by whichever route works: the host helper when it
+ * answers, otherwise spawning the launcher ourselves. The daemon runs as a
+ * launchd agent in the user's GUI session, and a stdio server runs under the
+ * user's terminal, so both can open a GUI app directly — the helper is only
+ * needed when the server has no GUI session at all.
+ *
+ * A secret file on disk does not mean the helper is running (it outlives the
+ * process), so a failed helper call falls through to the direct spawn.
+ */
+export async function launchBrowser(): Promise<"host-helper" | "direct"> {
+  if (hostHelper.available()) {
+    try {
+      await hostHelper.launchChrome();
+      return "host-helper";
+    } catch {}
+  }
+  const child = spawn(resolve(repoRoot, "bin/launch-chrome.sh"), [], {
+    cwd: repoRoot,
+    detached: true,
+    stdio: "ignore",
+  });
+  child.on("error", () => {});
+  child.unref();
+  return "direct";
+}

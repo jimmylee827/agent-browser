@@ -57,14 +57,17 @@ npm run mcp:install     # launchd agent, starts at login, restarts on crash
 claude mcp add --transport http agent-browser http://127.0.0.1:8788/mcp --scope user
 ```
 
-Optional — auto-launch Chrome when it isn't running:
+When Chrome isn't running, the browser tools launch it themselves — the daemon
+runs in your GUI login session, so it can open Chrome directly. The host helper
+is only needed when the server has no GUI session (for example, run over ssh or
+in a container):
 
 ```bash
 npm run host-helper:install
 ```
 
-Without it the browser tools still work; you just run `npm run launch` yourself
-when Chrome is closed.
+When it is installed and answering, launches go through it; otherwise the
+server spawns `bin/launch-chrome.sh` itself.
 
 ### Why a daemon rather than stdio
 

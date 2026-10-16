@@ -5,7 +5,7 @@ import type { Policy } from "../policy.js";
 import type { SessionManager } from "../sessions.js";
 import type { Audit } from "../audit.js";
 import type { AppConfig } from "../config.js";
-import { hostHelper } from "../host-helper-client.js";
+import { hostHelper, launchBrowser } from "../host-helper-client.js";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 
@@ -59,6 +59,33 @@ const fail = (msg: string, recovery: string) => ({
  *      Most agents shouldn't need these.
  */
 export function registerTools(server: McpServer, ctx: Ctx): void {
+  /**
+   * Bring the browser up if the bridge isn't connected. Returns how it got
+   * there, or a ready-made failure result. Shared by every tool that needs a
+   * live browser so the launch path and its error advice exist once.
+   */
+  async function ensureBrowser(
+    timeoutMs: number,
+  ): Promise<{ already: boolean; launchedVia?: string; waitedMs?: number } | ReturnType<typeof fail>> {
+    if (ctx.bridge.connected()) return { already: true };
+    // The worker may just be reconnecting (browser starting, extension
+    // reloaded). Give it a moment before concluding nothing is there.
+    if (await ctx.bridge.waitForConnection(8_000)) return { already: true };
+    if (existsSync(resolve(ctx.cfg.stateDir, "HALT")))
+      return fail("HALTED: kill switch active", "rm ~/.agent-chrome/HALT to resume");
+    const launchedVia = await launchBrowser();
+    ctx.audit.log("browser.launch", { via: launchedVia });
+    const t0 = Date.now();
+    if (await ctx.bridge.waitForConnection(timeoutMs))
+      return { already: false, launchedVia, waitedMs: Date.now() - t0 };
+    return fail(
+      `agent browser did not connect within ${timeoutMs}ms (launched via ${launchedVia})`,
+      "if Chrome opened, load the extension once via chrome://extensions → Load unpacked → packages/extension; " +
+        "if it did not, run `npm run launch` in the agent-browser repo and read its output",
+    );
+  }
+  const isFail = (r: object): r is ReturnType<typeof fail> => "isError" in r;
+
   // ============================================================
   // HIGH-LEVEL INTENT TOOLS — preferred for AI agents
   // ============================================================
@@ -94,29 +121,18 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
     "agent_browser_ensure_running",
     [
       "Make sure the stealth Chrome + extension are running and the bridge is ",
-      "connected, launching the browser via the host helper if needed. Idempotent. ",
+      "connected, launching the browser if needed (via the host helper when it is ",
+      "running, otherwise directly). Idempotent. ",
       "Use this before any agent_browser_visit / advanced browser_* calls.",
     ].join(""),
     { timeoutMs: z.number().int().default(45_000) },
     async ({ timeoutMs }) => {
-      if (ctx.bridge.connected()) return ok({ already: true, bridgeConnected: true });
-      if (await ctx.bridge.waitForConnection(8_000))
-        return ok({ already: true, bridgeConnected: true, waited: true });
-      if (!hostHelper.available())
-        return fail(
-          "stealth Chrome not running and host helper unavailable",
-          "install the host helper (host-helper:install)",
-        );
-      await hostHelper.launchChrome().catch(() => {});
-      const t0 = Date.now();
-      while (Date.now() - t0 < timeoutMs) {
-        if (ctx.bridge.connected())
-          return ok({ launched: true, bridgeConnected: true, waitedMs: Date.now() - t0 });
-        await new Promise((r) => setTimeout(r, 1500));
-      }
-      return fail(
-        `bridge not connected within ${timeoutMs}ms`,
-        "the extension may need to be loaded once via chrome://extensions → Load unpacked",
+      const r = await ensureBrowser(timeoutMs);
+      if (isFail(r)) return r;
+      return ok(
+        r.already
+          ? { already: true, bridgeConnected: true }
+          : { launched: true, launchedVia: r.launchedVia, bridgeConnected: true, waitedMs: r.waitedMs },
       );
     },
   );
@@ -132,22 +148,8 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
       url: z.string().url(),
     },
     async ({ url }) => {
-      // ensure running
-      if (!ctx.bridge.connected()) {
-        // The worker may just be reconnecting (browser starting, extension
-        // reloaded). Give it a moment before concluding nothing is there.
-        await ctx.bridge.waitForConnection(8_000);
-      }
-      if (!ctx.bridge.connected()) {
-        if (!hostHelper.available())
-          return fail("agent browser not running", "install host helper, or run `npm run launch` on host");
-        await hostHelper.launchChrome().catch(() => {});
-        const t0 = Date.now();
-        while (Date.now() - t0 < 45_000 && !ctx.bridge.connected())
-          await new Promise((r) => setTimeout(r, 1500));
-        if (!ctx.bridge.connected())
-          return fail("agent browser failed to come up within 45s", "see ~/.agent-chrome/host-helper.log");
-      }
+      const up = await ensureBrowser(45_000);
+      if (isFail(up)) return up;
       // Navigation is read-only and unrestricted — any URL is fair game. The
       // sensitive-action gate lives in agent_browser_act, and only for the
       // action classes a caller explicitly labels.
@@ -228,20 +230,8 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         if (existsSync(resolve(ctx.cfg.stateDir, "HALT")))
           return fail("HALTED: kill switch active", "rm ~/.agent-chrome/HALT to resume");
 
-        // Ensure browser is running (same idempotent pattern as agent_browser_visit).
-        if (!ctx.bridge.connected()) {
-          await ctx.bridge.waitForConnection(8_000);
-        }
-        if (!ctx.bridge.connected()) {
-          if (!hostHelper.available())
-            return fail("agent browser not running", "install host helper, or call agent_browser_ensure_running first");
-          await hostHelper.launchChrome().catch(() => {});
-          const t0 = Date.now();
-          while (Date.now() - t0 < 45_000 && !ctx.bridge.connected())
-            await new Promise((r) => setTimeout(r, 1500));
-          if (!ctx.bridge.connected())
-            return fail("agent browser failed to come up within 45s", "see ~/.agent-chrome/host-helper.log");
-        }
+        const up = await ensureBrowser(45_000);
+        if (isFail(up)) return up;
 
         // Policy gate: only fires for an explicitly labelled sensitive class.
         // A plain click/type/submit is an ordinary action anywhere on the web.

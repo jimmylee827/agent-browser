@@ -92,6 +92,12 @@
       const r = role(el);
       if (r === "button" || r === "link" || /^h[1-6]$/i.test(el.tagName))
         n = el.textContent || "";
+      // Icon-only controls (vote arrows, close buttons) carry their label on a
+      // child: <a><img alt="…"></a>, <a><div title="…"></div></a>, an <svg>.
+      if (!n.trim() && (r === "button" || r === "link")) {
+        const c = el.querySelector("[aria-label], img[alt], [title]");
+        n = c?.getAttribute("aria-label") || c?.getAttribute("alt") || c?.getAttribute("title") || "";
+      }
     }
     return clip(n, 100);
   }
@@ -194,16 +200,17 @@
       .querySelectorAll("[data-ab-ref]")
       .forEach((n) => n.removeAttribute("data-ab-ref"));
 
+    // Every qualifying element gets a ref, so locate/act can reach the whole
+    // page; only the tree handed back is capped at maxNodes. Capping the refs
+    // too made anything past the cap unreachable by name.
     const out = [];
     let ref = 0;
-    let truncated = false;
+    let omitted = 0;
     for (const { el, depth, crossOrigin } of walk(document.body, 0)) {
-      if (out.length >= maxNodes) {
-        truncated = true;
-        break;
-      }
       if (crossOrigin) {
-        out.push({ depth, role: "iframe", name: clip(el.src, 60), crossOrigin: true });
+        if (out.length < maxNodes)
+          out.push({ depth, role: "iframe", name: clip(el.src, 60), crossOrigin: true });
+        else omitted += 1;
         continue;
       }
       const r = role(el);
@@ -218,6 +225,10 @@
       ref += 1;
       el.setAttribute("data-ab-ref", String(ref));
       AB.refs.set(ref, el);
+      if (out.length >= maxNodes) {
+        omitted += 1;
+        continue;
+      }
       const st = state(el);
       out.push({
         ref,
@@ -233,8 +244,15 @@
       url: location.href,
       title: document.title,
       snapshotGeneration: AB.gen,
-      truncated,
-      counts: { nodes: out.length, interactive: out.filter((n) => n.interactive).length },
+      truncated: omitted > 0,
+      counts: {
+        nodes: out.length,
+        interactive: out.filter((n) => n.interactive).length,
+        ...(omitted ? { omitted } : {}),
+      },
+      ...(omitted
+        ? { hint: `${omitted} more elements not listed; agent_browser_act still finds them by name` }
+        : {}),
       ...(recentDialogs().length ? { dialogs: recentDialogs() } : {}),
       tree: out,
     };
@@ -301,11 +319,23 @@
   function locate(params = {}) {
     if (!AB.refs.size) buildTree(params);
     const want = (params.name || "").toLowerCase();
-    const matches = [];
-    for (const [r, el] of AB.refs) {
-      if (params.role && role(el) !== params.role) continue;
-      if (want && !accName(el).toLowerCase().includes(want)) continue;
-      matches.push({ ref: r, role: role(el), name: accName(el) });
+    const search = () => {
+      const matches = [];
+      for (const [r, el] of AB.refs) {
+        if (!el.isConnected) continue;
+        if (params.role && role(el) !== params.role) continue;
+        if (want && !accName(el).toLowerCase().includes(want)) continue;
+        matches.push({ ref: r, role: role(el), name: accName(el) });
+      }
+      return matches;
+    };
+    let matches = search();
+    // The page may have changed since the last snapshot (a menu opened, an SPA
+    // route rendered). Re-index once before reporting nothing. Rebuilding
+    // only on a miss keeps refs from an earlier observe valid on a hit.
+    if (!matches.length) {
+      buildTree(params);
+      matches = search();
     }
     return { snapshotGeneration: AB.gen, matches };
   }

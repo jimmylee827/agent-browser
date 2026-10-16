@@ -24,6 +24,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Kill switch (`npm run halt` / `npm run resume`) and audit log
 
 ### Fixed
+- `agent_browser_act` can reach elements past the snapshot cap. Refs were only
+  assigned to the first 220 nodes the snapshot listed, so on a long page (the
+  Hacker News front page, for one) any control after them — footer links,
+  "FAQ" — was unreachable by name. Every element now gets a ref; only the
+  returned tree is capped, and it reports how many it left out (`omitted`)
+- Lookup by name re-indexes the page once before reporting no match, so a
+  control that appeared after the last snapshot (an opened menu, an SPA route)
+  is found
+- Icon-only links and buttons take their name from a child's `aria-label`,
+  `alt`, or `title`, instead of showing up unnamed
+- The browser launches without the host helper. All three tools that start it
+  refused when the helper wasn't installed, and waited 45s for nothing when its
+  secret file was on disk but the helper wasn't running. They now share one
+  launch path that tries the helper and otherwise spawns the launcher directly,
+  and refuses to launch while the kill switch is on
 - A click that navigates no longer reports as an error. Chrome tears the
   document down before the async reply lands; that is success, and retrying it
   would fire the action twice
