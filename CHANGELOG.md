@@ -41,8 +41,45 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `browser_screenshot` captures tables, rows, figures, images, articles, lists
   and paragraphs by role and name, though the snapshot leaves them out
 - `npm run mcp:stop`; the daemon logs the signal it stopped on
+- `browser_tabs` lists, switches, opens and closes tabs, and an act that moved
+  to a new tab says `switchedTab: {from, to}`
+- `browser_scroll` (top, bottom, a screen, or a y; reports `atBottom` and how
+  much an infinite feed grew) and `browser_wait({text | name | role, gone?})`
+- `agent_browser_act` takes `onDialog: "accept" | "dismiss"` and `dialogText`;
+  every confirm/prompt box an action raised is reported in `dialogs`, at any
+  snapshot size. `agent_browser_visit` takes `snapshot`, so text can be read
+  without the tree
+- The tree shows a dropdown's `selected` label and `options`, an input's type
+  when it fixes the format, and a radio's or checkbox's `group` (fieldset
+  legend), which name matching also accepts ("Pizza Size Small")
+- Screenshot results give `bytes` per image
 
 ### Fixed
+- **A failed action no longer comes back as a success.** The engine reports its
+  own failures — no such option, a disabled or covered element — as a reply
+  carrying `error`, and nothing checked for it, so `select "Option 9"` returned
+  `acted: true` with nothing selected. The extension now turns those into
+  errors, for every method. A closed message channel (an action that navigated
+  away) is unchanged: still success, still never retried
+- Date, time, number and other whole-value fields can be filled. Typing one
+  character at a time made every partial value invalid, and Chrome cleared the
+  field after each. They are now set in one write; a value the field rejects
+  is an error naming the format, and the field keeps its old value
+- Same-origin iframes are reachable: an editor's body (TinyMCE) is a `textbox`
+  you can type into, iframe text appears in read mode, iframe elements are
+  labelled from their own document, and positions, the occlusion check and
+  screenshots account for the frame's offset
+- Menu items, tabs and options take their name from their text (TinyMCE's
+  "File" was unnamed)
+- Viewport screenshots honour `scale` and `format`
+- Element screenshots include text that overflows its box (TodoMVC's heading
+  was cut in half)
+- A slow form submit is reported as a page still loading (`stillLoading`), not
+  as an action with no effect
+- The "similar elements" suggestion no longer lists unrelated elements of the
+  same role when a name was given
+- `agent_browser_status` keeps reporting `serverRunning` once the browser is up,
+  and titles are the page's own (not the URL Chrome shows for an untitled page)
 - A call no longer hangs for 30s when the extension restarts under it: pending
   calls fail as soon as the connection drops, and read-only ones are re-sent
   once on the new connection. A self-reloading worker now checks itself before

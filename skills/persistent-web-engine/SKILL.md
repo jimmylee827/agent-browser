@@ -11,16 +11,19 @@ description: |
   - "Find the link / button / field that says X and ..."
 
   Primary tools (use these — no `ref` / `snapshotGeneration` to track):
-  - `agent_browser_visit({ url } | { history: "back" }, text?)` — navigate (or go back/forward/reload) + wait + return accessibility tree; `text: true` adds the page's visible text
-  - `agent_browser_act({ name, role?, action, value?, snapshot? })` — find element by name + perform action + return new accessibility tree
-  - `browser_observe({ mode: "read", offset? })` — the page's text, paged (prices, scores, articles, JSON)
+  - `agent_browser_visit({ url } | { history: "back" }, text?, snapshot?)` — navigate (or go back/forward/reload) + wait + return accessibility tree; `text: true` adds the page's visible text, `snapshot: "none"` drops the tree
+  - `agent_browser_act({ name, role?, action, value?, snapshot?, onDialog? })` — find element by name + perform action + return new accessibility tree
+  - `browser_observe({ mode: "read", offset? })` — the page's text, paged (prices, scores, articles, JSON, iframe content)
   - `browser_screenshot({ fullPage? | name? | ref? | clip? })` — viewport, whole page, one element, or a region
+  - `browser_tabs({ action })` — list, switch, open or close tabs
+  - `browser_scroll({ to | y })` — scroll the page, load more of an infinite feed
+  - `browser_wait({ text? | name? | role?, gone? })` — wait for something to appear or disappear
 
   Status / lifecycle:
   - `agent_browser_status()` — is the browser ready? (no side effects)
   - `agent_browser_ensure_running()` — idempotent launch (auto-fires on first visit, rarely needed manually)
 
-  Advanced primitives (`[advanced]` in their tool descriptions) — rarely needed: `browser_locate`, `browser_navigate`, `browser_act`, `browser_wait`, `browser_robust_click`, `browser_wait_for_navigation`.
+  Advanced primitives (`[advanced]` in their tool descriptions) — rarely needed: `browser_locate`, `browser_navigate`, `browser_act`, `browser_robust_click`, `browser_wait_for_navigation`.
 user-invocable: false
 ---
 
@@ -74,14 +77,45 @@ If a result says `noEffect: true`, the action changed nothing — try another wa
 
 ### "Keep results small"
 
-Every act returns a snapshot. For a run of fills, pass `snapshot: "none"` (just
-url and title) or `"viewport"` (only what is on screen), and take a full one at
-the end.
+Every act and visit returns a snapshot. For a run of fills, pass `snapshot:
+"none"` (just url and title) or `"viewport"` (only what is on screen), and take
+a full one at the end. To read a page without its tree:
+`agent_browser_visit({ url, text: true, snapshot: "none" })`.
 
 ### "Go back"
 ```text
 agent_browser_visit({ history: "back" })      # also "forward", "reload"
 ```
+
+### "A link opened a new tab"
+The act result says `switchedTab: { from, to }` and the agent is now on the new
+tab. `browser_tabs({ action: "switch", tabId: from })` goes back;
+`browser_tabs({ action: "close", tabId: to })` closes it.
+
+### "Scroll, or wait for something"
+```text
+browser_scroll({ to: "bottom" })        # also "top", "up", "down", or { y }; says atBottom, grewBy
+browser_wait({ text: "Order confirmed" })               # until the text appears (max 25s)
+browser_wait({ name: "Loading", gone: true })          # until an element goes away
+```
+
+### "Dates, times and numbers"
+`fill` sets these in one go, in the field's own format: `2026-10-17` for a date,
+`19:30` for a time. A value the field rejects is an error that names the
+expected format, and the field keeps what it had. The tree shows the type
+(`state.inputType: "time"`).
+
+### "Confirm and prompt boxes"
+A box the page opens is answered and reported in the act result's `dialogs`,
+whatever the snapshot size. The default is OK; pass `onDialog: "dismiss"` for
+Cancel, and `dialogText` for a prompt's answer. Answer a "Delete this?" box with
+care — it is a decision on the user's behalf.
+
+### "Editors and iframes"
+Same-origin iframes are part of the page: their fields are in the tree, their
+text is in read mode (under `[frame: …]`), and a rich-text editor's body is a
+`textbox` you can `type` into. Cross-origin iframes appear only as a boundary
+node.
 
 ### "Take a screenshot"
 ```text
@@ -92,9 +126,10 @@ browser_screenshot({ name: "Star Ferry", role: "table" })  # a table, named by i
 browser_screenshot({ clip: { x, y, width, height } })      # region, CSS px from the page's top-left
 ```
 Element capture also reaches things the snapshot leaves out — `table`, `row`,
-`figure`, `img`, `article`, `list`, `paragraph` — when you give the role. A
-miss names the closest candidates. Full pages default to JPEG at 1x (about a
-third the size of PNG); pass `format: "png"` or `scale` to change that. The
+`listitem`, `figure`, `img`, `article`, `list`, `paragraph` — when you give the
+role. A miss names the closest candidates. Full pages default to JPEG at 1x
+(about a third the size of PNG); pass `format` or `scale` on any capture to
+change that. Each result gives `bytes` per image. The
 result's `viewport.scrollY` converts what you see on screen into page
 coordinates for `clip`.
 
@@ -167,7 +202,14 @@ Recent history is checked first, so a redirect that already landed still counts.
 | `focus` | move keyboard focus to element | no |
 | `check` / `uncheck` | for checkboxes/radios | no |
 | `submit` | submit the form containing the element | no |
-| `select` | pick a dropdown option, by its text or value | yes |
+| `select` | pick a dropdown option, by its text or value (a miss lists the options) | yes |
+
+A radio or checkbox also matches by its group: `name: "Pizza Size Small"` picks
+the "Small" in the "Pizza Size" fieldset (`state.group`). A dropdown's state
+shows the `selected` label and its `options`.
+
+When the action itself fails — no such option, a rejected date, a disabled
+button — the call returns an error, never `acted: true`.
 
 ## Reading the result of `agent_browser_act`
 

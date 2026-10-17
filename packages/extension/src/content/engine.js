@@ -62,32 +62,49 @@
   });
   const recentDialogs = () => AB.dialogs.slice(-5);
 
+  // An editing host — a contenteditable element, or the body of a document in
+  // design mode (the iframe a rich-text editor such as TinyMCE types into).
+  const isEditingHost = (el) =>
+    el.getAttribute("contenteditable") === "true" ||
+    el.getAttribute("contenteditable") === "" ||
+    (el === el.ownerDocument.body && (el.isContentEditable || el.ownerDocument.designMode === "on"));
+
   function role(el) {
     const explicit = el.getAttribute("role");
     if (explicit) return explicit.split(/\s+/)[0];
     const f = TAG_ROLE[el.tagName];
-    return f ? f(el) : null;
+    if (f) return f(el);
+    return isEditingHost(el) ? "textbox" : null;
   }
 
+  // Roles whose accessible name comes from their own content.
+  const NAMED_BY_CONTENT = new Set([
+    "button", "link", "menuitem", "menuitemcheckbox", "menuitemradio",
+    "tab", "option", "treeitem", "switch",
+  ]);
+
   function accName(el) {
+    // Look labels up in the element's own document: an element inside an
+    // iframe is labelled by ids in that iframe, not in the top page.
+    const doc = el.ownerDocument;
     const byId = (attr) =>
       (el.getAttribute(attr) || "")
         .split(/\s+/)
-        .map((id) => document.getElementById(id)?.textContent || "")
+        .map((id) => doc.getElementById(id)?.textContent || "")
         .join(" ");
     let n =
       byId("aria-labelledby") ||
       el.getAttribute("aria-label") ||
       "";
     if (!n && el.id) {
-      const lbl = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+      const lbl = doc.querySelector(`label[for="${CSS.escape(el.id)}"]`);
       if (lbl) n = lbl.textContent || "";
     }
     if (!n) n = el.closest("label")?.textContent || "";
     if (!n) n = el.getAttribute("placeholder") || el.getAttribute("alt") || "";
     const r = role(el);
     if (!n.trim()) {
-      if (r === "button" || r === "link" || /^h[1-6]$/i.test(el.tagName))
+      if (NAMED_BY_CONTENT.has(r) || /^h[1-6]$/i.test(el.tagName))
         n = el.textContent || "";
       // Icon-only controls (vote arrows, close buttons) carry their label on a
       // child: <a><img alt="…"></a>, <a><div title="…"></div></a>, an <svg>.
@@ -105,8 +122,29 @@
     // title is a tooltip: the last resort, after the visible text. Taking it
     // first named Wikipedia's links after their targets ("Special:Statistics").
     if (!n.trim()) n = el.getAttribute("title") || "";
+    // An editor's iframe body: the iframe element carries the label.
+    if (!n.trim() && el === doc.body) {
+      const frame = doc.defaultView?.frameElement;
+      n = frame?.getAttribute("title") || frame?.getAttribute("aria-label") || "";
+    }
     return clip(n, 100);
   }
+
+  // The group a radio or checkbox belongs to — its fieldset legend or its
+  // radiogroup's name — so "Small" under "Pizza Size" can be told from another
+  // "Small" on the page.
+  function groupName(el) {
+    const legend = el.closest("fieldset")?.querySelector(":scope > legend")?.textContent;
+    if (legend?.trim()) return clip(legend, 60);
+    const g = el.closest('[role="radiogroup"], [role="group"]');
+    return g && g !== el ? accName(g) : "";
+  }
+
+  // Input types whose value Chrome only accepts whole: a partial time like "1"
+  // is invalid and resets the field to empty, so typing character by character
+  // can never fill one.
+  const WHOLE_VALUE = new Set(["date", "time", "datetime-local", "month", "week", "number", "color", "range"]);
+  const TEXT_INPUT_TYPES = new Set(["text", "search", "email", "url", "tel", "password"]);
 
   // Form controls at opacity 0 are still on top and still take the click: it
   // is how custom-styled checkboxes and radios are built (the page paints a
@@ -121,8 +159,26 @@
     return s.opacity !== "0" || FORM_CONTROL.has(el.tagName);
   }
 
+  // An element's box in the TOP page's viewport. getBoundingClientRect is
+  // relative to the element's own frame, so an element inside an iframe needs
+  // each enclosing frame's offset (and its border and padding) added.
+  function viewRect(el, r = el.getBoundingClientRect()) {
+    let x = r.left;
+    let y = r.top;
+    let win = el.ownerDocument.defaultView;
+    while (win && win !== window && win.frameElement) {
+      const fe = win.frameElement;
+      const f = fe.getBoundingClientRect();
+      const cs = getComputedStyle(fe);
+      x += f.left + parseFloat(cs.borderLeftWidth) + parseFloat(cs.paddingLeft);
+      y += f.top + parseFloat(cs.borderTopWidth) + parseFloat(cs.paddingTop);
+      win = win.parent;
+    }
+    return { left: x, top: y, width: r.width, height: r.height, right: x + r.width, bottom: y + r.height };
+  }
+
   const inViewport = (el) => {
-    const r = el.getBoundingClientRect();
+    const r = viewRect(el);
     return r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth;
   };
 
@@ -148,7 +204,23 @@
     if (el.getAttribute("aria-selected") === "true") s.selected = true;
     if (/^h([1-6])$/i.test(el.tagName)) s.level = +el.tagName[1];
     if (el.getAttribute("aria-invalid") === "true") s.invalid = true;
-    if ("value" in el && el.value != null && el.value !== "") {
+    if (el.tagName === "SELECT") {
+      // The label a person sees, not just the option's value ("2").
+      const opts = [...el.options];
+      if (el.selectedOptions[0]) s.selected = clip(el.selectedOptions[0].text, 60);
+      s.options = opts.slice(0, 12).map((o) => clip(o.text, 40));
+      if (opts.length > 12) s.optionCount = opts.length;
+    }
+    if (el.tagName === "INPUT") {
+      const t = (el.type || "text").toLowerCase();
+      // Say the type when it dictates the value's format (time, date, number…).
+      if (!TEXT_INPUT_TYPES.has(t) && t !== "checkbox" && t !== "radio") s.inputType = t;
+      if (t === "checkbox" || t === "radio") {
+        const g = groupName(el);
+        if (g) s.group = g;
+      }
+    }
+    if ("value" in el && el.value != null && el.value !== "" && el.type !== "checkbox" && el.type !== "radio") {
       s.value = isRedacted(el) ? "[redacted]" : clip(String(el.value), 60);
     }
     return s;
@@ -197,8 +269,12 @@
         } catch {
           doc = null;
         }
-        if (doc && doc.body) yield* walk(doc.body, depth + 1);
-        else yield { el, depth, crossOrigin: true };
+        if (doc && doc.body) {
+          AB.frameDocs.add(doc);
+          // The body itself first: in an editor's iframe it is the text box.
+          yield { el: doc.body, depth: depth + 1 };
+          yield* walk(doc.body, depth + 1);
+        } else yield { el, depth, crossOrigin: true };
       }
       el = tw.nextNode();
     }
@@ -208,9 +284,14 @@
     const maxNodes = opts.maxNodes || 220;
     AB.gen = Date.now();
     AB.refs = new Map();
-    document
-      .querySelectorAll("[data-ab-ref]")
-      .forEach((n) => n.removeAttribute("data-ab-ref"));
+    // Clear old refs in iframes too: robustClick finds an element by its ref
+    // attribute in every frame, so a stale one there could be clicked instead.
+    for (const d of [document, ...(AB.frameDocs || [])]) {
+      try {
+        d.querySelectorAll("[data-ab-ref]").forEach((n) => n.removeAttribute("data-ab-ref"));
+      } catch {}
+    }
+    AB.frameDocs = new Set();
 
     // Every qualifying element gets a ref, so locate/act can reach the whole
     // page; only the tree handed back is capped at maxNodes. Capping the refs
@@ -277,7 +358,7 @@
     layer.style.cssText =
       "position:fixed;inset:0;z-index:2147483647;pointer-events:none;";
     for (const [r, el] of AB.refs) {
-      const b = el.getBoundingClientRect();
+      const b = viewRect(el);
       if (b.width <= 0 || b.bottom < 0 || b.top > innerHeight) continue;
       const tag = document.createElement("div");
       tag.textContent = String(r);
@@ -308,7 +389,16 @@
   function readText(params = {}) {
     // Leading indentation is kept (it carries the structure of JSON and code);
     // runs of spaces inside a line and trailing spaces are squeezed.
-    const all = (document.body?.innerText || "")
+    // innerText stops at iframe boundaries; add each same-origin frame's text
+    // (an editor's content, an embedded form) under a marker, in page order.
+    const frames = [];
+    for (const f of document.querySelectorAll("iframe")) {
+      try {
+        const t = f.contentDocument?.body?.innerText?.trim();
+        if (t && visible(f)) frames.push(`\n[frame: ${clip(f.title || f.name || f.src || "untitled", 60)}]\n${t}`);
+      } catch {} // cross-origin
+    }
+    const all = ((document.body?.innerText || "") + frames.join("\n"))
       .replace(/ /g, " ")
       .replace(/(\S)[ \t]{2,}/g, "$1 ")
       .replace(/[ \t]+\n/g, "\n")
@@ -358,8 +448,21 @@
 
   function rectOf(p = {}) {
     const el = resolve(p.ref, p.gen);
-    const r = el.getBoundingClientRect();
-    return { rect: { x: r.left + scrollX, y: r.top + scrollY, width: r.width, height: r.height } };
+    // Take in text that overflows the box: a large heading in a short line
+    // box (TodoMVC's 80px "todos" in a 19.6px box) was captured cut in half.
+    let r = el.getBoundingClientRect();
+    try {
+      const range = el.ownerDocument.createRange();
+      range.selectNodeContents(el);
+      const t = range.getBoundingClientRect();
+      if (t.width && t.height) {
+        const left = Math.min(r.left, t.left);
+        const top = Math.min(r.top, t.top);
+        r = { left, top, width: Math.max(r.right, t.right) - left, height: Math.max(r.bottom, t.bottom) - top };
+      }
+    } catch {}
+    const v = viewRect(el, r);
+    return { rect: { x: v.left + scrollX, y: v.top + scrollY, width: v.width, height: v.height } };
   }
 
   // Fixed and sticky elements (headers, cookie bars) would repeat in every
@@ -464,8 +567,12 @@
       for (const [r, el] of AB.refs) {
         if (!el.isConnected) continue;
         if (params.role && role(el) !== params.role) continue;
-        if (want && !accName(el).toLowerCase().includes(want)) continue;
-        matches.push({ ref: r, role: role(el), name: accName(el) });
+        // A radio or checkbox also answers to "<group> <name>" ("Pizza Size
+        // Small"), which tells it from another "Small" on the page.
+        const name = accName(el);
+        const group = el.type === "radio" || el.type === "checkbox" ? groupName(el) : "";
+        if (want && !name.toLowerCase().includes(want) && !(group && `${group} ${name}`.toLowerCase().includes(want))) continue;
+        matches.push({ ref: r, role: role(el), name, ...(group ? { group } : {}) });
       }
       return matches;
     };
@@ -513,9 +620,11 @@
     if (el.disabled || el.getAttribute("aria-disabled") === "true") {
       const e = new Error("NOT_ACTIONABLE: disabled"); e.code = "NOT_ACTIONABLE"; throw e;
     }
+    // Coordinates relative to the element's own frame, so ask that frame's
+    // document what is on top (the top page would only ever answer "the iframe").
     const b = el.getBoundingClientRect();
     const cx = b.left + b.width / 2, cy = b.top + b.height / 2;
-    const top = document.elementFromPoint(cx, cy);
+    const top = el.ownerDocument.elementFromPoint(cx, cy);
     if (top && top !== el && !el.contains(top) && !top.contains(el)) {
       const e = new Error("NOT_ACTIONABLE: occluded by another element");
       e.code = "NOT_ACTIONABLE"; throw e;
@@ -551,12 +660,11 @@
   const nativeSetter = (el) => {
     // Only return a setter for elements that actually have a .value property;
     // returning the input setter for a <div>/<select> -> "Illegal invocation".
+    // By tag, from the element's own window: `instanceof HTMLInputElement` is
+    // false for an input inside an iframe, which has its own constructors.
+    const win = el.ownerDocument.defaultView || window;
     const proto =
-      el instanceof HTMLTextAreaElement
-        ? HTMLTextAreaElement
-        : el instanceof HTMLInputElement
-          ? HTMLInputElement
-          : null;
+      el.tagName === "TEXTAREA" ? win.HTMLTextAreaElement : el.tagName === "INPUT" ? win.HTMLInputElement : null;
     return proto ? Object.getOwnPropertyDescriptor(proto.prototype, "value")?.set : null;
   };
 
@@ -564,6 +672,27 @@
     el.focus();
     const setter = nativeSetter(el);
     const isCE = el.isContentEditable;
+    const doc = el.ownerDocument; // an editor in an iframe edits its own document
+
+    // Date, time, number…: one whole-value write, then check it took.
+    if (setter && el.tagName === "INPUT" && WHOLE_VALUE.has((el.type || "").toLowerCase())) {
+      const want = String(text);
+      const previous = el.value;
+      setter.call(el, want);
+      if (el.value !== want && want !== "") {
+        // Chrome clears the field when it rejects a value. Put the old one
+        // back before saying so, or "unchanged" would be false.
+        setter.call(el, previous);
+        const fmt = { date: "YYYY-MM-DD", time: "HH:MM (24h)", "datetime-local": "YYYY-MM-DDTHH:MM", month: "YYYY-MM", week: "YYYY-Www", color: "#rrggbb" }[el.type] || "a valid number";
+        const e = new Error(`INVALID_VALUE: this ${el.type} field rejected "${want}"; it expects ${fmt}`);
+        e.code = "NOT_ACTIONABLE";
+        throw e;
+      }
+      // Only now tell the page: a rejected value never reaches its handlers.
+      fire(el, "input", { inputType: "insertReplacementText" });
+      fire(el, "change");
+      return;
+    }
 
     if (replace) {
       if (setter) {
@@ -571,13 +700,13 @@
         fire(el, "input", { inputType: "deleteContentBackward" });
       } else if (isCE) {
         // Select-all + delete: rich editors (ProseMirror etc.) track this.
-        const sel = window.getSelection();
-        const range = document.createRange();
+        const sel = doc.getSelection();
+        const range = doc.createRange();
         range.selectNodeContents(el);
         sel.removeAllRanges();
         sel.addRange(range);
         fire(el, "beforeinput", { inputType: "deleteContentBackward" });
-        document.execCommand("delete", false);
+        doc.execCommand("delete", false);
         fire(el, "input", { inputType: "deleteContentBackward" });
       }
     }
@@ -589,7 +718,7 @@
         setter.call(el, (el.value ?? "") + ch);
       } else if (isCE) {
         // execCommand insertText drives the editor's own model + fires input.
-        document.execCommand("insertText", false, ch);
+        doc.execCommand("insertText", false, ch);
       } else {
         el.textContent = (el.textContent ?? "") + ch;
       }
@@ -644,7 +773,10 @@
       [...el.options].find((o) => o.text.trim().toLowerCase() === w) ||
       [...el.options].find((o) => o.text.toLowerCase().includes(w));
     if (!opt) {
-      const e = new Error(`NO_SUCH_OPTION: no option matching "${want}"`); e.code = "NOT_ACTIONABLE"; throw e;
+      const names = [...el.options].slice(0, 20).map((o) => `"${clip(o.text, 40)}"`).join(", ");
+      const e = new Error(`NO_SUCH_OPTION: no option matching "${want}"; the options are ${names}`);
+      e.code = "NOT_ACTIONABLE";
+      throw e;
     }
     el.value = opt.value;
     fire(el, "input");
@@ -653,12 +785,26 @@
 
   async function act(p = {}) {
     const el = resolve(p.ref, p.gen); // throws STALE_SNAPSHOT / REF_NOT_FOUND
-    const before = { url: location.href, value: "value" in el ? el.value : undefined };
+    // An editing host has no .value; its text is what typing changes.
+    const valueOf = () => ("value" in el ? el.value : el.isContentEditable ? el.textContent : undefined);
+    const before = { url: location.href, value: valueOf() };
     const checkedBefore = el.checked;
+    // How a native dialog raised by this action is answered. The MAIN-world
+    // dialog handler reads these attributes when the dialog opens. Set before
+    // the observer starts, or setting them counts as a change on the page and
+    // hides a genuine no-op.
+    const root = document.documentElement;
+    root.setAttribute("data-ab-dialog", p.onDialog === "dismiss" ? "dismiss" : "accept");
+    if (p.dialogText != null) root.setAttribute("data-ab-dialog-text", String(p.dialogText));
+    else root.removeAttribute("data-ab-dialog-text");
+    const dialogsBefore = AB.dialogs.length;
     let mutated = 0;
     let extra = {};
     const mo = new MutationObserver((recs) => (mutated += recs.length));
-    mo.observe(document.documentElement, { subtree: true, childList: true, attributes: true });
+    // Watch the element's own document too: a change inside an iframe is not
+    // a mutation of the top page.
+    for (const d of new Set([document, el.ownerDocument]))
+      mo.observe(d.documentElement, { subtree: true, childList: true, attributes: true, characterData: true });
     try {
       const { cx, cy } = await ensureActionable(el);
       switch (p.action) {
@@ -685,17 +831,66 @@
       await sleep(60);
       mo.disconnect();
     }
-    const after = { url: location.href, value: "value" in el ? el.value : undefined };
+    const after = { url: location.href, value: valueOf() };
     // A field's value and a checkbox's state are properties, not DOM
     // mutations, so domMutations alone reads 0 for a fill that worked.
     const valueChanged = before.value !== after.value || el.checked !== checkedBefore;
+    const dialogs = AB.dialogs.slice(dialogsBefore);
     return {
       acted: true,
       action: p.action,
-      changed: before.url !== after.url || valueChanged || mutated > 0 || !!extra.submitted,
+      changed: before.url !== after.url || valueChanged || mutated > 0 || !!extra.submitted || dialogs.length > 0,
       signals: { navigated: before.url !== after.url, domMutations: mutated, valueChanged, ...extra },
+      ...(dialogs.length ? { dialogs } : {}),
       snapshotStale: true, // caller should re-observe
     };
+  }
+
+  // Scroll the page: to the top or bottom, by a screen, or to a y. Reports
+  // whether the bottom was reached, and how much the page grew — an infinite
+  // feed loads more as you reach its end.
+  async function scrollPage(p = {}) {
+    const se = document.scrollingElement || document.documentElement;
+    const heightBefore = se.scrollHeight;
+    const step = Math.round(innerHeight * 0.85);
+    const y =
+      p.to === "top" ? 0
+      : p.to === "bottom" ? se.scrollHeight
+      : p.to === "up" ? scrollY - step
+      : p.to === "down" ? scrollY + step
+      : +p.y || 0;
+    window.scrollTo({ top: y, left: scrollX, behavior: "instant" });
+    await nextPaint(250);
+    await waitForStable({ timeout: p.timeout || 3000, quietMs: 400 });
+    return {
+      scrollY: Math.round(scrollY),
+      pageHeight: se.scrollHeight,
+      viewportHeight: innerHeight,
+      atTop: scrollY <= 0,
+      atBottom: scrollY + innerHeight >= se.scrollHeight - 2,
+      ...(se.scrollHeight > heightBefore ? { grewBy: se.scrollHeight - heightBefore } : {}),
+    };
+  }
+
+  // Wait until some text appears on the page, or an element by role/name, or
+  // until it goes away (gone:true). Polls; no CDP.
+  async function waitFor(p = {}) {
+    const timeout = Math.min(p.timeout || 10000, 25000);
+    const want = (p.text || "").toLowerCase();
+    const present = () => {
+      if (want && !(document.body?.innerText || "").toLowerCase().includes(want)) return false;
+      if (p.name || p.role) {
+        buildTree({});
+        if (!locate({ role: p.role, name: p.name }).matches.length) return false;
+      }
+      return true;
+    };
+    const t0 = performance.now();
+    while (performance.now() - t0 < timeout) {
+      if (present() !== !!p.gone) return { found: !p.gone, gone: !!p.gone, waitedMs: Math.round(performance.now() - t0) };
+      await sleep(250);
+    }
+    return { timedOut: true, waitedMs: timeout };
   }
 
   // Network/DOM-quiet heuristic without CDP.
@@ -760,6 +955,8 @@
         else if (m === "rectOf") sendResponse(rectOf(msg.params));
         else if (m === "hideFixed") sendResponse(hideFixed());
         else if (m === "restoreFixed") sendResponse(restoreFixed());
+        else if (m === "scrollPage") sendResponse(await scrollPage(msg.params));
+        else if (m === "waitFor") sendResponse(await waitFor(msg.params));
         else if (m === "hideScrollbar") sendResponse(hideScrollbar());
         else if (m === "restoreScrollbar") sendResponse(restoreScrollbar());
         else if (m === "locate") sendResponse(locate(msg.params));

@@ -18,7 +18,7 @@ interface Pending {
  */
 const READ_ONLY = new Set([
   "engine.ping", "engine.observe", "engine.locate", "engine.waitForStable",
-  "engine.screenshot", "engine.navHistory",
+  "engine.screenshot", "engine.navHistory", "engine.waitFor",
 ]);
 const DROPPED = "BRIDGE_DROPPED";
 

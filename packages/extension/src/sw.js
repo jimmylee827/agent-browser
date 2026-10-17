@@ -132,12 +132,29 @@ const RETRY_SAFE = new Set([
   "hideScrollbar", "restoreScrollbar",
 ]);
 
+// The engine reports its own failures (NOT_ACTIONABLE, NO_SUCH_OPTION…) as an
+// ordinary reply carrying `error`, because sendResponse has no reject. Passing
+// that on as a result is how a failed select came back as `acted: true`.
+// Turn it into a thrown error here, once, for every method.
+class EngineError extends Error {
+  constructor(reply) {
+    super(reply.error);
+    this.code = reply.code;
+  }
+}
+const unwrap = (reply) => {
+  if (reply && typeof reply.error === "string") throw new EngineError(reply);
+  return reply;
+};
+
 async function callEngine(tabId, method, params) {
   // Target the TOP frame only — broadcasting lets cross-origin tracking
   // iframes answer first. The engine walks same-origin child frames itself.
   try {
-    return await chrome.tabs.sendMessage(tabId, { method, params }, { frameId: 0 });
+    return unwrap(await chrome.tabs.sendMessage(tabId, { method, params }, { frameId: 0 }));
   } catch (e) {
+    // The engine ran and said no. Never retried: for act, it may have done part.
+    if (e instanceof EngineError) throw e;
     const msg = String(e.message || e);
     // The message never reached a content script — nothing ran, so retrying
     // is always safe (tab predates the extension, or was orphaned by a reload).
@@ -175,12 +192,15 @@ async function callEngine(tabId, method, params) {
       } catch (injErr) {
         lastErr = injErr; // page may be mid-commit; fall through and retry
       }
+      let reply;
       try {
-        return await chrome.tabs.sendMessage(tabId, { method, params }, { frameId: 0 });
+        reply = await chrome.tabs.sendMessage(tabId, { method, params }, { frameId: 0 });
       } catch (retryErr) {
         lastErr = retryErr;
         await new Promise((r) => setTimeout(r, 400));
+        continue;
       }
+      return unwrap(reply); // an engine error here ends the retries
     }
     throw lastErr;
   }
@@ -308,16 +328,22 @@ async function captureRegion(tab, region, opts = {}) {
 
 // Full page, one element (by ref), or a region; otherwise the viewport.
 async function screenshot(tab, params = {}) {
-  if (!params.fullPage && params.ref == null && !params.clip) {
+  const resized = params.scale != null || params.format != null;
+  if (!params.fullPage && params.ref == null && !params.clip && !resized) {
     const m = await callEngine(tab.id, "pageMetrics", {}).catch(() => null);
     return {
       screenshot: await captureViewport(tab.windowId),
       url: tab.url,
+      format: "png",
       ...(m ? { viewport: { scrollX: m.scrollX, scrollY: m.scrollY, width: m.innerWidth, height: m.innerHeight, pageHeight: m.scrollHeight } } : {}),
     };
   }
   let region;
-  if (params.fullPage) {
+  if (!params.fullPage && params.ref == null && !params.clip) {
+    // The viewport, but at a chosen scale or format: the visible region.
+    const m = await callEngine(tab.id, "pageMetrics", {});
+    region = { x: 0, y: m.scrollY, width: m.innerWidth, height: m.innerHeight };
+  } else if (params.fullPage) {
     const m = await callEngine(tab.id, "pageMetrics", {});
     region = { x: 0, y: 0, width: m.innerWidth, height: m.scrollHeight };
   } else if (params.ref != null) {
@@ -388,6 +414,34 @@ async function dispatch(method, params) {
       return { navigating: true, to: params.action, tabId: tabForNav.id, via: "browser" };
     }
   }
+  // Tabs. "The active tab" is what every other method acts on, so switching
+  // here moves the agent. Within a window this never raises Chrome; a tab in
+  // another window needs that window focused, which brings it forward.
+  if (method === "engine.tabs") {
+    let focusedWindow = false;
+    if (params.action === "switch" || params.action === "close") {
+      const target = await chrome.tabs.get(params.tabId).catch(() => null);
+      if (!target) throw new Error(`NO_SUCH_TAB: no tab ${params.tabId}; list the tabs first`);
+      if (params.action === "close") await chrome.tabs.remove(params.tabId);
+      else {
+        await chrome.tabs.update(params.tabId, { active: true });
+        const current = await activeTab().catch(() => null);
+        if (current?.id !== params.tabId) {
+          await chrome.windows.update(target.windowId, { focused: true });
+          focusedWindow = true;
+        }
+      }
+    } else if (params.action === "new") {
+      await chrome.tabs.create({ url: params.url || "about:blank", active: true });
+    }
+    const active = await activeTab().catch(() => null);
+    const all = await chrome.tabs.query({});
+    return {
+      tabs: all.map((t) => ({ tabId: t.id, url: t.url, title: t.title, active: t.id === active?.id, windowId: t.windowId })),
+      activeTabId: active?.id,
+      ...(focusedWindow ? { focusedWindow } : {}),
+    };
+  }
   const tab = await activeTab();
   if (method === "engine.ping") {
     const pong = await callEngine(tab.id, "ping", params).catch((e) => ({
@@ -420,6 +474,8 @@ async function dispatch(method, params) {
   if (method === "engine.robustClick") return await robustClick(tab.id, params);
   if (method === "engine.waitForNavigation") return await waitForNavigation(params);
   if (method === "engine.navHistory") return { navigations: NAV_LOG.slice(-25) };
+  if (method === "engine.scroll") return await callEngine(tab.id, "scrollPage", params);
+  if (method === "engine.waitFor") return await callEngine(tab.id, "waitFor", params);
   if (method === "engine.waitForStable") return await callEngine(tab.id, "waitForStable", params);
   if (method === "engine.screenshot") return await screenshot(tab, params);
   throw new Error(`unknown method: ${method}`);
@@ -601,13 +657,25 @@ async function robustClick(tabId, params = {}) {
 function dialogTamer() {
   if (window.__abTamed) return;
   window.__abTamed = true;
-  const report = (kind, message) =>
+  const report = (kind, message, answer) =>
     window.dispatchEvent(
-      new CustomEvent("ab-dialog", { detail: { kind, message: String(message ?? ""), ts: Date.now() } }),
+      new CustomEvent("ab-dialog", { detail: { kind, message: String(message ?? ""), answer, ts: Date.now() } }),
     );
-  window.alert = (m) => report("alert", m);
-  window.confirm = (m) => (report("confirm", m), true);
-  window.prompt = (m, d) => (report("prompt", m), d ?? "");
+  // The agent's choice for this action, set by the content engine on <html>
+  // before it acts. Default accept: the agent clicked the thing that asks.
+  const dismiss = () => document.documentElement.getAttribute("data-ab-dialog") === "dismiss";
+  window.alert = (m) => report("alert", m, "ok");
+  window.confirm = (m) => {
+    const ok = !dismiss();
+    report("confirm", m, ok ? "ok" : "cancel");
+    return ok;
+  };
+  window.prompt = (m, d) => {
+    if (dismiss()) return report("prompt", m, null), null;
+    const text = document.documentElement.getAttribute("data-ab-dialog-text") ?? d ?? "";
+    report("prompt", m, text);
+    return text;
+  };
   window.addEventListener("beforeunload", (e) => {
     e.stopImmediatePropagation();
     delete e.returnValue;

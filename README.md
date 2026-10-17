@@ -118,10 +118,13 @@ the daemon.)
 
 | Tool | What it does |
 | ---- | ------------ |
-| `agent_browser_visit({url} \| {history}, text?)` | Navigate — or go back / forward / reload — wait for the page to settle, return an accessibility tree. `text: true` adds the visible text. |
-| `agent_browser_act({name, role?, action, value?, snapshot?})` | Find an element by accessible name, act on it, wait, return the new tree. Says `noEffect` when nothing changed. |
-| `browser_observe({mode: "read", offset?})` | The page's visible text, paged. |
+| `agent_browser_visit({url} \| {history}, text?, snapshot?)` | Navigate — or go back / forward / reload — wait for the page to settle, return an accessibility tree. `text: true` adds the visible text; `snapshot: "none"` drops the tree. |
+| `agent_browser_act({name, role?, action, value?, snapshot?, onDialog?})` | Find an element by accessible name, act on it, wait, return the new tree. A failed action is an error; one that changed nothing says `noEffect`. |
+| `browser_observe({mode: "read", offset?})` | The page's visible text, paged, including same-origin iframes. |
 | `browser_screenshot({fullPage? \| name? \| ref? \| clip?})` | Viewport, whole page (stitched), one element, or a region. |
+| `browser_tabs({action})` | List, switch, open or close tabs. |
+| `browser_scroll({to \| y})` | Scroll; reports `atBottom` and how much an infinite feed grew. |
+| `browser_wait({text? \| name? \| role?, gone?})` | Wait for text or an element to appear or go; with none, for the page to go quiet. |
 | `agent_browser_status()` | Is the browser ready? No side effects. |
 | `agent_browser_ensure_running()` | Idempotent launch (auto-fires on first visit). |
 
@@ -133,8 +136,7 @@ substring; pass `role` when a name is ambiguous. `snapshot` is `full`
 ### Advanced primitives
 
 `browser_status` · `browser_ping` · `browser_locate` · `browser_navigate` ·
-`browser_act` · `browser_wait` · `browser_robust_click` ·
-`browser_wait_for_navigation`
+`browser_act` · `browser_robust_click` · `browser_wait_for_navigation`
 
 Ref-based, for surgical control. Most agents never need them.
 

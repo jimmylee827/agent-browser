@@ -115,6 +115,9 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
     if (/HALTED/.test(msg)) return HALT_ADVICE;
     if (!ctx.bridge.connected()) return "the browser is not connected: call agent_browser_ensure_running, then retry";
     if (/STALE_SNAPSHOT|REF_NOT_FOUND/.test(msg)) return "the page changed: take a fresh snapshot (agent_browser_visit / browser_observe), then retry";
+    if (/NO_SUCH_OPTION/.test(msg)) return "nothing was selected; retry with one of the options listed in the error";
+    if (/INVALID_VALUE/.test(msg)) return "the field is unchanged; retry with a value in the format the error gives";
+    if (/NO_SUCH_TAB/.test(msg)) return "call browser_tabs({action:\"list\"}) for the current tab ids";
     if (/NOT_ACTIONABLE/.test(msg)) return "element not actionable (hidden, disabled, or covered): wait or scroll, then retry";
     return fallback;
   };
@@ -132,7 +135,9 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         matches?: { role: string; name: string }[];
       }).matches ?? [];
     let similar = role && name ? await near({ name }) : [];
-    if (!similar.length && role) similar = await near({ role });
+    // Listing every element of the role only helps when no name was given;
+    // with one, it was just the first five buttons on the page.
+    if (!similar.length && role && !name) similar = await near({ role });
     if (!similar.length && name) {
       const word = name.split(/\s+/).sort((a, b) => b.length - a.length)[0];
       if (word && word.length >= 3 && word !== name) similar = await near({ name: word });
@@ -147,15 +152,30 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   const ping = async () =>
     (await ctx.bridge.request("engine.ping", {})) as {
-      tab?: { url?: string; title?: string; status?: string };
-      engine?: { error?: string };
+      tab?: { id?: number; url?: string; title?: string; status?: string };
+      engine?: { error?: string; title?: string };
     };
 
   type Snap = Record<string, unknown> & { url?: string; tree?: unknown[] };
-  const settleAndObserve = async (observe: Record<string, unknown> = {}) => {
-    await ctx.bridge.request("engine.waitForStable", { timeout: 8000, quietMs: 600 }).catch(() => {});
-    return (await ctx.bridge.request("engine.observe", { mode: "semantic", ...observe })) as Snap;
+  type SnapshotSize = "full" | "viewport" | "none";
+  /** The page's own title: Chrome shows the URL as the tab title when a page
+   *  has none, which disagreed with what observe reported. */
+  const brief = async (): Promise<Snap> => {
+    const p = await ping();
+    return { url: p.tab?.url, title: p.engine?.title ?? p.tab?.title };
   };
+  const observeAs = async (size: SnapshotSize): Promise<Snap> =>
+    size === "none"
+      ? brief()
+      : ((await ctx.bridge.request("engine.observe", { mode: "semantic", viewportOnly: size === "viewport" })) as Snap);
+  const settleAndObserve = async (size: SnapshotSize = "full") => {
+    await ctx.bridge.request("engine.waitForStable", { timeout: 8000, quietMs: 600 }).catch(() => {});
+    return observeAs(size);
+  };
+  const snapshotOption = z
+    .enum(["full", "viewport", "none"])
+    .default("full")
+    .describe("What the snapshot holds: full (default), viewport (only what is on screen — much smaller), none (just url and title)");
 
   /**
    * Add the page's visible text to a snapshot when asked, and always when the
@@ -204,6 +224,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         } catch {}
       }
       return ok({
+        serverRunning: true, // answering at all means it is (the launcher reports false)
         bridgeConnected,
         activeTab,
         hostHelperReachable: helperUp,
@@ -248,8 +269,11 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         .optional()
         .describe("Move through this tab's history instead of opening a URL."),
       text: z.boolean().default(false).describe("Also return the page's visible text (first 8000 chars; the result says how to page on)."),
+      snapshot: snapshotOption.describe(
+        "Tree size: full (default), viewport (only what is on screen), none (no tree — with text:true, just the text)",
+      ),
     },
-    async ({ url, history, text }) => {
+    async ({ url, history, text, snapshot }) => {
       if (!url === !history) return fail("give exactly one of url or history", "e.g. {url:\"https://…\"} or {history:\"back\"}");
       const up = await ensureBrowser(45_000);
       if (isFail(up)) return up;
@@ -274,7 +298,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
               `${history} did not change the page (still on ${before})`,
               `there may be no ${history === "back" ? "earlier" : "later"} page in this tab's history; open the page with agent_browser_visit({url}) instead`,
             );
-          const snap = await attachText(await settleAndObserve(), text);
+          const snap = await attachText(await settleAndObserve(snapshot), text);
           ctx.audit.log("tool.agent_browser_visit", { history, from: before, to: snap.url });
           return ok(snap);
         } catch (e) {
@@ -307,7 +331,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
             if (!tabUrl) continue;
             const h = new URL(tabUrl).hostname;
             if (h === wantHost || h.endsWith("." + wantHost) || wantHost.endsWith("." + h)) {
-              const snap = await attachText(await settleAndObserve(), text);
+              const snap = await attachText(await settleAndObserve(snapshot), text);
               ctx.audit.log("tool.agent_browser_visit", { url });
               return ok(snap);
             }
@@ -341,10 +365,14 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         .default("click")
         .describe("click (default) | type (append text) | fill (replace text) | clear | press (key, value=key; Enter in a form field submits it) | hover | focus | check | uncheck | submit | select (dropdown; value = option text or value)"),
       value: z.string().optional().describe("Required for type/fill/press/select; for press it's the key (e.g. \"Enter\")"),
-      snapshot: z
-        .enum(["full", "viewport", "none"])
-        .default("full")
-        .describe("What snapshotAfter holds: full (default), viewport (only what is on screen — much smaller), none (just url and title; use for a run of fills)"),
+      snapshot: snapshotOption.describe(
+        "What snapshotAfter holds: full (default), viewport (only what is on screen — much smaller), none (just url and title; use for a run of fills)",
+      ),
+      onDialog: z
+        .enum(["accept", "dismiss"])
+        .default("accept")
+        .describe("How to answer a confirm/prompt box this action raises: accept (OK, the default) or dismiss (Cancel). Boxes that appeared are listed in `dialogs`."),
+      dialogText: z.string().optional().describe("The answer to type into a prompt box, if one appears"),
       actionClass: z
         .string()
         .optional()
@@ -359,7 +387,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         ),
       session: z.string().default("default"),
     },
-    async ({ name, role, action, value, actionClass, robust, snapshot, session }) => {
+    async ({ name, role, action, value, actionClass, robust, snapshot, onDialog, dialogText, session }) => {
       try {
         if (existsSync(resolve(ctx.cfg.stateDir, "HALT"))) return fail("HALTED: kill switch active", HALT_ADVICE);
 
@@ -368,7 +396,8 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
 
         // Policy gate: only fires for an explicitly labelled sensitive class.
         // A plain click/type/submit is an ordinary action anywhere on the web.
-        const tabUrl = (await ping()).tab?.url ?? "";
+        const tabBefore = (await ping()).tab;
+        const tabUrl = tabBefore?.url ?? "";
         const d = ctx.policy.evaluate({ url: tabUrl, actionClass });
         if (!d.allow) return fail(`blocked by policy: ${d.reason}`, POLICY_ADVICE);
 
@@ -396,13 +425,15 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
           // engine's reply can be lost to a closed port. That is SUCCESS, not
           // failure — the SW distinguishes it (PORT_CLOSED_AFTER_ACTION) rather
           // than retrying, which would fire the action a second time.
-          let result: { acted?: boolean; changed?: boolean; signals?: Record<string, unknown> };
+          let result: { acted?: boolean; changed?: boolean; signals?: Record<string, unknown>; dialogs?: unknown[] };
           try {
             result = (await ctx.bridge.request("engine.act", {
               ref: match.ref,
               gen: loc.snapshotGeneration,
               action,
               value,
+              onDialog,
+              dialogText,
             })) as typeof result;
           } catch (e) {
             if (!PORT_DIED.test((e as Error).message)) throw e;
@@ -457,18 +488,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
           // and perform the action twice.
           let after: Snap;
           try {
-            if (snapshot === "none") {
-              const p = await ping();
-              after = { url: p.tab?.url, title: p.tab?.title };
-            } else {
-              after = await attachText(
-                (await ctx.bridge.request("engine.observe", {
-                  mode: "semantic",
-                  viewportOnly: snapshot === "viewport",
-                })) as Snap,
-                false,
-              );
-            }
+            after = await attachText(await observeAs(snapshot), false);
           } catch (obsErr) {
             const p = await ping().catch(() => ({}) as Awaited<ReturnType<typeof ping>>);
             ctx.audit.log("act.observe_failed", { name, action, msg: (obsErr as Error).message });
@@ -484,15 +504,25 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
           // engine's own flag is taken 60ms after the action, before most
           // navigations commit, so the two used to disagree.
           const navigated = tabUrl !== after.url;
+          // A link with target=_blank moves the agent to a new tab; say so, so
+          // it knows the old one is still there (browser_tabs switches back).
+          const tabNow = (await ping().catch(() => null))?.tab;
+          const switchedTab =
+            tabNow?.id != null && tabBefore?.id != null && tabNow.id !== tabBefore.id
+              ? { from: tabBefore.id, to: tabNow.id, hint: "this action opened or moved to another tab; browser_tabs lists, switches and closes tabs" }
+              : undefined;
           // An action meant to change something that changed nothing is not a
           // success. The Enter that did nothing on Wikipedia came back as a
           // plain `acted: true`; say so instead, so the caller tries another way.
+          // A slow server: the form was submitted, but the next page has not
+          // arrived. The tab is loading — that is an effect, not a no-op.
+          const loading = !navigated && tabNow?.status === "loading";
           const noEffect =
-            !["hover", "focus"].includes(action) && !navigated && result.changed === false;
+            !["hover", "focus"].includes(action) && !navigated && !loading && result.changed === false;
           const warning = !noEffect
             ? undefined
             : escalated === "robust"
-              ? "the first click changed nothing; a page-world retry ran and the URL did not change. Check snapshotAfter before assuming it worked"
+              ? `the first click changed nothing; a page-world retry ran and the URL did not change. ${snapshot === "none" ? "Take a snapshot" : "Check snapshotAfter"} before assuming it worked`
               : "nothing on the page changed (no navigation, no DOM or value change): this probably did not do what you intended";
 
           ctx.audit.log("tool.agent_browser_act", { name, role, action, urlBefore: tabUrl, urlAfter: after.url, noEffect });
@@ -505,6 +535,13 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
             escalated,
             navigated,
             ...(noEffect ? { noEffect, warning } : {}),
+            ...(loading
+              ? { stillLoading: true, hint: "the action started a page load that has not finished: call browser_wait, then look — do not repeat the action" }
+              : {}),
+            // Always reported, whatever the snapshot size: a confirm box the
+            // page asked is a decision made on the user's behalf.
+            ...(result.dialogs?.length ? { dialogs: result.dialogs } : {}),
+            ...(switchedTab ? { switchedTab } : {}),
             urlBefore: tabUrl,
             urlAfter: after.url,
             snapshotAfter: after,
@@ -748,21 +785,87 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
 
   server.tool(
     "browser_wait",
-    "[advanced] Wait until the page is DOM/network-quiet (no CDP heuristic). Use after navigation or an action that triggers loading.",
+    [
+      "Wait for the page. With text, or name/role: until that text or element appears ",
+      "(gone:true — until it disappears), up to 25s. With neither: until the page is ",
+      "DOM/network-quiet. Use after an action that loads something.",
+    ].join(""),
     {
       session: z.string().default("default"),
+      text: z.string().optional().describe("Wait until this text is on the page (case-insensitive)"),
+      name: z.string().optional().describe("Wait until an element with this accessible name exists"),
+      role: z.string().optional().describe("Narrow `name` to a role, or wait for any element of this role"),
+      gone: z.boolean().default(false).describe("Wait for the text/element to disappear instead"),
       timeout: z.number().int().default(8000),
       quietMs: z.number().int().default(600),
     },
-    async ({ session, timeout, quietMs }) => {
+    async ({ session, text, name, role, gone, timeout, quietMs }) => {
       try {
-        const r = await ctx.sessions.withLock(session, () =>
-          ctx.bridge.request("engine.waitForStable", { timeout, quietMs }),
-        );
-        ctx.audit.log("tool.browser_wait", { session });
+        const targeted = text !== undefined || name !== undefined || role !== undefined;
+        const r = (await ctx.sessions.withLock(session, () =>
+          targeted
+            ? ctx.bridge.request("engine.waitFor", { text, name, role, gone, timeout })
+            : ctx.bridge.request("engine.waitForStable", { timeout, quietMs }),
+        )) as { timedOut?: boolean };
+        ctx.audit.log("tool.browser_wait", { session, targeted });
+        if (targeted && r.timedOut)
+          return fail(
+            `${gone ? "still there" : "did not appear"} after ${Math.min(timeout, 25_000)}ms`,
+            "check the page (browser_observe) — the text or name may differ from what you expect",
+          );
         return ok(r);
       } catch (e) {
         return failWith(e, "retry; if it repeats, call agent_browser_status");
+      }
+    },
+  );
+
+  server.tool(
+    "browser_scroll",
+    [
+      "Scroll the active page: to top or bottom, a screen up or down, or to a y offset. Returns ",
+      "the position, page height, atBottom, and grewBy when the page loaded more (an infinite ",
+      "feed). Element actions and screenshots scroll by themselves; use this to load more ",
+      "content or to look around.",
+    ].join(""),
+    {
+      session: z.string().default("default"),
+      to: z.enum(["top", "bottom", "up", "down"]).optional(),
+      y: z.number().optional().describe("Scroll to this offset in CSS pixels instead"),
+    },
+    async ({ session, to, y }) => {
+      if (!to === (y === undefined)) return fail("give exactly one of to or y", "e.g. {to:\"bottom\"} or {y:2400}");
+      try {
+        const r = await ctx.sessions.withLock(session, () => ctx.bridge.request("engine.scroll", { to, y }));
+        ctx.audit.log("tool.browser_scroll", { session, to, y });
+        return ok(r);
+      } catch (e) {
+        return failWith(e, "retry; if it repeats, call agent_browser_status");
+      }
+    },
+  );
+
+  server.tool(
+    "browser_tabs",
+    [
+      "List, switch, open or close the agent browser's tabs. Every other tool acts on the active ",
+      "tab, so switching moves the agent. Switching within a window never brings Chrome to the ",
+      "front; a tab in another window does (the result says focusedWindow).",
+    ].join(""),
+    {
+      action: z.enum(["list", "switch", "new", "close"]).default("list"),
+      tabId: z.number().int().optional().describe("For switch and close: a tabId from the list"),
+      url: z.string().url().optional().describe("For new: the page to open"),
+    },
+    async ({ action, tabId, url }) => {
+      if ((action === "switch" || action === "close") && tabId === undefined)
+        return fail(`${action} needs a tabId`, "call browser_tabs({action:\"list\"}) first");
+      try {
+        const r = await ctx.bridge.request("engine.tabs", { action, tabId, url });
+        ctx.audit.log("tool.browser_tabs", { action, tabId });
+        return ok(r);
+      } catch (e) {
+        return failWith(e, "list the tabs, then retry");
       }
     },
   );
@@ -822,9 +925,11 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
           const images = (r.images ?? [r.screenshot]).map(imageContent).filter((i) => i !== null);
           if (!images.length) return fail("no screenshot came back", "retry; if it repeats, call agent_browser_status");
           const { screenshot: _s, images: _i, ...meta } = r;
+          // Bytes per image, so a caller can see the cost before using one.
+          const bytes = images.map((i) => Math.floor((i.data.length * 3) / 4));
           return {
             content: [
-              { type: "text" as const, text: JSON.stringify({ ...meta, ...(images.length > 1 ? { tiles: images.length } : {}) }) },
+              { type: "text" as const, text: JSON.stringify({ ...meta, bytes, ...(images.length > 1 ? { tiles: images.length } : {}) }) },
               ...images,
             ],
           };
