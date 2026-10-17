@@ -9,7 +9,18 @@ interface Pending {
   resolve: (v: unknown) => void;
   reject: (e: Error) => void;
   timer: NodeJS.Timeout;
+  ws: WebSocket;
 }
+
+/**
+ * Engine methods that change nothing, so re-sending one after the extension
+ * dropped mid-call is safe. Anything else may already have acted.
+ */
+const READ_ONLY = new Set([
+  "engine.ping", "engine.observe", "engine.locate", "engine.waitForStable",
+  "engine.screenshot", "engine.navHistory",
+]);
+const DROPPED = "BRIDGE_DROPPED";
 
 /** Comfortably inside Chrome's ~30s service-worker idle timeout. */
 const HEARTBEAT_MS = 20_000;
@@ -91,6 +102,15 @@ export class Bridge {
           clearInterval(heartbeat);
           if (this.client === ws) this.client = undefined;
           this.audit.log("bridge.disconnected", {});
+          // Nothing will ever answer a request sent on this socket. Fail them
+          // now instead of leaving each to its 30s timeout — that is what made
+          // the first call after an extension self-reload hang.
+          for (const [id, p] of this.pending) {
+            if (p.ws !== ws) continue;
+            this.pending.delete(id);
+            clearTimeout(p.timer);
+            p.reject(new Error(`${DROPPED}: the browser extension restarted while the call was in flight`));
+          }
         });
       });
       setTimeout(() => {
@@ -143,11 +163,23 @@ export class Bridge {
   }
 
   /** Send a command to the extension engine and await its correlated reply. */
-  request<T = unknown>(
+  async request<T = unknown>(
     method: string,
     params: Record<string, unknown> = {},
     timeoutMs = this.cfg.bridge.requestTimeoutMs,
   ): Promise<T> {
+    try {
+      return await this.send<T>(method, params, timeoutMs);
+    } catch (e) {
+      // A read-only call lost to an extension restart is re-sent once on the
+      // new connection. A state-changing one is not: it may have run.
+      if (!String((e as Error).message).startsWith(DROPPED) || !READ_ONLY.has(method)) throw e;
+      if (!(await this.waitForConnection(8_000))) throw e;
+      return await this.send<T>(method, params, timeoutMs);
+    }
+  }
+
+  private send<T>(method: string, params: Record<string, unknown>, timeoutMs: number): Promise<T> {
     if (this.halted()) {
       this.audit.log("bridge.halted", { method });
       return Promise.reject(
@@ -165,8 +197,9 @@ export class Bridge {
         this.pending.delete(id);
         reject(new Error(`bridge request timeout: ${method}`));
       }, timeoutMs);
-      this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer });
-      this.client!.send(JSON.stringify({ id, method, params }));
+      const ws = this.client!;
+      this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer, ws });
+      ws.send(JSON.stringify({ id, method, params }));
     });
   }
 }

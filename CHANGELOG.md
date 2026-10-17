@@ -33,7 +33,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `browser_observe({mode: "read"})` pages long text with `offset`/`maxChars`
   and says when there is more
 
+- A stdio launcher (`dist/launcher.js`) to register with MCP clients in place
+  of the HTTP address. It always loads, so the browser tools exist even when
+  everything is off, and it starts the daemon on the first call that needs it.
+  Registered by URL, a session that began while the daemon was down had no
+  browser tools and no way to get them
+- `browser_screenshot` captures tables, rows, figures, images, articles, lists
+  and paragraphs by role and name, though the snapshot leaves them out
+- `npm run mcp:stop`; the daemon logs the signal it stopped on
+
 ### Fixed
+- A call no longer hangs for 30s when the extension restarts under it: pending
+  calls fail as soon as the connection drops, and read-only ones are re-sent
+  once on the new connection. A self-reloading worker now checks itself before
+  connecting, so it takes no calls it is about to drop
+- A cold start no longer waits 8s for a browser that isn't running (1.1s now)
+- `npm run mcp:restart` loads the daemon when it was stopped, instead of
+  failing with `Could not find service`
+- Full-page captures no longer repeat the scrollbar down the right edge, and
+  default to JPEG (a 6.7 MB PNG became about 1.8 MB)
+- A missed element lookup in `browser_screenshot` names similar elements, as
+  `agent_browser_act` does, and says when nothing has that role
 - Custom-styled checkboxes and radios are reachable. Inputs hidden with
   `opacity: 0` (the real control under a painted box, as in TodoMVC) were
   dropped from the snapshot and from lookup; an unlabelled checkbox now takes

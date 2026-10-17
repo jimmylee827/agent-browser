@@ -30,9 +30,12 @@ That's the whole API. No refs to track, no snapshot generations, no selectors.
 │  Chrome (persistent profile, no automation flags)      │
 │   └─ Agent Bridge MV3 extension ──┐                    │
 │                                   │ ws 127.0.0.1:8787  │
-│  mcp-server  ◄────────────────────┘                    │
-│   ├─ stdio MCP        → Claude Code et al.             │
+│  mcp-server (daemon) ◄────────────┘                    │
 │   └─ HTTP MCP :8788   → any HTTP-capable MCP client    │
+│        ▲                                               │
+│  launcher (stdio, one per client session)              │
+│   └─ lists tools always; starts the daemon on demand   │
+│        ▲  Claude Code et al.                           │
 │                                                        │
 │  host-helper :8789 (launchd, optional)                 │
 │   └─ one job: spawn GUI Chrome on request              │
@@ -50,12 +53,23 @@ npm run launch                       # opens Chrome on the agent profile
 Then, once: `chrome://extensions` → Developer mode → **Load unpacked** →
 select `packages/extension`.
 
-Install the server as a background daemon, and point your client at it:
+Install the server as a background daemon, and register the launcher with
+your client:
 
 ```bash
 npm run mcp:install     # launchd agent, starts at login, restarts on crash
-claude mcp add --transport http agent-browser http://127.0.0.1:8788/mcp --scope user
+claude mcp add agent-browser --scope user -- "$(which node)" "$PWD/packages/mcp-server/dist/launcher.js"
 ```
+
+Register the launcher, not the daemon's HTTP address. A client only reads a
+server's tools when a session starts: registered by URL, a session that starts
+while the daemon is down gets no browser tools at all, and nothing inside the
+session can bring them back. The launcher always starts, lists the tools from
+the same code the daemon runs, and starts the daemon on the first call that
+needs it. `agent_browser_status` reports "off" without starting anything, and
+nothing starts while the kill switch is on.
+
+Clients that only speak HTTP can still use `http://127.0.0.1:8788/mcp` directly.
 
 When Chrome isn't running, the browser tools launch it themselves — the daemon
 runs in your GUI login session, so it can open Chrome directly. The host helper
@@ -78,15 +92,25 @@ the server owns fixed ports and exits if they're taken, two concurrent stdio
 clients fight and the second one dies. One long-lived server fixes both: any
 number of clients attach over HTTP.
 
-Stdio still works (`npm run mcp`) if you'd rather run it per-session; just don't
-run both.
+The launcher is a thin stdio front for that one daemon, so many sessions share
+it. (`npm run mcp` runs the full server on stdio instead; don't run it beside
+the daemon.)
 
 | | |
 | --- | --- |
 | `npm run mcp:status` | is it up? |
-| `npm run mcp:restart` | reload after `npm run build` |
-| `npm run mcp:logs` | follow stderr |
+| `npm run mcp:restart` | reload after `npm run build` (loads it if it was stopped) |
+| `npm run mcp:stop` | stop it; it starts again at login or on the next browser tool call |
+| `npm run mcp:logs` | follow stderr (says why it stopped) |
 | `npm run mcp:uninstall` | remove the launchd agent |
+
+### Troubleshooting
+
+| Symptom | Fix |
+| --- | --- |
+| No `agent-browser` tools in a session | The client is registered by URL, or the registration is missing. Register the launcher (above), then start a new session — or `/mcp` → reconnect. |
+| `Could not find service "com.agent-browser.mcp-server"` | Old `mcp:restart`; update, or run `npm run mcp:install`. |
+| Tools answer `HALTED` | The kill switch is on (`~/.agent-chrome/HALT`). That is the user's call: `npm run resume`. |
 
 ## Tools
 

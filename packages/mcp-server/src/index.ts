@@ -48,6 +48,16 @@ async function main() {
     makeHttpTransport: () => new StreamableHTTPServerTransport({ sessionIdGenerator: undefined }), // stateless
   });
 
+  // Say why we stopped. A daemon booted out by launchd, or killed, used to
+  // leave a log of "MCP up" lines and nothing else.
+  for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
+    process.on(sig, () => {
+      audit.log("mcp.stopped", { signal: sig });
+      process.stderr.write(`[agent-browser] stopping on ${sig} at ${new Date().toISOString()}\n`);
+      process.exit(0);
+    });
+  }
+
   audit.log("mcp.started", { bridgePort: cfg.bridge.port });
   process.stderr.write(
     `[agent-browser] MCP up. Bridge :${cfg.bridge.port}  ` +

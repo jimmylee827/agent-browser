@@ -129,6 +129,7 @@ async function waitForNavigation(params = {}) {
 const RETRY_SAFE = new Set([
   "ping", "observe", "locate", "waitForStable", "clearMarks",
   "pageMetrics", "rectOf", "scrollToY", "hideFixed", "restoreFixed",
+  "hideScrollbar", "restoreScrollbar",
 ]);
 
 async function callEngine(tabId, method, params) {
@@ -254,6 +255,7 @@ async function captureRegion(tab, region, opts = {}) {
   let hid = false;
   let slices = 0;
   let cur = y;
+  if (!fitsInView) await callEngine(tab.id, "hideScrollbar", {}).catch(() => {});
   try {
     while (cur < y + height) {
       const viewTop = fitsInView ? m.scrollY : (await callEngine(tab.id, "scrollToY", { y: Math.min(cur, maxScroll) })).scrollY;
@@ -282,6 +284,7 @@ async function captureRegion(tab, region, opts = {}) {
     }
   } finally {
     if (hid) await callEngine(tab.id, "restoreFixed", {}).catch(() => {});
+    if (!fitsInView) await callEngine(tab.id, "restoreScrollbar", {}).catch(() => {});
     if (!fitsInView) await callEngine(tab.id, "scrollToY", { y: m.scrollY }).catch(() => {});
   }
   if (cur < y + height)
@@ -325,7 +328,9 @@ async function screenshot(tab, params = {}) {
   // A full page at device resolution is huge; default it to 1 image pixel per
   // CSS pixel. Elements and regions keep full sharpness.
   const scale = params.scale ?? (params.fullPage ? 1 : undefined);
-  return { url: tab.url, ...(await captureRegion(tab, region, { scale, format: params.format })) };
+  // And JPEG: a full page as PNG ran to 6.7 MB, as JPEG 2.4 MB.
+  const format = params.format ?? (params.fullPage ? "jpeg" : "png");
+  return { url: tab.url, format, ...(await captureRegion(tab, region, { scale, format })) };
 }
 
 async function dispatch(method, params) {
@@ -643,14 +648,17 @@ async function reloadIfStale() {
     let h = 5381;
     for (let i = 0; i < disk.length; i++) h = ((h * 33) ^ disk.charCodeAt(i)) >>> 0;
     const { swReloadedFor } = await chrome.storage.local.get("swReloadedFor");
-    if (swReloadedFor === h) return;
+    if (swReloadedFor === h) return false;
     await chrome.storage.local.set({ swReloadedFor: h });
     console.log("[agent-bridge] running worker differs from src/sw.js on disk — reloading");
     chrome.runtime.reload();
+    return true;
   } catch (e) {
     console.warn("[agent-bridge] stale-worker check failed", e);
+    return false;
   }
 }
 
-reloadIfStale();
-ensureConnected();
+// Check before connecting, so a stale worker never takes calls it is about to
+// drop by reloading.
+reloadIfStale().then((reloading) => reloading || ensureConnected());

@@ -7,6 +7,7 @@ import type { Audit } from "../audit.js";
 import type { AppConfig } from "../config.js";
 import { hostHelper, launchBrowser } from "../host-helper-client.js";
 import { existsSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { resolve } from "node:path";
 
 const DRY_RUN = process.env.AB_DRY_RUN === "1";
@@ -45,7 +46,7 @@ function imageContent(dataUrl: unknown) {
 }
 // The kill switch is the human's. Telling an agent how to remove it — as the
 // old "rm ~/.agent-chrome/HALT to resume" did — invites it to.
-const HALT_ADVICE = "the user has switched on the kill switch: stop and tell them; do not try to turn it off";
+export const HALT_ADVICE = "the user has switched on the kill switch: stop and tell them; do not try to turn it off";
 // Same principle for the policy gate: the decision belongs to the user.
 const POLICY_ADVICE =
   "this needs the user's approval: stop and ask them. Do not retry it, relabel it, or change the policy yourself";
@@ -76,8 +77,10 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
   ): Promise<{ already: boolean; launchedVia?: string; waitedMs?: number } | ReturnType<typeof fail>> {
     if (ctx.bridge.connected()) return { already: true };
     // The worker may just be reconnecting (browser starting, extension
-    // reloaded). Give it a moment before concluding nothing is there.
-    if (await ctx.bridge.waitForConnection(8_000)) return { already: true };
+    // reloaded). Give it a moment before concluding nothing is there — but
+    // only if the agent Chrome is running at all; otherwise there is nothing
+    // to wait for, and the wait only delayed every cold start by 8s.
+    if (agentChromeRunning() && (await ctx.bridge.waitForConnection(8_000))) return { already: true };
     if (existsSync(resolve(ctx.cfg.stateDir, "HALT"))) return fail("HALTED: kill switch active", HALT_ADVICE);
     const launchedVia = await launchBrowser();
     ctx.audit.log("browser.launch", { via: launchedVia });
@@ -92,6 +95,17 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
   }
   const isFail = (r: object): r is ReturnType<typeof fail> => "isError" in r;
 
+  /** Is a Chrome running on the agent profile? (Unknown counts as yes.) */
+  const agentChromeRunning = () => {
+    try {
+      // No leading "--" in the pattern: pgrep would read it as an option.
+      execFileSync("pgrep", ["-f", `user-data-dir=${ctx.cfg.profileDir}`], { stdio: "ignore" });
+      return true;
+    } catch (e) {
+      return (e as { status?: number }).status !== 1; // 1 = no match
+    }
+  };
+
   /**
    * Recovery advice that matches the actual state. A fixed "ensure agent
    * Chrome is launched" sent agents chasing a browser that was running fine.
@@ -105,6 +119,30 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
     return fallback;
   };
   const failWith = (e: unknown, fallback: string) => fail((e as Error).message ?? String(e), advise(e, fallback));
+
+  /**
+   * Recovery advice for a lookup that found nothing: say what IS there. Pages
+   * change an element's role under you (Wikipedia's search box turns from
+   * searchbox into combobox once its suggestions open), and a bare "no
+   * element" hides that.
+   */
+  const suggest = async (name: string, role?: string): Promise<string> => {
+    const near = async (q: { role?: string; name?: string }) =>
+      ((await ctx.bridge.request("engine.locate", q).catch(() => ({}))) as {
+        matches?: { role: string; name: string }[];
+      }).matches ?? [];
+    let similar = role && name ? await near({ name }) : [];
+    if (!similar.length && role) similar = await near({ role });
+    if (!similar.length && name) {
+      const word = name.split(/\s+/).sort((a, b) => b.length - a.length)[0];
+      if (word && word.length >= 3 && word !== name) similar = await near({ name: word });
+    }
+    if (similar.length)
+      return `similar elements: ${similar.slice(0, 5).map((m) => `${m.role} "${m.name}"`).join(", ")} — retry with one of those`;
+    return role
+      ? `nothing with role ${role} on this page matches; drop role, use a shorter name, or call browser_observe to see what is there`
+      : "call agent_browser_visit to refresh the page snapshot, OR widen the name to a less specific substring";
+  };
 
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   const ping = async () =>
@@ -349,24 +387,8 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
             matches?: { ref: number; role: string; name: string }[];
           };
           const match = loc.matches?.[0];
-          if (!match) {
-            // Say what IS there. Pages change an element's role under you
-            // (Wikipedia's search box turns from searchbox into combobox once
-            // its suggestions open), and a bare "no element" hides that.
-            const near = async (q: { role?: string; name?: string }) =>
-              ((await ctx.bridge.request("engine.locate", q).catch(() => ({}))) as typeof loc).matches ?? [];
-            let similar = role ? await near({ name }) : [];
-            if (!similar.length) {
-              const word = name.split(/\s+/).sort((a, b) => b.length - a.length)[0];
-              if (word && word.length >= 3 && word !== name) similar = await near({ name: word });
-            }
-            return fail(
-              `no element matching role=${role ?? "any"} name="${name}" on ${tabUrl}`,
-              similar.length
-                ? `similar elements: ${similar.slice(0, 5).map((m) => `${m.role} "${m.name}"`).join(", ")} — retry with one of those`
-                : "call agent_browser_visit to refresh the page snapshot, OR widen the name to a less specific substring",
-            );
-          }
+          if (!match)
+            return fail(`no element matching role=${role ?? "any"} name="${name}" on ${tabUrl}`, await suggest(name, role));
 
           // 2. Act with the just-located ref + matching generation.
           //
@@ -759,7 +781,10 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
       session: z.string().default("default"),
       fullPage: z.boolean().default(false),
       name: z.string().optional().describe("Capture the first element whose accessible name contains this"),
-      role: z.string().optional().describe("Narrow `name` to a role (button, link, img, heading…)"),
+      role: z
+        .string()
+        .optional()
+        .describe("Narrow `name` to a role: button, link, heading… and also table, row, figure, img, article, list, paragraph — which are not in the snapshot but can be captured (a table is named by its caption or first text)"),
       ref: z.number().int().optional().describe("Capture this element from the latest snapshot"),
       clip: z
         .object({ x: z.number(), y: z.number(), width: z.number().positive(), height: z.number().positive() })
@@ -771,7 +796,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         .max(4)
         .optional()
         .describe("Image pixels per CSS pixel. Default: the screen's (sharp) — or 1 for fullPage, to keep it small"),
-      format: z.enum(["png", "jpeg"]).default("png").describe("jpeg is much smaller for photos and long pages"),
+      format: z.enum(["png", "jpeg"]).optional().describe("Default: jpeg for fullPage (about a third of the size), png otherwise"),
     },
     async ({ session, fullPage, name, role, ref, clip, scale, format }) => {
       const targets = [fullPage, name !== undefined || role !== undefined, ref !== undefined, clip !== undefined];
@@ -786,10 +811,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
             };
             target = loc.matches?.[0]?.ref;
             if (target === undefined)
-              return fail(
-                `no element matching role=${role ?? "any"} name="${name ?? ""}"`,
-                "widen the name to a shorter substring, or drop role",
-              );
+              return fail(`no element matching role=${role ?? "any"} name="${name ?? ""}"`, await suggest(name ?? "", role));
           }
           const r = (await ctx.bridge.request(
             "engine.screenshot",

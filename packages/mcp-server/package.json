@@ -15,7 +15,8 @@
     "url": "https://github.com/jimmylee827/agent-browser/issues"
   },
   "bin": {
-    "agent-browser-mcp": "dist/index.js"
+    "agent-browser-mcp": "dist/index.js",
+    "agent-browser-launcher": "dist/launcher.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

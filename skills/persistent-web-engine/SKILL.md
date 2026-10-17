@@ -87,11 +87,23 @@ agent_browser_visit({ history: "back" })      # also "forward", "reload"
 ```text
 browser_screenshot()                                   # what is on screen
 browser_screenshot({ fullPage: true })                 # whole page, stitched; long pages come as several images
-browser_screenshot({ name: "Infobox", role: "table" }) # one element
-browser_screenshot({ clip: { x, y, width, height } })  # region, CSS px from the page's top-left
+browser_screenshot({ name: "History", role: "heading" })   # one element
+browser_screenshot({ name: "Star Ferry", role: "table" })  # a table, named by its caption / first text
+browser_screenshot({ clip: { x, y, width, height } })      # region, CSS px from the page's top-left
 ```
-The result's `viewport.scrollY` converts what you see on screen into page
+Element capture also reaches things the snapshot leaves out — `table`, `row`,
+`figure`, `img`, `article`, `list`, `paragraph` — when you give the role. A
+miss names the closest candidates. Full pages default to JPEG at 1x (about a
+third the size of PNG); pass `format: "png"` or `scale` to change that. The
+result's `viewport.scrollY` converts what you see on screen into page
 coordinates for `clip`.
+
+### "The browser is off"
+
+`agent_browser_status` says `serverRunning: false` without starting anything.
+Any other browser tool — `agent_browser_ensure_running` is the obvious one —
+starts the server and the browser itself. If a tool answers `HALTED`, the user
+switched the kill switch on: stop and tell them.
 
 ### "Fill out a form"
 ```text

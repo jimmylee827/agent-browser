@@ -378,6 +378,19 @@
     AB.hiddenFixed = hidden;
     return { hidden: hidden.length };
   }
+  // macOS flashes its overlay scrollbar on every programmatic scroll, so each
+  // slice of a stitched capture carried a scrollbar thumb down the right edge.
+  function hideScrollbar() {
+    if (document.getElementById("__ab_noscrollbar")) return { ok: true };
+    const s = document.createElement("style");
+    s.id = "__ab_noscrollbar";
+    s.textContent =
+      "html,body{scrollbar-width:none!important}html::-webkit-scrollbar,body::-webkit-scrollbar{display:none!important}";
+    document.documentElement.appendChild(s);
+    return { ok: true };
+  }
+  const restoreScrollbar = () => (document.getElementById("__ab_noscrollbar")?.remove(), { ok: true });
+
   function restoreFixed() {
     for (const [el, v, prio] of AB.hiddenFixed || []) {
       if (v) el.style.setProperty("visibility", v, prio);
@@ -403,6 +416,46 @@
     return el;
   }
 
+  // Page structure the snapshot leaves out to stay small, but which callers
+  // still want to target — mostly to screenshot one (an infobox, a story row).
+  const STRUCTURAL = {
+    table: "table", row: "tr", cell: "td, th", figure: "figure", article: "article",
+    img: "img, svg", list: "ul, ol", listitem: "li", paragraph: "p",
+    region: "section", dialog: "dialog", code: "pre",
+  };
+
+  function structuralName(el) {
+    const own = accName(el);
+    if (own.trim()) return own;
+    // innerText, not textContent: cells and lines need their breaks, or a
+    // table reads "The Star Ferry CompanyStar Ferry Pier…".
+    const cap = el.querySelector(":scope > caption, :scope > figcaption");
+    const lead = cap?.innerText || el.getAttribute("alt") || el.innerText || el.textContent;
+    return clip(lead, 100);
+  }
+
+  // Find structural elements by role and name, and give them refs on demand.
+  // Innermost first: HN nests whole pages in table rows, so the row that is
+  // the story must come before the row that holds everything.
+  function locateStructural(roleName, want) {
+    const sel = [STRUCTURAL[roleName], `[role="${roleName}"]`].filter(Boolean).join(", ");
+    const found = [...document.querySelectorAll(sel)].filter(
+      (el) => visible(el) && (!want || structuralName(el).toLowerCase().includes(want)),
+    );
+    const outer = (el) => found.some((o) => o !== el && el.contains(o));
+    found.sort((a, b) => outer(a) - outer(b));
+    let next = Math.max(0, ...AB.refs.keys()) + 1;
+    return found.slice(0, 20).map((el) => {
+      let r = +el.getAttribute("data-ab-ref") || 0;
+      if (!r || AB.refs.get(r) !== el) {
+        r = next++;
+        el.setAttribute("data-ab-ref", String(r));
+        AB.refs.set(r, el);
+      }
+      return { ref: r, role: roleName, name: structuralName(el) };
+    });
+  }
+
   function locate(params = {}) {
     if (!AB.refs.size) buildTree(params);
     const want = (params.name || "").toLowerCase();
@@ -424,6 +477,8 @@
       buildTree(params);
       matches = search();
     }
+    if (!matches.length && params.role && (STRUCTURAL[params.role] || !INTERACTIVE.has(params.role)))
+      matches = locateStructural(params.role, want);
     return { snapshotGeneration: AB.gen, matches };
   }
 
@@ -705,6 +760,8 @@
         else if (m === "rectOf") sendResponse(rectOf(msg.params));
         else if (m === "hideFixed") sendResponse(hideFixed());
         else if (m === "restoreFixed") sendResponse(restoreFixed());
+        else if (m === "hideScrollbar") sendResponse(hideScrollbar());
+        else if (m === "restoreScrollbar") sendResponse(restoreScrollbar());
         else if (m === "locate") sendResponse(locate(msg.params));
         else if (m === "act") sendResponse(await act(msg.params));
         else if (m === "waitForStable") sendResponse(await waitForStable(msg.params));

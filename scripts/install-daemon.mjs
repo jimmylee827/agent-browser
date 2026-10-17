@@ -97,12 +97,13 @@ MCP server installed + loaded.
   • Logs          ${resolve(logDir, "mcp-server.out.log")}
                   ${resolve(logDir, "mcp-server.err.log")}
 
-Point a client at it:
-  claude mcp add --transport http agent-browser http://127.0.0.1:8788/mcp --scope user
+If your MCP client is not registered yet (skip this if it already is):
+  claude mcp add agent-browser --scope user -- ${node} ${resolve(root, "packages/mcp-server/dist/launcher.js")}
+The launcher always loads, and starts this server when a tool needs it.
 
 Verify:  curl http://127.0.0.1:8788/status
-Stop:    npm run mcp:uninstall
+Stop:    npm run mcp:stop       (remove for good: npm run mcp:uninstall)
 
 After rebuilding (\`npm run build\`), restart it so the new code is live:
-  launchctl kickstart -k gui/$(id -u)/${LABEL}
+  npm run mcp:restart
 `);
