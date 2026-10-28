@@ -285,3 +285,16 @@ test("status reports the build, and staleBuild once the disk has a newer one", {
   const s3 = await A("agent_browser_status", {});
   assert.equal(s3.data.staleBuild, false);
 });
+
+test("a connection that does not identify itself is told it shares a window", { skip }, async () => {
+  const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+  const { StreamableHTTPClientTransport } = await import("@modelcontextprotocol/sdk/client/streamableHttp.js");
+  const c = new Client({ name: "anon", version: "0" });
+  await c.connect(new StreamableHTTPClientTransport(new URL(`${h.base}/mcp`)));
+  try {
+    const r = await c.callTool({ name: "agent_browser_visit", arguments: { url: h.url("form.html"), snapshot: "none" } });
+    assert.match(JSON.parse(r.content[0].text).warning, /does not identify itself/);
+  } finally {
+    await c.close();
+  }
+});

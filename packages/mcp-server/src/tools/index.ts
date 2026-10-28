@@ -221,6 +221,13 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
       call.warnings.push(
         "session \"default\" acts on whichever tab is focused — which other agents and the user also use. Omit `session` to get a window of your own",
       );
+    // A client that does not name itself (a launcher from before sessions,
+    // or a bare HTTP client) cannot be told apart from any other such one:
+    // they all share one window. Say so on every call, with the fix.
+    else if (ctx.client.id === "anonymous")
+      call.warnings.push(
+        "this connection does not identify itself (an agent-browser launcher older than this server, or a plain HTTP client), so it shares one window with every other such connection. Reconnect the agent-browser MCP server (/mcp) to get a window of your own",
+      );
     if (args.tabId !== undefined && args.tabId !== s.tabId) {
       const owner = ctx.sessions.ownerOfTab(args.tabId);
       if (owner && owner !== s)
