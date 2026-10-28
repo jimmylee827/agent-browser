@@ -385,8 +385,15 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
     const p = await ping(sc);
     return { url: p.tab?.url, title: p.engine?.title ?? p.tab?.title };
   };
-  const observeAs = async (sc: Scope, size: SnapshotSize, details = false): Promise<Snap> =>
-    size === "none" ? brief(sc) : sc.req<Snap>("engine.observe", { mode: "semantic", viewportOnly: size === "viewport", details });
+  const observeAs = async (sc: Scope, size: SnapshotSize, details = false): Promise<Snap> => {
+    if (size !== "none") return sc.req<Snap>("engine.observe", { mode: "semantic", viewportOnly: size === "viewport", details });
+    // No tree, but a wall is still reported: an agent keeping its results
+    // small must still learn that a captcha stands in its way.
+    const [b, w] = await Promise.all([brief(sc), sc.req<{ needsHuman?: Snap["needsHuman"] }>("engine.detectWall").catch(() => null)]);
+    if (!w?.needsHuman) return b;
+    const shot = w.needsHuman.reason === "captcha" ? await sc.req<{ screenshot?: string }>("engine.captureViewport").catch(() => null) : null;
+    return { ...b, outcome: "needs_human", needsHuman: w.needsHuman, ...(shot?.screenshot ? { screenshot: shot.screenshot } : {}) };
+  };
 
   /**
    * Wait for the page: first DOM/network quiet, then layout and animations.

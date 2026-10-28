@@ -130,6 +130,11 @@ test("a captcha wall is reported as needing a human, with the frame and an image
   assert.equal(act.isError, true);
   assert.equal(act.data.code, "NEEDS_HUMAN");
   assert.ok(act.data.humanAction);
+  // Asking for no tree must not hide the wall.
+  const small = await A("agent_browser_visit", { url: h.url("captcha.html"), snapshot: "none" });
+  assert.equal(small.data.outcome, "needs_human");
+  assert.equal(small.data.needsHuman.reason, "captcha");
+  assert.ok(small.images.length >= 1);
 });
 
 test("a cookie banner is a consent wall the agent can dismiss", { skip }, async () => {
