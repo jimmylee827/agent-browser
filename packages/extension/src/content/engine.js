@@ -1560,6 +1560,23 @@
     return { pointer: done };
   }
 
+  // Where to click for real input: scroll the element into the middle of the
+  // screen, then give its centre in the viewport's own coordinates (the
+  // operating system works from the screen, the page from its viewport).
+  async function pointInView(p = {}) {
+    const el = resolve(p.ref, p.gen);
+    el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+    await nextPaint(250);
+    const b = el.getBoundingClientRect();
+    const x = b.left + b.width / 2;
+    const y = b.top + b.height / 2;
+    return {
+      point: { x, y },
+      inViewport: x >= 0 && y >= 0 && x <= innerWidth && y <= innerHeight,
+      rect: { x: b.x + scrollX, y: b.y + scrollY, width: b.width, height: b.height },
+    };
+  }
+
   // Whether the page's own hover styling applies to this element right now —
   // after real input, the honest check that the hover did something.
   function hoverState(p = {}) {
@@ -1681,6 +1698,7 @@
         else if (m === "prepareElementCapture") sendResponse(await prepareElementCapture(msg.params));
         else if (m === "inspect") sendResponse(inspect(msg.params));
         else if (m === "hoverState") sendResponse(hoverState(msg.params));
+        else if (m === "pointInView") sendResponse(await pointInView(msg.params));
         else if (m === "detectWall") sendResponse({ needsHuman: detectWall() });
         else if (m === "diagnostics") sendResponse(diagnostics(msg.params));
         else if (m === "clearMarks") {

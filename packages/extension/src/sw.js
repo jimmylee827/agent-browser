@@ -142,7 +142,7 @@ async function setViewport(tab, v) {
   }
   m = await metrics();
   const got = { width: m.innerWidth, height: m.innerHeight, deviceScaleFactor: Math.round(m.devicePixelRatio * 100) / 100 };
-  const off = got.width !== v.width || (v.deviceScaleFactor && Math.abs(got.deviceScaleFactor - v.deviceScaleFactor) > 0.05);
+  const off = got.width !== v.width || got.height !== v.height || (v.deviceScaleFactor && Math.abs(got.deviceScaleFactor - v.deviceScaleFactor) > 0.05);
   return { viewport: got, zoom, ...(off ? { note: `asked for ${v.width}x${v.height}${v.deviceScaleFactor ? ` @${v.deviceScaleFactor}x` : ""}; Chrome gave ${got.width}x${got.height} @${got.deviceScaleFactor}x` } : {}) };
 }
 

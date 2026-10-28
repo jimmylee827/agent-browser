@@ -102,7 +102,7 @@ export class InputHelper {
     pid: number,
     window: Rect,
     events: Event[],
-    opts: { route?: "pid" | "global"; raise?: boolean; restoreFocus?: boolean; timeoutMs?: number } = {},
+    opts: { route?: "pid" | "global"; raise?: boolean; restoreFocus?: boolean; restoreCursor?: boolean; timeoutMs?: number } = {},
   ): Promise<Record<string, unknown>> {
     return this.call(
       "pointer",
@@ -119,7 +119,9 @@ export class InputHelper {
         // a second "raise" picks a window by frame alone and can pick the
         // wrong Chrome window when two sit at the same place.
         raise: opts.raise ?? false,
-        restoreCursor: true,
+        // A real hover lasts only while the pointer stays there: putting the
+        // cursor back would end the state the caller asked to see.
+        restoreCursor: opts.restoreCursor ?? true,
         restoreFocus: opts.restoreFocus ?? true,
       },
       opts.timeoutMs ?? 15_000,

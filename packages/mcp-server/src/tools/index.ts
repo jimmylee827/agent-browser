@@ -894,17 +894,33 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
           if (!st.ok || !st.trusted) throw new AbError("TRUSTED_UNAVAILABLE", st.error ?? "real input is not available", { helper: st });
           const pid = ctx.input.pid(ctx.cfg.profileDir);
           if (!pid) throw new AbError("TRUSTED_UNAVAILABLE", "the agent Chrome is not running on the agent profile");
-          const metrics = await sc.req<{ screenX: number; screenY: number; outerWidth: number; outerHeight: number; innerWidth: number; innerHeight: number; scrollX: number; scrollY: number }>("engine.pageMetrics");
-          const box = (await sc.req<{ rect: { x: number; y: number; width: number; height: number } }>("engine.rectOf", { ref: match.ref })).rect;
-          const at = InputHelper.screenPoint({ x: box.x + box.width / 2, y: box.y + box.height / 2 }, metrics);
+          let metrics = await sc.req<{ screenX: number; screenY: number; outerWidth: number; outerHeight: number; innerWidth: number; innerHeight: number; scrollX: number; scrollY: number }>("engine.pageMetrics");
+          // Scroll it into the middle first: a point off-screen hits nothing
+          // (a 375px-wide layout puts most of a page below the fold).
+          const spot = await sc.req<{ point: { x: number; y: number }; inViewport: boolean }>("engine.pointInView", { ref: match.ref });
+          if (!spot.inViewport)
+            throw new AbError("NOT_ACTIONABLE", "the element cannot be brought into view for a real gesture (it may be in a scroll container of its own)");
+          const after = await ping(sc).catch(() => ({}) as Ping);
+          if (after.tab?.url && after.tab.url !== tabUrl) throw new AbError("STALE_SNAPSHOT", "the page navigated while the element was being located");
+          const metrics2 = await sc.req<typeof metrics>("engine.pageMetrics");
+          const at = InputHelper.screenPoint(spot.point, metrics2);
+          metrics = metrics2;
           await sc.req("engine.focusWindow", {}).catch(() => {});
-          const pageTitle = (await ping(sc).catch(() => ({}) as Ping)).engine?.title;
-          await ctx.input.focus(pid, InputHelper.windowOf(metrics), pageTitle).catch(() => {});
+          // Frame only: Chrome's window title is the tab's, which often differs
+          // from the page's own <title>, and a title that matches nothing
+          // would leave the raise with no window to raise.
+          const focused = (await ctx.input.focus(pid, InputHelper.windowOf(metrics)).catch(() => null)) as
+            | { raised?: boolean; frontmostIsChrome?: boolean }
+            | null;
+          // Raising races Chrome's own accessibility tree; what matters is
+          // that Chrome ended up in front, which activation alone achieves.
+          if (focused && !focused.raised && !focused.frontmostIsChrome)
+            throw new AbError("TRUSTED_UNAVAILABLE", "could not bring the session's window forward for a real gesture", { helper: focused });
           const events =
             action === "hover"
               ? [{ type: "move" as const, ...at }]
               : [{ type: "move" as const, ...at }, { type: "down" as const, ...at }, { type: "up" as const, ...at }];
-          const g = await ctx.input.gesture(pid, InputHelper.windowOf(metrics), events);
+          const g = await ctx.input.gesture(pid, InputHelper.windowOf(metrics), events, { restoreCursor: action !== "hover" });
           await sleep(300);
           // Hover is only real if the page's own :hover applies now.
           if (action === "hover") {
@@ -915,7 +931,13 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
               if (!again?.hovered) throw new AbError("HOVER_NOT_EFFECTIVE", "HOVER_NOT_EFFECTIVE: the real pointer moved but the page has no :hover for this element");
             }
           }
-          call.extra.trustedInput = { from: "macOS Accessibility", raised: g.raised, gaveFocusBackTo: g.gaveFocusBackTo ?? null };
+          call.extra.trustedInput = {
+            from: "macOS Accessibility",
+            ...(g.raised !== undefined ? { raised: g.raised } : {}),
+            gaveFocusBackTo: g.gaveFocusBackTo ?? null,
+            // Said plainly: a hover lasts while the pointer stays on the element.
+            ...(action === "hover" ? { note: "the pointer is left on the element so the page keeps its hover state" } : {}),
+          };
           result = { acted: true, changed: true, signals: { trusted: true, navigated: false, domMutations: 0, valueChanged: false } };
         }
         if (!result) try {
