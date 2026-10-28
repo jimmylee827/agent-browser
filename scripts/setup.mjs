@@ -145,6 +145,18 @@ if (!CHECK && mac) {
     run("node", [resolve(root, "scripts/install-daemon.mjs")], { stdio: "ignore" });
     record("Login item", "ok", `${LABEL} (starts at login, restarts on crash)`);
   } else record("Login item", existsSync(plist) ? "ok" : "warn", existsSync(plist) ? LABEL : "skipped (--no-daemon)");
+  const before = await status();
+  if (before?.build?.staleBuild) {
+    if (mac) {
+      try {
+        execFileSync("launchctl", ["kickstart", "-k", `gui/${process.getuid()}/com.agent-browser.mcp-server`], { stdio: "ignore" });
+        for (let i = 0; i < 40 && !(await status()); i++) await sleep(250);
+        record("Server restart", "ok", "it was running an older build");
+      } catch {
+        record("Server restart", "warn", "run `npm run mcp:restart` to load the new build");
+      }
+    } else record("Server restart", "warn", "restart it to load the new build");
+  }
   const up = await status();
   if (up) record("Server", "ok", BASE);
   else {
@@ -168,11 +180,16 @@ if (!CHECK) {
     spawn("bash", [resolve(root, "bin/launch-chrome.sh")], { detached: true, stdio: "ignore", cwd: root }).unref();
     record("Chrome", "ok", "launched on the agent profile");
   } else record("Chrome", "ok", "already running on the agent profile");
-  // The extension connecting is what proves the whole chain works.
-  for (let i = 0; i < 60 && !connected; i++) {
-    await sleep(500);
-    connected = !!(await status())?.bridgeConnected;
-  }
+  // The extension connecting is what proves the whole chain works. It drops
+  // briefly while it reloads itself, so a missed window is retried.
+  const waitConnected = async (tries) => {
+    for (let i = 0; i < tries && !connected; i++) {
+      await sleep(500);
+      connected = !!(await status())?.bridgeConnected;
+    }
+  };
+  await waitConnected(120);
+  if (!connected) await waitConnected(20);
 }
 
 // ------------------------------------------------------------- verification
@@ -235,7 +252,11 @@ if (!CHECK && has("claude")) {
 // ------------------------------------------------------------------ summary
 
 if (!connected) {
-  console.log(`
+  console.log(final?.extension?.stale
+    ? `
+\x1b[1mThe extension did not reconnect after its update.\x1b[0m Reload it once: chrome://extensions → Reload ↻ on Agent Bridge.
+`
+    : `
 \x1b[1mOne step is a person's:\x1b[0m Chrome allows no script to load an extension.
 
   1. In the Chrome window just opened: chrome://extensions
