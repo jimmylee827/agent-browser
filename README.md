@@ -201,7 +201,7 @@ the `error` and `recovery` prose. A captcha or a notice in the way comes back as
 | `browser_eval({expression})` | A JS expression in the page, its value as JSON — app state, `video.readyState`. Refused on `eval.blockedDomains`. |
 | `browser_network({urlPattern?, status?, type?, includeBodies?, action?})` | What the page sent and received: fetch/XHR bodies (JSON parsed), WebSocket and EventSource messages, headers and timing. `action: "export"` writes a HAR or NDJSON file. See [Network capture](#network-capture). |
 | `browser_diagnostics({since?})` | Failed requests (every host); console errors, exceptions and rejections (development hosts). |
-| `browser_jobs({action})` | Background jobs: keep a page open, record it, heal it. See [Background jobs](#background-jobs). |
+| `browser_jobs({action})` | Background jobs: keep a page open, record it, work it with steps, heal it. See [Background jobs](#background-jobs). |
 | `browser_pointer({sequence})` | A down / move / up / wheel sequence, for gestures `drag` does not cover. |
 | `browser_tabs({action})` | List, switch, open or close tabs. |
 | `browser_scroll({to \| y})` | Scroll; reports `atBottom` and how much an infinite feed grew. |
@@ -333,6 +333,63 @@ cached answer right after its own reload does not count. Nothing is done while
 a page loads, and page loads, scheduled refreshes included, are capped per hour
 (`jobs.defaults.maxLoadsPerHour`), so a sick site is never hammered.
 
+### Steps: what a job does on its page
+
+A job can work its page after each load. A page often needs a click before it
+shows anything: accept a cookie banner, pick "Today", press Refresh.
+
+```bash
+npm run ab -- jobs start --id dash --url https://dash.example/overview \
+  --capture /api/readings \
+  --step dismiss-consent --step 'click?:Accept all' \
+  --step 'click:Today@tab' --step 'click:Refresh'
+```
+
+| `--step` | Does |
+| --- | --- |
+| `dismiss-consent` | Clicks the accept button of a cookie or consent banner, when one shows |
+| `click:Name` | Clicks the element with that accessible name (add `@role` to narrow it) |
+| `click?:Name` | The same, skipped when it is not there (a banner that only sometimes shows) |
+| `fill:Field:value` / `type:Field:value` | Types into a field |
+| `fill:Field:@secret` | Types a secret you approved (below) |
+| `press:Field:Enter`, `select:Field:Option`, `check:Name` | As they read |
+| `wait:Text` | Waits until that text is on the page |
+
+At most 10 steps, run once per page load after `jobs.defaults.pageGraceMs`. A step that
+finds nothing (unless marked `?`) counts as the page being unwell: the healing
+ladder takes over. No step ever double-fires: steps use a plain click, never the
+dead-click retry or real OS input.
+
+### Secrets: a password, code or card a job may type
+
+A job never types into a password, one-time-code or card field on its own. It
+does it only from a **secret you approve for a named host**:
+
+```bash
+npm run ab -- secrets set shop-login --kind password --host login.shop.example
+npm run ab -- secrets set shop-2fa   --kind totp     --host login.shop.example
+npm run ab -- secrets list          # names, kinds and hosts — never values
+npm run ab -- secrets remove shop-login
+```
+
+Then `--step 'fill:Password:@shop-login'`. Kinds: `password`, `totp`,
+`card-number`, `card-expiry`, `card-cvc`, `text`.
+
+- **Where it is kept:** the macOS login Keychain. `secrets.json` holds only
+  the name, kind and hosts. (Off macOS: a 0600 file in the state dir, and the
+  CLI says so.)
+- **Where it is used:** only on the hosts you named (or their subdomains). A
+  redirect to a look-alike host gets nothing, and the job stops and says so.
+- **Where it shows up:** nowhere. Not in `jobs.json`, the job log, the audit
+  log, or the recorded traffic: the value is redacted from captures before
+  they are stored, whatever the field is called.
+- **TOTP** stores the authenticator app's seed (base32 or the `otpauth://`
+  link) and computes the six-digit code at the moment it is needed (RFC 6238),
+  so a 2FA login can run unattended. An SMS code cannot: it is different every
+  time, so that step still needs a person.
+- **SMS and push approvals still need you.** A job that meets one flags
+  `needs-attention` and waits.
+
 The server drives jobs, not the page: they survive the extension sleeping and
 the server restarting (it finds the tab again). The kill switch pauses them;
 what the page recorded meanwhile is written when it is lifted. If the browser
@@ -351,6 +408,7 @@ npm run ab -- tabs
 npm run ab -- network --tab <id> --url /api/ --bodies
 npm run ab -- network --tab <id> --export har
 npm run ab -- jobs list
+npm run ab -- secrets list
 ```
 
 ## Safety

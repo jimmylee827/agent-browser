@@ -244,11 +244,37 @@ browser_jobs({ action: "status", id: "readings" })    # running | healing | need
 browser_jobs({ action: "read", id: "readings", limit: 50 })   # what it recorded; pass `next` as `after`
 browser_jobs({ action: "stop", id: "readings" })
 ```
+It can work the page once per load: `steps: [{action:"dismiss-consent"},
+{action:"click", name:"Today"}, {action:"click", name:"Refresh"}]`.
+
 A job runs in its own window beyond this conversation, heals its page when it
 stops answering, and caps its page loads per hour. Tell the user it exists and
 how to stop it (`npm run ab -- jobs stop <id>`). `JOB_LIMIT` means it would load
 the page too often, or there are too many jobs: ask for a slower interval, do
 not raise the limits.
+
+### "A page a job has to work (a banner, a tab, a login)"
+```text
+browser_jobs({ action: "start", id: "dash", url, capture: [{urlPattern: "/api/"}],
+  steps: [
+    { action: "dismiss-consent" },
+    { action: "click", name: "Today", role: "tab" },
+    { action: "click", name: "Refresh" },
+  ] })
+```
+A step that is not there stops the run and lets the healing ladder take over,
+unless you mark it `optional: true` (a banner that only sometimes shows).
+
+For a password, one-time-code or card field the job uses only a secret the
+user approved for that host. **You never create one yourself**: tell the user
+the command and let them run it (Claude Code shows it for approval):
+```text
+npm run ab -- secrets set shop-login --kind password --host login.shop.example
+```
+then `{ action: "fill", name: "Password", secret: "shop-login" }`. Without one,
+the job stops at that field and flags `needs-attention` — that is correct, not a
+failure to work around. Never ask the user to paste a password into the chat so
+you can put it in a step.
 
 ### "Why did it fail?"
 visit and act results carry `diagnostics` when something went wrong in the page
@@ -425,5 +451,6 @@ Never edit it without their yes, and never relabel an action to get past it.
 - Don't drive another agent's or the user's tab: no `session: "default"`, no `tabId` you did not open, unless asked.
 - Don't start a background job unless the user asked for something to be watched or recorded over time, and don't leave one running unmentioned.
 - Don't edit `network.blockedDomains` or a job's limits yourself; like trustedDomains, they are the user's.
+- Don't create, read or echo a secret, and don't put a password, code or card value in a step, a command or the chat: a step names a secret the user approved, and nothing else.
 - Don't copy recorded bodies into a report wholesale: take the fields the task needs. They can hold personal data the redaction does not know is personal.
 - Don't expect `isTrusted:true` events from synthetic input. A small minority of hardened sites gate on it; if one rejects the click, the tool surfaces the error rather than degrading stealth.

@@ -7,13 +7,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- Job steps (`browser_jobs` steps, `npm run ab -- jobs start --step …`): a job
+  can dismiss a consent banner, click a tab or button, fill a field, press a
+  key, wait for text — once per page load, checked at start, and a missing
+  step counts as the page being unwell.
+- Approved secrets (`npm run ab -- secrets set|list|remove`): a password, an
+  authenticator seed (the code is computed at the moment it is typed, RFC 6238)
+  or card details, kept in the macOS Keychain, usable only on the hosts they
+  were approved for, redacted from everything recorded. A password field with no
+  approved secret stops the job and flags `needs-attention`.
+- A job reloads its own tab once when the extension is updated under it
+  (`rearmed`); every other open tab is re-armed in place, without a reload.
 - Network capture: fetch and XHR bodies, WebSocket and EventSource messages,
   headers and timing, recorded on every page except `network.blockedDomains`,
   secrets removed before anything is stored. `browser_network` reads it (JSON
   parsed) and exports HAR or NDJSON; `browser_wait({response})` waits up to five
   minutes for a response and returns it; `agent_browser_act({waitForResponse})`
   does it in one call; visit and act results name the API calls in `network`.
-  Extension 0.0.7 (`unlimitedStorage`).
+  Extension 0.0.8 (`unlimitedStorage`; 0.0.7 introduced capture; 0.0.8 removed
+  the engine's own marks from pages).
 - Background jobs (`browser_jobs`, `npm run ab -- jobs`): a page kept open in
   its own window, its matching responses written to
   `~/.agent-chrome/jobs/<id>/<date>.ndjson`, healed when it stops answering
