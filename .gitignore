@@ -28,6 +28,7 @@ credentials*.json
 **/cred-backup-*.json
 
 # Local-only state
+config/local.json
 .agent-browser-local/
 .local-state/
 

@@ -858,7 +858,21 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         const d = ctx.policy.evaluate({ url: tabUrl, actionClass });
         if (!d.allow) {
           ctx.audit.log("policy.block", { tool: "agent_browser_act", url: tabUrl, action, reason: d.reason });
-          throw new AbError("POLICY_BLOCKED", `blocked by policy: ${d.reason}`, { recovery: POLICY_ADVICE });
+          const host = (() => {
+            try {
+              return new URL(tabUrl).hostname;
+            } catch {
+              return "";
+            }
+          })();
+          throw new AbError("POLICY_BLOCKED", `blocked by policy: ${d.reason}`, {
+            recovery: POLICY_ADVICE,
+            // The path and the exact line make the proposal one edit, which
+            // the person approves in chat; nothing is changed without them.
+            allowDomain: host
+              ? { domain: host, file: ctx.policy.localFile, field: "policy.trustedDomains", actionClass }
+              : undefined,
+          });
         }
         if (DRY_RUN) return { dryRun: true, wouldAct: { action, name, role, value }, currentUrl: tabUrl, policy: d.reason };
         if (args.allowPopups !== undefined) await allowPopups(call, sc, args.allowPopups);

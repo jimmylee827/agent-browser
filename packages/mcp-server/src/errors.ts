@@ -80,7 +80,14 @@ export const CATALOGUE: Record<Code, Entry> = {
   },
   NAV_TIMEOUT: { agentCanFix: true, fixSteps: ["retry once", "if it repeats, check agent_browser_status"], humanAction: null },
   HALTED: { agentCanFix: false, fixSteps: [HALT_ADVICE], humanAction: "turn the kill switch off (npm run resume) when you want the agent to continue" },
-  POLICY_BLOCKED: { agentCanFix: false, fixSteps: [POLICY_ADVICE], humanAction: "approve the action, or add the domain to trustedDomains in config/default.json" },
+  POLICY_BLOCKED: {
+    agentCanFix: false,
+    fixSteps: [
+      POLICY_ADVICE,
+      "if the user says yes, propose an edit adding the domain to policy.trustedDomains in config/local.json — they approve the change in chat, and it takes effect on the next action",
+    ],
+    humanAction: "approve the action, or approve the agent's edit that adds the domain to trustedDomains in config/local.json",
+  },
   INVALID_VALUE: { agentCanFix: true, fixSteps: ["the field is unchanged; retry with a value in the format the error gives"], humanAction: null },
   NO_SUCH_OPTION: { agentCanFix: true, fixSteps: ["nothing was selected; retry with one of the options listed in the error"], humanAction: null },
   EVAL_BLOCKED: {

@@ -1,4 +1,5 @@
-import type { AppConfig } from "./config.js";
+import { statSync } from "node:fs";
+import { localConfigPath, readLocalOverride, type AppConfig } from "./config.js";
 
 export interface PolicyDecision {
   allow: boolean;
@@ -31,9 +32,31 @@ function domainMatch(host: string, domains: string[]): boolean {
  * the verb alone, so a search-box submit is not treated as a payment.
  */
 export class Policy {
+  private mtime = 0;
+  readonly localFile = localConfigPath();
+
   constructor(private cfg: AppConfig) {}
 
+  /**
+   * Pick up an edit to the person's own config without a restart: the file is
+   * read when it changes, so an approved change to trustedDomains takes effect
+   * on the very next action.
+   */
+  refresh(): void {
+    try {
+      const m = statSync(this.localFile).mtimeMs;
+      if (m === this.mtime) return;
+      this.mtime = m;
+      const local = readLocalOverride(this.localFile);
+      const trusted = (local?.policy as { trustedDomains?: string[] } | undefined)?.trustedDomains;
+      if (trusted) this.cfg.policy.trustedDomains = trusted;
+    } catch {
+      // No override file is the normal case.
+    }
+  }
+
   evaluate(opts: { url: string; actionClass?: string }): PolicyDecision {
+    this.refresh();
     const host = hostOf(opts.url);
     const trusted = domainMatch(host, this.cfg.policy.trustedDomains);
     const sensitive =

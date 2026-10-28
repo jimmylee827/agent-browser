@@ -36,6 +36,44 @@ export interface AppConfig {
   audit: { file: string };
 }
 
+/**
+ * A person's own settings, kept out of the repository: the file an agent may
+ * propose an edit to (Claude Code shows the diff, the person approves) when a
+ * policy block needs a domain allowed, and where private hosts live so they
+ * never get pushed.
+ *
+ *   { "policy": { "trustedDomains": ["shop.internal"] } }
+ */
+export function localConfigPath(): string {
+  return process.env.AB_LOCAL_CONFIG ?? resolve(repoRoot, "config/local.json");
+}
+
+export function readLocalOverride(file = localConfigPath()): Partial<AppConfig> | null {
+  try {
+    return JSON.parse(readFileSync(file, "utf8")) as Partial<AppConfig>;
+  } catch {
+    return null;
+  }
+}
+
+function applyLocal(cfg: AppConfig, local: Partial<AppConfig> | null): AppConfig {
+  if (!local) return cfg;
+  if (local.policy) {
+    cfg.policy = {
+      ...cfg.policy,
+      ...local.policy,
+      // A list in the override replaces the default, it does not append:
+      // what a person writes there is what they mean.
+      trustedDomains: (local.policy as { trustedDomains?: string[] }).trustedDomains ?? cfg.policy.trustedDomains,
+    };
+  }
+  if (local.eval?.blockedDomains) cfg.eval.blockedDomains = local.eval.blockedDomains;
+  if (local.diagnostics?.hosts) cfg.diagnostics.hosts = local.diagnostics.hosts;
+  if (local.input) cfg.input = { ...cfg.input, ...local.input };
+  if (local.evidence) cfg.evidence = { ...cfg.evidence, ...local.evidence };
+  return cfg;
+}
+
 export function loadConfig(): AppConfig {
   const raw = readFileSync(process.env.AB_CONFIG ?? resolve(repoRoot, "config/default.json"), "utf8");
   const cfg = JSON.parse(raw) as AppConfig;
@@ -61,7 +99,7 @@ export function loadConfig(): AppConfig {
   cfg.evidence ??= { enabled: true, retainDays: 14 };
   if (env.AB_BIND_HOST) cfg.bridge.host = env.AB_BIND_HOST;
   if (env.AB_BRIDGE_SECRET_FILE) cfg.bridge.secretFile = env.AB_BRIDGE_SECRET_FILE;
-  return cfg;
+  return applyLocal(cfg, readLocalOverride());
 }
 
 /** Generate (once) and read the localhost bridge shared secret, 0600. */

@@ -143,6 +143,8 @@ export async function startHarness({ log = false, waitMs = 45_000, setup = false
     AB_CONTROL_PORT: String(controlPort),
     AB_EXTENSION_DIR: ext,
     AB_CONFIG: resolve(root, "config/default.json"),
+    // The person's own override, kept out of the tests.
+    AB_LOCAL_CONFIG: join(tmp, "local.json"),
     AB_DISABLE_STDIO_MCP: "1",
   };
   const out = log ? "inherit" : "ignore";

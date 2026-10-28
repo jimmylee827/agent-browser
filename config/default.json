@@ -9,10 +9,8 @@
     "requestTimeoutMs": 30000
   },
   "policy": {
-    "comment": "Navigation and ordinary interaction are allowed everywhere. Only the action classes below escalate, and only off the trusted list. Add domains you want fully autonomous to trustedDomains.",
-    "trustedDomains": [
-      "login.food.saveris.net"
-    ],
+    "comment": "Navigation and ordinary interaction are allowed everywhere. Only the action classes below escalate, and only off the trusted list. Put your own domains in config/local.json (never committed); an agent may propose that edit and you approve it in chat.",
+    "trustedDomains": [],
     "sensitiveActionClasses": [
       "payment",
       "delete_destructive",
