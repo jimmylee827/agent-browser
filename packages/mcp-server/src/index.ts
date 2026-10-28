@@ -13,6 +13,7 @@ import { registerTools } from "./tools/index.js";
 import { buildId, RUNNING } from "./build.js";
 import { pruneEvidence } from "./evidence.js";
 import { InputHelper } from "./input.js";
+import { JobRunner, pruneJobs } from "./jobs.js";
 
 async function main() {
   const cfg = loadConfig();
@@ -29,9 +30,11 @@ async function main() {
   const policy = new Policy(cfg);
   const warnedStale = new Set<string>();
   const input = new InputHelper(cfg.input);
+  // Daemon-level, like the sessions: the HTTP transport builds a server per request.
+  const jobs = new JobRunner({ cfg, bridge, sessions, audit });
   const makeServer = (client: ClientInfo): McpServer => {
     const s = new McpServer({ name: "agent-browser", version: "0.0.1" });
-    registerTools(s, { bridge, policy, sessions, audit, cfg, client, warnedStale, input });
+    registerTools(s, { bridge, policy, sessions, audit, cfg, client, warnedStale, input, jobs });
     return s;
   };
 
@@ -56,6 +59,7 @@ async function main() {
   // The daemon runs for weeks; pruning only at start let evidence pile up.
   const prune = () => {
     if (cfg.evidence.enabled) pruneEvidence(cfg);
+    pruneJobs(cfg, jobs.list().map((j) => j.spec.id));
   };
   prune();
   setInterval(prune, 24 * 3600_000).unref();
@@ -88,13 +92,15 @@ async function main() {
     makeMcpServer: makeServer,
     makeHttpTransport: () => new StreamableHTTPServerTransport({ sessionIdGenerator: undefined }), // stateless
     releaseClient,
-  });
+  }, jobs);
+  jobs.start();
 
   // Say why we stopped. A daemon booted out by launchd, or killed, used to
   // leave a log of "MCP up" lines and nothing else.
   for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
     process.on(sig, () => {
       audit.log("mcp.stopped", { signal: sig });
+      jobs.stopAll();
       process.stderr.write(`[agent-browser] stopping on ${sig} at ${new Date().toISOString()}\n`);
       process.exit(0);
     });

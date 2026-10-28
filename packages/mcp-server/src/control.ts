@@ -8,7 +8,9 @@ import { buildStatus } from "./build.js";
 import { rejectBrowserOrigin } from "./http-guard.js";
 import { secondPassRedact, toHar, toNdjson, type NetEntry } from "./network.js";
 import { writeEvidenceFile } from "./evidence.js";
-import { readFileSync } from "node:fs";
+import type { JobRunner } from "./jobs.js";
+import { codeOf } from "./errors.js";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 /** Who is calling: one id per MCP client connection (one launcher process). */
@@ -24,6 +26,13 @@ interface McpHooks {
   releaseClient: (id: string) => Promise<number>;
 }
 
+const readBody = (req: IncomingMessage) =>
+  new Promise<string>((resolve) => {
+    let b = "";
+    req.on("data", (c) => (b += c));
+    req.on("end", () => resolve(b));
+  });
+
 const header = (req: IncomingMessage, name: string) => {
   const v = req.headers[name];
   return (Array.isArray(v) ? v[0] : v) || undefined;
@@ -38,6 +47,7 @@ export function startControl(
   bridge: Bridge,
   audit: Audit,
   mcp?: McpHooks,
+  jobs?: JobRunner,
 ): void {
   const send = (res: ServerResponse, code: number, body: unknown) => {
     const s = JSON.stringify(body);
@@ -211,23 +221,41 @@ export function startControl(
         return send(res, file ? 200 : 500, file ? { file, format, entries: entries.length, matched: r.matched } : { error: "could not write the export" });
       }
       if (url.pathname === "/tabs") return send(res, 200, await bridge.request("engine.tabs", { action: "list" }));
+      // Background jobs, for `npm run ab -- jobs`.
+      const jm = url.pathname.match(/^\/jobs(?:\/([a-z0-9-]+))?(?:\/(stop|resume|records|log))?$/);
+      if (jm && jobs) {
+        const [, id, verb] = jm;
+        try {
+          if (!id && req.method === "GET") return send(res, 200, { jobs: jobs.list(), needsAttention: jobs.needsAttention() });
+          if (!id && req.method === "POST") {
+            if (existsSync(resolve(cfg.stateDir, "HALT"))) return send(res, 423, { error: "HALTED: kill switch active", code: "HALTED" });
+            const spec = JSON.parse((await readBody(req)) || "{}");
+            return send(res, 200, jobs.create(spec, "cli"));
+          }
+          if (id && !verb && req.method === "GET") return send(res, 200, jobs.status(id));
+          if (id && !verb && req.method === "DELETE") return send(res, 200, await jobs.remove(id, "cli"));
+          if (verb === "stop" && req.method === "POST") return send(res, 200, await jobs.stop(id!, "cli"));
+          if (verb === "resume" && req.method === "POST") return send(res, 200, jobs.resume(id!, "cli"));
+          if (verb === "records" || verb === "log") {
+            const q = url.searchParams;
+            return send(res, 200, jobs.read(id!, { after: q.get("after") ?? undefined, limit: Number(q.get("limit") ?? 100), urlPattern: q.get("url") ?? undefined, file: verb === "log" ? "log" : "records" }));
+          }
+          return send(res, 405, { error: `${req.method} ${url.pathname} is not a jobs operation` });
+        } catch (e) {
+          const code = codeOf(e);
+          return send(res, code === "JOB_NOT_FOUND" ? 404 : code === "BAD_REQUEST" || code === "NETWORK_BLOCKED" || code === "JOB_LIMIT" ? 400 : 502, {
+            error: (e as Error).message,
+            code,
+          });
+        }
+      }
       if (url.pathname === "/robust-click" && req.method === "POST") {
-        const body = await new Promise<string>((resolve) => {
-          let b = "";
-          req.on("data", (c) => (b += c));
-          req.on("end", () => resolve(b));
-        });
-        const p = JSON.parse(body || "{}");
+        const p = JSON.parse((await readBody(req)) || "{}");
         audit.log("control.robust_click", { ref: p.ref });
         return send(res, 200, await bridge.request("engine.robustClick", p));
       }
       if (url.pathname === "/act" && req.method === "POST") {
-        const body = await new Promise<string>((resolve) => {
-          let b = "";
-          req.on("data", (c) => (b += c));
-          req.on("end", () => resolve(b));
-        });
-        const p = JSON.parse(body || "{}");
+        const p = JSON.parse((await readBody(req)) || "{}");
         audit.log("control.act", { action: p.action, ref: p.ref });
         return send(res, 200, await bridge.request("engine.act", p));
       }
@@ -236,6 +264,7 @@ export function startControl(
         routes: [
           "/status", "/ping", "/observe", "/locate", "/wait", "/navigate", "/visit", "/tabs",
           "/network?tabId=", "/network/export?tabId=&format=har|ndjson", "/network/clear?tabId=",
+          "GET|POST /jobs", "GET|DELETE /jobs/:id", "POST /jobs/:id/stop|resume", "GET /jobs/:id/records|log?after=",
           "POST /act", "POST /robust-click", "POST /mcp", "POST /session/release?client=",
         ],
       });

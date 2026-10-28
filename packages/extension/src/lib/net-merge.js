@@ -99,7 +99,7 @@ function addWire(e, w) {
  * apart in time a page record and a wire record may be and still be one
  * request (the page stamps after the body is read; webRequest at completion).
  */
-export function mergeStreams(records, { windowMs = 3000 } = {}) {
+export function mergeStreams(records, { windowMs = 3000, orphanFrames = false } = {}) {
   const pages = [];
   const wires = [];
   const frames = [];
@@ -145,7 +145,14 @@ export function mergeStreams(records, { windowMs = 3000 } = {}) {
 
   for (const f of frames) {
     const e = sockets.get(`${f.tabId}|${f.socketId}`);
-    if (!e) continue;
+    if (!e) {
+      // Its socket was recorded in an earlier batch (a job drains as it goes).
+      if (orphanFrames) {
+        const { kind, queue: _q, jobId: _j, ...rest } = f;
+        entries.push({ ...rest, via: kind === "sse-event" ? "sse" : "ws", type: kind, method: "GET", url: f.url ?? "" });
+      }
+      continue;
+    }
     if (f.kind === "ws-close") {
       e.closed = { ts: f.ts, code: f.code, reason: f.reason };
       // The hook stops sending frames past its cap and reports the count here.

@@ -8,8 +8,16 @@
 //   npm run ab -- network --tab 123 [--url RE] [--status 4xx] [--type api|all|…] [--bodies] [--limit N]
 //   npm run ab -- network --tab 123 --export har|ndjson
 //   npm run ab -- network --tab 123 --clear
+//   npm run ab -- network --job ID [same filters]          a background job's live page
+//   npm run ab -- jobs list | status ID [--check]
+//   npm run ab -- jobs start --id ID --url URL --capture RE [--capture RE…] [--every 15m]
+//                            [--health-text RE] [--health-response RE] [--max-loads N] [--keep-visible]
+//   npm run ab -- jobs start --spec job.json
+//   npm run ab -- jobs stop|resume|remove ID
+//   npm run ab -- jobs tail ID [--follow] [--log] [--url RE]
 //
-// Exit codes: 0 ok, 1 error, 2 the browser is not connected or the kill switch is on.
+// Exit codes: 0 ok, 1 error, 2 the browser is not connected or the kill switch is on,
+// 3 (jobs status --check) a job needs attention.
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -39,11 +47,9 @@ for (let i = 1; i < argv.length; i++) {
   }
   const key = a.slice(2);
   const next = argv[i + 1];
-  if (next === undefined || next.startsWith("--")) flags[key] = true;
-  else {
-    flags[key] = next;
-    i++;
-  }
+  const value = next === undefined || next.startsWith("--") ? true : (i++, next);
+  // A flag given twice (--capture a --capture b) collects its values.
+  flags[key] = key in flags ? [].concat(flags[key], value) : value;
 }
 const JSON_OUT = !!flags.json;
 
@@ -105,8 +111,13 @@ const commands = {
   },
 
   async network() {
-    const tab = flags.tab ?? positional[0];
-    if (!tab) die("say which tab: --tab <id> (ids: npm run ab -- tabs)");
+    let tab = flags.tab ?? positional[0];
+    if (flags.job) {
+      const j = await call(`/jobs/${encodeURIComponent(flags.job)}`);
+      tab = j.state.tabId;
+      if (tab === undefined) die(`job ${flags.job} has no page open now (status: ${j.state.status})`);
+    }
+    if (!tab) die("say which tab: --tab <id> (ids: npm run ab -- tabs), or --job <id>");
     if (flags.clear) return out(await call(`/network/clear?${qs({ tabId: tab })}`), (d) => console.log(`cleared ${d.cleared} record(s)`));
     if (flags.export) {
       const r = await call(`/network/export?${qs({ tabId: tab, format: flags.export === true ? "har" : flags.export, url: flags.url, status: flags.status, type: flags.type ?? "all" })}`);
@@ -125,6 +136,90 @@ const commands = {
       }
     });
   },
+};
+
+const duration = (v) => {
+  const m = /^(\d+(?:\.\d+)?)(ms|s|m|h)?$/.exec(String(v));
+  if (!m) die(`not a duration: ${v} (e.g. 90s, 15m, 1h)`);
+  return Math.round(Number(m[1]) * { ms: 1, s: 1000, m: 60_000, h: 3_600_000 }[m[2] ?? "ms"]);
+};
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const ago = (ts) => (ts ? `${Math.round((Date.now() - ts) / 1000)}s ago` : "never");
+
+commands.jobs = async () => {
+  const sub = positional[0] ?? "list";
+  const id = positional[1] ?? flags.id;
+  const one = () => id ?? die(`jobs ${sub} needs an id`);
+  if (sub === "list") {
+    const r = await call("/jobs");
+    return out(r, (d) => {
+      if (!d.jobs.length) return console.log("no jobs");
+      for (const j of d.jobs)
+        console.log(`${j.spec.id.padEnd(20)} ${j.state.status.padEnd(16)} ${String(j.state.records).padStart(6)} records, last ${ago(j.state.lastRecordAt)}  ${j.spec.url}`);
+    });
+  }
+  if (sub === "status") {
+    if (flags.check && !id) {
+      const r = await call("/jobs");
+      out({ needsAttention: r.needsAttention }, (d) => console.log(d.needsAttention.length ? `needs attention: ${d.needsAttention.join(", ")}` : "all jobs fine"));
+      process.exit(r.needsAttention.length ? 3 : 0);
+    }
+    const j = await call(`/jobs/${encodeURIComponent(one())}`);
+    out(j, (d) => {
+      const s = d.state;
+      console.log(`${d.spec.id}: ${s.status}${s.lastReason ? ` (${s.lastReason})` : ""}`);
+      console.log(`  page     ${d.spec.url}  tab ${s.tabId ?? "-"}${s.windowState === "minimized" ? "  window minimised: its page is throttled (--keep-visible restores it)" : ""}`);
+      console.log(`  records  ${s.records}, last ${ago(s.lastRecordAt)}; last good response ${ago(s.lastGoodAt)}`);
+      console.log(`  ladder   rung ${s.rung}, ${s.loads.length} page load(s) in the last hour${s.lastError ? `; error: ${s.lastError}` : ""}`);
+      console.log(`  files    ${d.files}`);
+    });
+    if (flags.check && j.state.status === "needs-attention") process.exit(3);
+    return;
+  }
+  if (sub === "start") {
+    let spec;
+    if (flags.spec) spec = JSON.parse(readFileSync(resolve(flags.spec), "utf8"));
+    else {
+      const capture = [].concat(flags.capture ?? []).filter((c) => c !== true);
+      spec = {
+        id: one(),
+        url: flags.url,
+        capture: capture.map((urlPattern) => ({ urlPattern })),
+        ...(flags.every ? { refresh: "reload", intervalMs: duration(flags.every) } : {}),
+        ...(flags["health-text"] || flags["health-response"]
+          ? { health: { ...(flags["health-text"] ? { text: flags["health-text"] } : {}), ...(flags["health-response"] ? { response: { urlPattern: flags["health-response"] } } : {}) } }
+          : {}),
+        ...(flags["max-loads"] ? { ladder: { maxLoadsPerHour: Number(flags["max-loads"]) } } : {}),
+        ...(flags["keep-visible"] ? { keepVisible: true } : {}),
+      };
+    }
+    const r = await call("/jobs", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(spec) });
+    return out(r, (d) => console.log(`started ${d.spec.id}: ${d.spec.url}\n  records → ${d.files}\n  stop with: npm run ab -- jobs stop ${d.spec.id}`));
+  }
+  if (sub === "stop" || sub === "resume") {
+    const r = await call(`/jobs/${encodeURIComponent(one())}/${sub}`, { method: "POST" });
+    return out(r, (d) => console.log(`${d.spec.id}: ${d.state.status}`));
+  }
+  if (sub === "remove") {
+    const r = await call(`/jobs/${encodeURIComponent(one())}`, { method: "DELETE" });
+    return out(r, (d) => console.log(`removed ${d.removed}; ${d.note} (${d.records})`));
+  }
+  if (sub === "tail") {
+    const path = `/jobs/${encodeURIComponent(one())}/${flags.log ? "log" : "records"}`;
+    let after = "";
+    for (;;) {
+      const r = await call(`${path}?${qs({ after, limit: 200, url: flags.url })}`);
+      for (const rec of r.records) {
+        if (JSON_OUT) console.log(JSON.stringify(rec));
+        else if (flags.log) console.log(`${new Date(rec.ts).toISOString()}  ${rec.event}${rec.reason ? `: ${rec.reason}` : ""}`);
+        else console.log(describe(rec));
+      }
+      after = r.next || after;
+      if (!flags.follow) return;
+      if (!r.more) await sleep(2000);
+    }
+  }
+  die(`unknown: jobs ${sub}`);
 };
 
 if (!cmd || cmd === "help" || flags.help || !commands[cmd]) {

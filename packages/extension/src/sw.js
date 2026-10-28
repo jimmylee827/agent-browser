@@ -506,7 +506,8 @@ async function netDispatch(method, params) {
   }
   if (method === "net.drain") {
     const records = await netstore.takePending(params.jobId, { olderThan: Date.now() - (params.olderThanMs ?? 2000), maxBytes: params.maxBytes });
-    return { entries: mergeStreams(records), ids: records.map((r) => r.id) };
+    // A socket's frames can drain in a later batch than the socket itself: keep them.
+    return { entries: mergeStreams(records, { orphanFrames: true }), ids: records.map((r) => r.id) };
   }
   if (method === "net.ack") return { written: await netstore.markWritten(params.ids || []) };
   if (method === "net.stats") return { ...(await netstore.stats()), jobTabs: Object.fromEntries(await jobTabs()) };
@@ -962,6 +963,18 @@ async function dispatch(method, params) {
     return { windowId: win.id };
   }
   if (method === "engine.mobile") return await setMobile(await tabFor(params), params);
+  // A minimised window hides its page, and Chrome throttles a hidden page's
+  // timers hard: a background job's polling slows to a crawl. Say so, and
+  // restore it when the job asked (which may bring it forward).
+  if (method === "engine.windowState") {
+    const win = await chrome.windows.get(params.windowId).catch(() => null);
+    if (!win) return { state: "gone" };
+    if (params.restore && win.state === "minimized") {
+      await chrome.windows.update(params.windowId, { state: "normal" });
+      return { state: "normal", restored: true };
+    }
+    return { state: win.state };
+  }
   if (method === "engine.closeWindow") {
     await chrome.windows.remove(params.windowId).catch(() => {});
     return { closed: true };

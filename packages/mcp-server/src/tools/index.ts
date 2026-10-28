@@ -12,6 +12,7 @@ import { buildId, buildStatus, RUNNING } from "../build.js";
 import { recordEvidence, writeEvidenceFile } from "../evidence.js";
 import { bodyView, secondPassRedact, summarize, toHar, toNdjson, type NetEntry } from "../network.js";
 import { InputHelper, type InputConfig } from "../input.js";
+import type { JobRunner } from "../jobs.js";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
@@ -43,6 +44,8 @@ interface Ctx {
   warnedStale: Set<string>;
   /** Real input through macOS Accessibility. */
   input: InputHelper;
+  /** Background jobs (absent in the launcher's stub). */
+  jobs?: JobRunner;
 }
 
 type Text = { type: "text"; text: string };
@@ -234,7 +237,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
     if (args.tabId !== undefined && args.tabId !== s.tabId) {
       const owner = ctx.sessions.ownerOfTab(args.tabId);
       if (owner && owner !== s)
-        throw new AbError("TAB_OWNED_BY_OTHER", `tab ${args.tabId} belongs to another session (${owner.shared ? owner.label : "a private session"})`);
+        throw new AbError("TAB_OWNED_BY_OTHER", `tab ${args.tabId} belongs to another session (${owner.shared || owner.job ? owner.label : "a private session"})`);
       if (s.legacy) call.tabId = args.tabId;
       else ctx.sessions.bind(s, args.tabId);
     }
@@ -684,6 +687,9 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         staleBuild: b.staleBuild,
         ...extensionStatus(),
         sessions: mine,
+        ...(ctx.jobs?.list().length
+          ? { jobs: { count: ctx.jobs.list().length, needsAttention: ctx.jobs.needsAttention() } }
+          : {}),
         hostHelperReachable: helperUp,
       };
     },
@@ -1462,7 +1468,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
       const label = (t: { tabId: number; windowId: number }) => {
         const o = ctx.sessions.ownerOfTab(t.tabId);
         const yours = !!o && (o === s || o.ownerClient === ctx.client.id);
-        return { ...(o ? { session: o.shared ? o.label : yours ? o.label : "another agent" } : {}), yours };
+        return { ...(o ? { session: o.shared || o.job ? o.label : yours ? o.label : "another agent" } : {}), yours };
       };
       const annotate = (l: TabList) => ({ ...l, tabs: l.tabs.map((t) => ({ ...t, ...label(t) })) });
       const mineTab = (id: number, windowId?: number) => ctx.sessions.ownerOfTab(id) === s || (s.windowId !== undefined && windowId === s.windowId);
@@ -1700,10 +1706,17 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
       bodyChars: z.number().int().min(100).max(65536).default(4000),
       limit: z.number().int().min(1).max(500).default(50).describe("Newest first"),
       format: z.enum(["har", "ndjson"]).default("har").describe("export: HAR opens in browser devtools; NDJSON is one entry per line"),
+      job: z.string().optional().describe("Read a background job's live page instead of your session's (read-only)"),
     },
     async (args, call) => {
-      const sc = scope(call, args, "tab");
-      ctx.sessions.touch(sc.s, ctx.client.id);
+      // A job's page belongs to the job runner: it can be read, never cleared from here.
+      if (args.job && args.action === "clear") throw new AbError("BAD_REQUEST", "a job's record is the job's: stop or remove the job instead");
+      const jobTab = args.job ? ctx.jobs?.tabOf(args.job) : undefined;
+      if (args.job && jobTab === undefined) throw new AbError("NO_SESSION_TAB", `job ${args.job} has no page open now`, { recovery: "browser_jobs({action:\"status\", id}) says why; its records on disk: browser_jobs({action:\"read\", id})" });
+      const sc: Scope = args.job
+        ? { s: ctx.sessions.jobSession(args.job), req: (m, p = {}, t) => ctx.bridge.request(m, { ...p, tabId: jobTab }, t) }
+        : scope(call, args, "tab");
+      if (!args.job) ctx.sessions.touch(sc.s, ctx.client.id);
       if (args.action === "clear") {
         ctx.audit.log("tool.browser_network", { action: "clear", tabId: call.tabId });
         return await sc.req<Record<string, unknown>>("net.clear");
@@ -1730,7 +1743,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         const oldestFirst = [...entries].reverse();
         const content =
           args.format === "har" ? JSON.stringify(toHar(oldestFirst, { page: r.url, version: buildId(RUNNING) }), null, 2) : toNdjson(oldestFirst);
-        const file = writeEvidenceFile(ctx.cfg, evidenceDir(sc.s), "network", args.format, content);
+        const file = writeEvidenceFile(ctx.cfg, args.job ? `job-${args.job}` : evidenceDir(sc.s), "network", args.format, content);
         if (!file) throw new AbError("CAPTURE_FAILED", `could not write the ${args.format} file under ${ctx.cfg.stateDir}/sessions`);
         return { file, format: args.format, entries: entries.length, matched: r.matched, ...(r.matched > 500 ? { note: "the newest 500 entries were exported" } : {}) };
       }
@@ -1750,6 +1763,91 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         ...(note ? { note } : {}),
         entries: view,
       };
+    },
+  );
+
+  tool(
+    "browser_jobs",
+    [
+      "Background jobs: keep a page open in its own window and record the responses that match, for hours or days, ",
+      "beyond this conversation. A job writes what it records to disk, refreshes on a schedule if asked, and heals its ",
+      "page when it stops answering (reload, then navigate again, then reopen the window, then stop and say so), with ",
+      "a cap on page loads per hour. Start one ONLY when the user asked for a page to be watched or recorded over time. ",
+      "start needs id, url and capture [{urlPattern}]; health.text (a pattern that is on screen when the page is fine) ",
+      "and health.response help it tell a dead page from a quiet one. read returns what it recorded (cursor `after`); ",
+      "browser_network({job}) shows its live page. list, status, stop, resume, remove. A person can do the same with ",
+      "`npm run ab -- jobs`.",
+    ].join(""),
+    {
+      action: z.enum(["start", "list", "status", "stop", "resume", "remove", "read"]).default("list"),
+      id: z.string().optional().describe("The job's name: lower-case letters, digits, dashes"),
+      url: z.string().url().optional().describe("start: the page to keep open"),
+      capture: z
+        .array(z.object({ urlPattern: z.string(), method: z.string().optional() }))
+        .optional()
+        .describe("start: which responses to record, e.g. [{urlPattern:\"/api/readings\"}]"),
+      refresh: z.enum(["none", "reload"]).optional().describe("start: none (default) keeps the page open, for pages that poll by themselves; reload refreshes every intervalMs"),
+      intervalMs: z.number().int().optional(),
+      health: z
+        .object({ text: z.string().optional(), response: z.object({ urlPattern: z.string() }).optional() })
+        .optional()
+        .describe("start: how to tell the page is fine — text: a pattern on screen; response: a request that succeeds"),
+      maxLoadsPerHour: z.number().int().min(1).max(60).optional().describe("start: page loads it may cause per hour (default from the config)"),
+      keepVisible: z.boolean().optional().describe("start: un-minimise its window if someone minimises it (a hidden page polls slowly)"),
+      after: z.string().optional().describe("read: the `next` cursor from the last read"),
+      limit: z.number().int().min(1).max(500).optional(),
+      urlPattern: z.string().optional().describe("read: only records whose URL matches"),
+      log: z.boolean().optional().describe("read: what the job did (loads, remedies) instead of what it recorded"),
+    },
+    async (args, call) => {
+      const jobs = ctx.jobs;
+      if (!jobs) throw new AbError("ENGINE_ERROR", "this server runs no job runner");
+      const by = short(ctx.client.id);
+      const need = () => {
+        if (!args.id) throw new AbError("BAD_REQUEST", `${args.action} needs id`, { jobs: jobs.list().map((j) => j.spec.id) });
+        return args.id;
+      };
+      ctx.audit.log("tool.browser_jobs", { action: args.action, id: args.id, client: by });
+      switch (args.action) {
+        case "list": {
+          const all = jobs.list();
+          return { jobs: all.map((j) => ({ id: j.spec.id, url: j.spec.url, status: j.state.status, records: j.state.records, lastRecordAt: j.state.lastRecordAt, lastReason: j.state.lastReason })) };
+        }
+        case "status":
+          return jobs.status(need());
+        case "start": {
+          if (existsSync(resolve(ctx.cfg.stateDir, "HALT"))) throw new AbError("HALTED", "HALTED: kill switch active");
+          const r = jobs.create(
+            {
+              id: args.id,
+              url: args.url,
+              capture: args.capture,
+              refresh: args.refresh,
+              intervalMs: args.intervalMs,
+              health: args.health,
+              keepVisible: args.keepVisible,
+              ...(args.maxLoadsPerHour ? { ladder: { maxLoadsPerHour: args.maxLoadsPerHour } } : {}),
+            },
+            by,
+          );
+          call.warnings.push(`job ${r.spec.id} runs in the background until stopped (browser_jobs({action:"stop", id})), beyond this conversation; tell the user it exists`);
+          return r;
+        }
+        case "stop":
+          return await jobs.stop(need(), by);
+        case "resume":
+          return jobs.resume(need(), by);
+        case "remove":
+          return await jobs.remove(need(), by);
+        case "read": {
+          const id = need();
+          const read = (limit: number) => jobs.read(id, { after: args.after, limit, urlPattern: args.urlPattern, file: args.log ? "log" : "records" });
+          let r = read(args.limit ?? 50);
+          // Readable in one go: past ~100k characters, fewer records, and the cursor to go on from.
+          while (r.records.length > 1 && JSON.stringify(r.records).length > 100_000) r = { ...read(Math.ceil(r.records.length / 2)), more: true };
+          return { id, ...r };
+        }
+      }
     },
   );
 

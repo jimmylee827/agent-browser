@@ -39,6 +39,8 @@ export interface Session {
   /** What each client last saw, to tell it what changed since. */
   lastSeen: Map<string, { at: number; navCount?: number; docGen?: string }>;
   usedAt: number;
+  /** A background job's own window (jobs.ts): never idled, never released with a client. */
+  job?: string;
 }
 
 export interface Resolved {
@@ -53,6 +55,10 @@ const SHARED = /^shared:(.+)$/;
 
 /** Map a caller's `session` argument to a registry key. */
 export function resolveKey(client: string, name?: string): Resolved {
+  if (name?.startsWith("job:"))
+    throw new AbError("BAD_REQUEST", `"${name}" is a background job's window, which only the job runner drives`, {
+      recovery: "read what a job recorded with browser_network({job}) or browser_jobs({action:\"read\"}); use your own session for anything else",
+    });
   if (name === LEGACY) return { key: LEGACY, label: LEGACY, shared: true, legacy: true };
   const m = name?.match(SHARED);
   if (m) return { key: `s:${m[1]}`, label: name!, shared: true, legacy: false };
@@ -74,6 +80,17 @@ export class SessionManager {
       this.sessions.set(r.key, s);
     }
     return s;
+  }
+
+  /** The session a background job owns. */
+  jobSession(id: string): Session {
+    const s = this.get({ key: `j:${id}`, label: `job:${id}`, shared: false, legacy: false }, "jobs");
+    s.job = id;
+    return s;
+  }
+
+  drop(s: Session): void {
+    this.sessions.delete(s.key);
   }
 
   all(): Session[] {
@@ -156,7 +173,7 @@ export class SessionManager {
 
   /** Private sessions unused for longer than `ms`: their windows stay open, unbound. */
   idle(ms: number, now = Date.now()): Session[] {
-    return this.all().filter((s) => !s.legacy && s.tabId !== undefined && now - s.usedAt > ms);
+    return this.all().filter((s) => !s.legacy && !s.job && s.tabId !== undefined && now - s.usedAt > ms);
   }
 
   async withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
