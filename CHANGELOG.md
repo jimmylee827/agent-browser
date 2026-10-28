@@ -7,6 +7,41 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **Sessions: one agent, one window.** Each MCP connection gets its own
+  background window on its first visit, and every call acts on that tab only —
+  two agents no longer type into, navigate or screenshot each other's page, and
+  an agent never lands in the user's tab. `session: "shared:<name>"` shares a tab
+  on purpose; results then name the `lastActor` and what changed since your last
+  call, and `lock: true` leases it. `session: "default"` keeps the old behaviour
+  with a warning
+- **Structured failures.** Every error carries a `code` (NEEDS_HUMAN, OCCLUDED,
+  NO_MATCH, STALE_SNAPSHOT, TAB_GONE, HOVER_NOT_EFFECTIVE, …), `agentCanFix`,
+  `fixSteps`, `humanAction` and, for a server problem, `logTail`; codes are
+  carried from the page through the extension and the bridge
+- `degraded: string[]` on every result: what could not be done as asked
+- **Human walls.** A captcha, or a notice whose only way out is disabled, comes
+  back as `outcome: "needs_human"` with the blocking element (cross-origin
+  iframes now have refs) and a screenshot; a cookie banner as a consent wall
+  with its dismiss button's ref. Acting on a blocked element fails `NEEDS_HUMAN`
+- **Settled captures and change detection.** Screenshots wait for layout,
+  animations, fonts and the network to settle, report `settled`/`settleReason`,
+  and carry `documentGeneration` and `layoutHash`
+- **Build identity.** `agent_browser_status` reports the server's build against
+  the one on disk (`staleBuild` + the restart command), the extension's version
+  against the one on disk, and the launcher's; the first result a client gets
+  says so once. `agent_browser_ensure_running({restartIfStale: true})`
+- `drag` in `agent_browser_act` (range inputs, custom sliders, pointer-capture
+  scrubbers, HTML5 drag-and-drop) and `browser_pointer` for raw sequences
+- `browser_inspect` (attributes, value, media state, box, topmost-at-centre),
+  `browser_eval` (any page but `eval.blockedDomains`), `browser_diagnostics`
+  (failed requests everywhere; console errors and exceptions on development
+  hosts), and a one-line `diagnostics` summary in visit and act results
+- The tree shows `pressed`, `current`, and video/audio elements with their
+  state; `details: true` adds hrefs and srcs
+- An evidence trail: each visit and screenshot is saved under
+  `~/.agent-chrome/sessions/<session>/` and returned as `evidence`
+- Tests: `npm test` (unit, in CI) and `npm run test:e2e` (real Google Chrome,
+  isolated instance, local fixtures; `npm run test:e2e:setup` once)
 - Persistent Chrome + MV3 extension bridge, with no CDP or debugger API
 - MCP server exposing `agent_browser_visit` / `agent_browser_act`, plus
   `browser_*` primitives, over stdio and Streamable HTTP
@@ -55,6 +90,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Screenshot results give `bytes` per image
 
 ### Fixed
+- **A hover that changed nothing no longer reports success.** It applies the
+  page's `:hover` rules and fails `HOVER_NOT_EFFECTIVE` when nothing changes
+- **Element screenshots no longer capture the sticky header instead.** The
+  element is centred, a fixed bar over it is hidden, and anything else covering
+  it is an `OCCLUDED` error
+- An `<a>` with a click handler and no href (`data-toggle`, `onclick`) is a
+  button, found by its text
+- A visit to another route on the same host returned the old route's tree: the
+  wait now counts commits instead of comparing host names
+- `name: "Play"` matched the heading "Player" before the Play button: an exact
+  name now beats a prefix, a prefix a substring, a control a heading
+- A link that opened a new tab counted as a dead click and was clicked again
+- The session mutex never held: the HTTP transport builds a server per request,
+  and each had its own session registry. There is one per daemon now
+- The extension reloads itself when any of its files (not just `sw.js`) or its
+  secret and port differ from what it runs, on start and on every reconnect
+- A page's `navigator.credentials.store` is refused in the persistent profile
+  and reported, and the first password typed on a host carries a warning
 - **A failed action no longer comes back as a success.** The engine reports its
   own failures — no such option, a disabled or covered element — as a reply
   carrying `error`, and nothing checked for it, so `select "Option 9"` returned

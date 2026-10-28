@@ -34,6 +34,8 @@ else
   echo "  v8 heap : Chrome default"
   JS_FLAGS_ARG=()
 fi
+# Google Chrome ignores --load-extension (since 137): the extension is loaded
+# once by hand into the profile, and stays.
 echo "  ext     : load once manually via chrome://extensions -> $EXT_DIR"
 
 # --disable-backgrounding-occluded-windows: keep painting the window while it
@@ -47,5 +49,5 @@ exec "$CHROME" \
   --disable-backgrounding-occluded-windows \
   --no-first-run \
   --no-default-browser-check \
-  --disable-features=Translate,DisableLoadExtensionCommandLineSwitch \
+  --disable-features=Translate \
   "$@"

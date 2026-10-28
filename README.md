@@ -42,6 +42,25 @@ That's the whole API. No refs to track, no snapshot generations, no selectors.
 └────────────────────────────────────────────────────────┘
 ```
 
+## First call on a fresh machine
+
+Most of it an agent can do itself; one step only a person can.
+
+| Who | Step |
+| --- | --- |
+| agent | `agent_browser_status` — is the server up, which build, is the extension current? |
+| agent | `agent_browser_ensure_running` — starts the server and Chrome as needed |
+| **person, once** | `chrome://extensions` → Developer mode → **Load unpacked** → `packages/extension`. Chrome allows no other way to install it. Afterwards the extension reloads itself when its files change; if `agent_browser_status` ever says `extension.stale`, press Reload on its card once. |
+
+### When it is down
+
+1. `agent_browser_status`. If `staleBuild` is true: `agent_browser_ensure_running({restartIfStale: true})`.
+2. `agent_browser_ensure_running`.
+3. Still failing: the error's `code` and `humanAction` say what is wrong. Tell
+   the person in one sentence, and record the step as not done (carry the
+   result's `degraded` entries into the final report) — never report a page
+   that was not reached as empty.
+
 ## Setup
 
 ```bash
@@ -112,16 +131,49 @@ the daemon.)
 | `Could not find service "com.agent-browser.mcp-server"` | Old `mcp:restart`; update, or run `npm run mcp:install`. |
 | Tools answer `HALTED` | The kill switch is on (`~/.agent-chrome/HALT`). That is the user's call: `npm run resume`. |
 
+## Sessions: one agent, one window
+
+Each MCP connection (one launcher — one agent conversation) gets its **own
+browser window**, opened in the background on its first visit. Its calls act on
+its own tab and nothing else: two agents testing the same page never see each
+other's typing or navigation, and an agent never lands in a tab the user has
+open. Every tool takes an optional `session`:
+
+| `session` | Meaning |
+| --- | --- |
+| omitted | your private window |
+| `"name"` | another private window of yours (for a subagent sharing your connection) |
+| `"shared:<name>"` | one tab shared by every caller passing the same name; each result says who else acted since your last call (`lastActor`, `changedSinceYourLastCall`), and `lock: true` leases it |
+| `"default"` | the old behaviour — whatever tab is focused — with a warning |
+
+Cookies and logins are **not** separated: there is one browser profile, so a
+login in one session is a login in all. Use test accounts you are happy to
+leave in that profile; a page's attempt to save a credential
+(`navigator.credentials.store`) is refused and reported.
+
+## Results
+
+Every result carries `degraded: string[]` — what could not be done — so a
+caller can carry it into its report. Every failure carries a `code`
+(`NEEDS_HUMAN`, `OCCLUDED`, `NO_MATCH`, `STALE_SNAPSHOT`, `TAB_GONE`,
+`HOVER_NOT_EFFECTIVE`, …), `agentCanFix`, `fixSteps` and `humanAction`, beside
+the `error` and `recovery` prose. A captcha or a notice in the way comes back as
+`outcome: "needs_human"` with the blocking element and a screenshot.
+
 ## Tools
 
 ### Primary
 
 | Tool | What it does |
 | ---- | ------------ |
-| `agent_browser_visit({url} \| {history}, text?, snapshot?)` | Navigate — or go back / forward / reload — wait for the page to settle, return an accessibility tree. `text: true` adds the visible text; `snapshot: "none"` drops the tree. |
-| `agent_browser_act({name, role?, action, value?, snapshot?, onDialog?})` | Find an element by accessible name, act on it, wait, return the new tree. A failed action is an error; one that changed nothing says `noEffect`. |
+| `agent_browser_visit({url} \| {history}, text?, snapshot?, details?)` | Navigate your session's tab — or go back / forward / reload — wait for the page to settle, return an accessibility tree. `text: true` adds the visible text; `snapshot: "none"` drops the tree; `details: true` adds hrefs and srcs. Failed requests and console errors since the call began are summarised in `diagnostics`. |
+| `agent_browser_act({name, role?, action, value?, to?, snapshot?, onDialog?})` | Find an element by accessible name, act on it, wait, return the new tree. A failed action is an error; one that changed nothing says `noEffect`. `drag` takes `to` (an element or a point) and `at`/`toAt` as percentages. |
 | `browser_observe({mode: "read", offset?})` | The page's visible text, paged, including same-origin iframes. |
-| `browser_screenshot({fullPage? \| name? \| ref? \| clip?})` | Viewport, whole page (stitched), one element, or a region. |
+| `browser_screenshot({fullPage? \| name? \| ref? \| clip?})` | Viewport, whole page (stitched), one element, or a region — after the page settles (`settled`, `settleReason`), with `documentGeneration` and `layoutHash` to tell two captures of a changed page apart. An element is centred and any fixed bar over it hidden; something else covering it is an `OCCLUDED` error. Saved to disk as `evidence`. |
+| `browser_inspect({name \| ref})` | One element's state: attributes (`src`, `href`, every `aria-*`), value, checked, media state, box, visibility, topmost-at-centre. |
+| `browser_eval({expression})` | A JS expression in the page, its value as JSON — app state, `video.readyState`. Refused on `eval.blockedDomains`. |
+| `browser_diagnostics({since?})` | Failed requests (every host); console errors, exceptions and rejections (development hosts). |
+| `browser_pointer({sequence})` | A down / move / up / wheel sequence, for gestures `drag` does not cover. |
 | `browser_tabs({action})` | List, switch, open or close tabs. |
 | `browser_scroll({to \| y})` | Scroll; reports `atBottom` and how much an infinite feed grew. |
 | `browser_wait({text? \| name? \| role?, gone?})` | Wait for text or an element to appear or go; with none, for the page to go quiet. |
@@ -129,8 +181,15 @@ the daemon.)
 | `agent_browser_ensure_running()` | Idempotent launch (auto-fires on first visit). |
 
 `action` is one of `click | type | fill | clear | press | hover | focus |
-check | uncheck | submit | select`. Name matching is case-insensitive
-substring; pass `role` when a name is ambiguous. `snapshot` is `full`
+check | uncheck | submit | select | drag`. Name matching is case-insensitive:
+an exact name wins over a prefix, a prefix over a substring, a control over a
+heading; pass `role` when a name is still ambiguous.
+
+Events are synthetic (`isTrusted: false`) — the price of having no CDP. Hover
+applies the page's own `:hover` rules and fails with `HOVER_NOT_EFFECTIVE` when
+nothing changes; drag works with pointer capture and HTML5 drag-and-drop. Things
+that need a real user gesture — `video.play()` with sound, `requestFullscreen` —
+are refused by Chrome, and the refusal shows up in `diagnostics`. `snapshot` is `full`
 (default), `viewport`, or `none` — use the smaller ones for a run of fills.
 
 ### Advanced primitives
@@ -189,7 +248,8 @@ there to make them fully autonomous.
 | ------- | --- |
 | `bridge not connected` | Is Chrome open on the agent profile? Is the extension loaded and enabled? |
 | Extension loaded but never connects | Re-run `node scripts/sync-ext-secret.mjs`, then reload the extension. |
-| Edited extension code, nothing changed | Chrome caches unpacked extensions. Hit reload ↻ on `chrome://extensions` — restarting the browser is often not enough. |
+| Edited extension code, nothing changed | The extension compares its files with what it runs and reloads itself on start and on every reconnect. If `agent_browser_status` still says `extension.stale` (or a call fails `EXTENSION_STALE`), hit reload ↻ on `chrome://extensions` once. |
+| `staleBuild: true` in a result | The server runs older code than `dist/`: `npm run mcp:restart`, or `agent_browser_ensure_running({restartIfStale: true})`. A `launcherWarning` means the client's tool list is old: reconnect it (`/mcp`). |
 | Daemon crash-looping in the logs | Something else holds `8787`/`8788`. The ports are single-owner; stop the other instance. |
 
 **Service-worker lifetime.** Chrome tears down an extension service worker after
@@ -199,6 +259,20 @@ heartbeat every 20s; receiving a WebSocket message resets that idle timer, so th
 worker stays resident while the browser is open. Calls that do arrive during a
 genuine reconnect (browser just started, extension reloaded) wait up to 8s rather
 than failing immediately.
+
+## Tests
+
+```bash
+npm test                 # unit tests, no browser (also in CI)
+npm run test:e2e:setup   # once: a person loads the extension into a test profile
+npm run test:e2e         # end to end, in real Google Chrome
+```
+
+The end-to-end tests run a second, isolated instance — their own server on free
+ports, real Google Chrome on `~/.agent-chrome-test/profile`, local fixture pages
+in `test/fixtures` — and never touch your agent browser, its profile or its
+server. Chrome no longer loads extensions from the command line, so the test
+profile is set up like the agent profile: the extension is loaded once by hand.
 
 ## Uninstall
 
