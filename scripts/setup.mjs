@@ -251,9 +251,11 @@ Then run \`npm run setup\` again (it will say Extension: connected), or
   }
 }
 
-const ready = connected && !final?.build?.staleBuild;
+const failures = results.filter((r) => r.status === "fail");
+const ready = connected && !final?.build?.staleBuild && failures.length === 0;
 console.log(
   `\n${ready ? "\x1b[32mReady.\x1b[0m" : "\x1b[33mNot ready yet.\x1b[0m"} ` +
     `${ready ? "Start a new Claude Code session, or run /mcp to reconnect, and the agent-browser tools are there." : "See above."}\n`,
 );
-process.exit(ready || (CHECK && results.every((r) => r.status !== "fail")) ? 0 : 1);
+if (!ready && failures.length) console.log(`\nNot ready: ${failures.map((f) => f.name).join(", ")}. See above.`);
+process.exit(ready ? 0 : 1);
