@@ -7,6 +7,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- Network capture: fetch and XHR bodies, WebSocket and EventSource messages,
+  headers and timing, recorded on every page except `network.blockedDomains`,
+  secrets removed before anything is stored. `browser_network` reads it (JSON
+  parsed) and exports HAR or NDJSON; `browser_wait({response})` waits up to five
+  minutes for a response and returns it; `agent_browser_act({waitForResponse})`
+  does it in one call; visit and act results name the API calls in `network`.
+  Extension 0.0.7 (`unlimitedStorage`).
+- Background jobs (`browser_jobs`, `npm run ab -- jobs`): a page kept open in
+  its own window, its matching responses written to
+  `~/.agent-chrome/jobs/<id>/<date>.ndjson`, healed when it stops answering
+  (reload, navigate again, reopen, then `needs-attention`), with page loads
+  capped per hour. Survive server restarts; paused by the kill switch.
+- `npm run ab`: the agent browser from a terminal (status, tabs, network,
+  jobs), `--json` for scripts.
+- `config/local.json` is re-read on change and sent to the extension; the
+  `network` and `jobs` sections join `policy` in being editable live.
+
+### Security
+- The control port refuses requests from web pages (an `Origin` header, a
+  cross-site `Sec-Fetch-Site`, or a Host other than loopback). Before, any page
+  in any browser on the machine could navigate the agent Chrome with an `<img>`.
+
 - `npm run setup`: one idempotent command that checks the machine, builds,
   writes the bridge secret, installs the login item, launches Chrome, registers
   the launcher with Claude Code, and verifies the chain — then opens

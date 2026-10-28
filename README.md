@@ -193,17 +193,19 @@ the `error` and `recovery` prose. A captcha or a notice in the way comes back as
 
 | Tool | What it does |
 | ---- | ------------ |
-| `agent_browser_visit({url} \| {history}, text?, snapshot?, details?)` | Navigate your session's tab — or go back / forward / reload — wait for the page to settle, return an accessibility tree. `text: true` adds the visible text; `snapshot: "none"` drops the tree; `details: true` adds hrefs and srcs. Failed requests and console errors since the call began are summarised in `diagnostics`. |
-| `agent_browser_act({name, role?, action, value?, to?, snapshot?, onDialog?})` | Find an element by accessible name, act on it, wait, return the new tree. A failed action is an error; one that changed nothing says `noEffect`. `drag` takes `to` (an element or a point) and `at`/`toAt` as percentages. |
+| `agent_browser_visit({url} \| {history}, text?, snapshot?, details?)` | Navigate your session's tab — or go back / forward / reload — wait for the page to settle, return an accessibility tree. `text: true` adds the visible text; `snapshot: "none"` drops the tree; `details: true` adds hrefs and srcs. Failed requests and console errors since the call began are summarised in `diagnostics`, the API calls the page made in `network`. |
+| `agent_browser_act({name, role?, action, value?, to?, snapshot?, onDialog?})` | Find an element by accessible name, act on it, wait, return the new tree. A failed action is an error; one that changed nothing says `noEffect`. `drag` takes `to` (an element or a point) and `at`/`toAt` as percentages. `waitForResponse: {urlPattern}` also returns the response the action made the page fetch. |
 | `browser_observe({mode: "read", offset?})` | The page's visible text, paged, including same-origin iframes. |
 | `browser_screenshot({fullPage? \| name? \| ref? \| clip?})` | Viewport, whole page (stitched), one element, or a region — after the page settles (`settled`, `settleReason`), with `documentGeneration` and `layoutHash` to tell two captures of a changed page apart. An element is centred and any fixed bar over it hidden; something else covering it is an `OCCLUDED` error. Saved to disk as `evidence`. |
 | `browser_inspect({name \| ref})` | One element's state: attributes (`src`, `href`, every `aria-*`), value, checked, media state, box, visibility, topmost-at-centre. |
 | `browser_eval({expression})` | A JS expression in the page, its value as JSON — app state, `video.readyState`. Refused on `eval.blockedDomains`. |
+| `browser_network({urlPattern?, status?, type?, includeBodies?, action?})` | What the page sent and received: fetch/XHR bodies (JSON parsed), WebSocket and EventSource messages, headers and timing. `action: "export"` writes a HAR or NDJSON file. See [Network capture](#network-capture). |
 | `browser_diagnostics({since?})` | Failed requests (every host); console errors, exceptions and rejections (development hosts). |
+| `browser_jobs({action})` | Background jobs: keep a page open, record it, heal it. See [Background jobs](#background-jobs). |
 | `browser_pointer({sequence})` | A down / move / up / wheel sequence, for gestures `drag` does not cover. |
 | `browser_tabs({action})` | List, switch, open or close tabs. |
 | `browser_scroll({to \| y})` | Scroll; reports `atBottom` and how much an infinite feed grew. |
-| `browser_wait({text? \| name? \| role?, gone?})` | Wait for text or an element to appear or go; with none, for the page to go quiet. |
+| `browser_wait({text? \| name? \| role?, gone?} \| {response})` | Wait for text or an element to appear or go; for a response (`{urlPattern}`, up to 5 minutes, returned parsed); with none, for the page to go quiet. |
 | `agent_browser_status()` | Is the browser ready? No side effects. |
 | `agent_browser_ensure_running()` | Idempotent launch (auto-fires on first visit). |
 
@@ -271,6 +273,86 @@ covers nothing else; after a rebuild macOS treats it as new and asks again.
 | `sound: true` | `agent_browser_visit` | this session's page may be heard (agent windows open muted) |
 | `allowPopups: true \| false` | visit, act | let the site open a popup without a click (or stop it) — audit-logged |
 
+## Network capture
+
+`chrome.webRequest` sees every request's headers but never a body, so the
+extension also records from inside the page: a script in the page's own world,
+loaded before any of the page's scripts, records what `fetch`, `XMLHttpRequest`,
+`WebSocket` and `EventSource` send and receive. An agent reads the data a page
+loaded — a product list, search results, a dashboard's readings — instead of
+scraping it off the screen.
+
+```js
+agent_browser_act({ name: "Search", waitForResponse: { urlPattern: "/api/search" } })
+// → response.json: the results the page fetched
+browser_network({ urlPattern: "/api/", includeBodies: true })
+browser_network({ action: "export", format: "har" })   // → a file devtools opens
+```
+
+- **Where:** every page except `network.blockedDomains` (identity, payment and
+  banking hosts by default; edit in `config/local.json`). On those, only what
+  `webRequest` sees: status and URL, no headers or bodies.
+- **Secrets first:** before anything is stored, the listed headers
+  (`Authorization`, `Cookie`, `Set-Cookie`, API keys…) are removed, along with any
+  JSON, form or query field whose name matches `network.redactKeys`, JWTs, and
+  values the agent typed into password fields. Cookies never reach the extension
+  at all.
+- **The page must not notice:** each patched function is a Proxy of the original
+  and reports itself as native code; `fetch` hands back the browser's own
+  promise; only a clone of a response is read. Cross-origin frames (mostly ads and
+  fraud scripts) are left alone. A page that compares functions against a
+  pristine frame's copy could still tell — that is the remaining risk.
+- **Kept:** in the browser (IndexedDB in the agent profile), per tab, up to
+  `maxEntriesPerTab` and `retainHours`; cleared when the tab closes and when the
+  browser restarts. It is written to disk only when exported, or by a job.
+- **Limits:** bodies up to `maxBodyChars`; images, fonts, media, scripts and
+  streams are recorded without bodies; WebSocket messages are capped per socket.
+  Named EventSource events (`event: foo`), requests from workers, and pages
+  opened before capture was on are not recorded (reload the page).
+
+## Background jobs
+
+A job keeps a page open in a window of its own and writes the responses that
+match to `~/.agent-chrome/jobs/<id>/<date>.ndjson`, for as long as it runs:
+hours or days, beyond any conversation. Start one only for a page you want
+watched or recorded over time.
+
+```bash
+npm run ab -- jobs start --id readings --url https://dash.example/overview \
+  --capture /api/readings --health-text '°C'
+npm run ab -- jobs status readings
+npm run ab -- jobs tail readings --follow
+npm run ab -- jobs stop readings
+```
+
+When the page stops answering — its requests fail, or the health text is gone —
+the job climbs a ladder: reload, then navigate again, then reopen the window,
+then stop and say so (`needs-attention`, `ab jobs status --check` exits 3).
+Only a real recovery clears the ladder: good responses and a quiet spell. A
+cached answer right after its own reload does not count. Nothing is done while
+a page loads, and page loads, scheduled refreshes included, are capped per hour
+(`jobs.defaults.maxLoadsPerHour`), so a sick site is never hammered.
+
+The server drives jobs, not the page: they survive the extension sleeping and
+the server restarting (it finds the tab again). The kill switch pauses them;
+what the page recorded meanwhile is written when it is lifted. If the browser
+stays disconnected — on macOS, a Chrome with no window open has unloaded the
+extension — the server opens a window, a few times a day at most. Records are
+removed after `evidence.retainDays`.
+
+## From a terminal
+
+Everything an agent's tools can read or start, `npm run ab` does too, with
+`--json` for scripts:
+
+```bash
+npm run ab -- status
+npm run ab -- tabs
+npm run ab -- network --tab <id> --url /api/ --bodies
+npm run ab -- network --tab <id> --export har
+npm run ab -- jobs list
+```
+
 ## Safety
 
 Navigation and ordinary interaction are unrestricted — the agent can go
@@ -295,15 +377,20 @@ never writes the file itself: your approval is what makes the change happen.
 - **Dry-run:** `AB_DRY_RUN=1` reports intent without executing.
 - **Activity feed:** `npm run activity` (`~/.agent-chrome/audit.log`).
 - **Redaction:** password / OTP / card fields are stripped from snapshots
-  (`policy.redactSelectors`).
+  (`policy.redactSelectors`), and secrets from recorded traffic (see
+  [Network capture](#network-capture)).
+- **Web pages cannot drive it:** the control port listens on 127.0.0.1, which
+  any web page in any browser on the machine can reach. Requests carrying what
+  only a browser adds (`Origin`, a cross-site `Sec-Fetch-Site`) or naming
+  another host (DNS rebinding) are refused and audit-logged.
 
 ## Layout
 
 - `bin/` — Chrome launcher, profile reset
 - `packages/mcp-server/` — MCP server + bridge + control plane (TypeScript)
-- `packages/extension/` — MV3 Agent Bridge (service worker + perception/action engine)
+- `packages/extension/` — MV3 Agent Bridge: service worker, perception/action engine (`src/content`), the page-world network hook (`src/main`), and its store, redaction and joining (`src/lib`)
 - `host-helper/` — optional launchd daemon that spawns GUI Chrome
-- `scripts/` — bridge-secret sync, smoke + action tests
+- `scripts/` — `ab.mjs` (the terminal client), setup, bridge-secret sync, smoke + action tests
 - `skills/` — the `persistent-web-engine` agent skill
 - `config/default.json` — policy, bridge, profile paths
 

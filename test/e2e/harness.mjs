@@ -21,6 +21,7 @@ import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { WebSocketServer } from "ws";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const fixtures = resolve(root, "test/fixtures");
@@ -77,9 +78,57 @@ const TONE = (() => {
 })();
 const escapeHtml = (t) => String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 
+// The API the network and job tests read: JSON (with a cookie and an echo of
+// what authorization arrived), a POST echo, slow and big answers, a poll whose
+// health a test switches (/api/mode?set=up|down|blank), and SSE.
+export const api = { mode: "up", polls: 0 };
+const json = (res, code, body, headers = {}) => {
+  res.writeHead(code, { "Content-Type": "application/json", "Cache-Control": "no-store", ...headers });
+  res.end(JSON.stringify(body));
+};
+function apiRoute(req, res, url) {
+  const p = url.pathname;
+  if (p === "/api/items")
+    return json(res, 200, { items: [{ id: 1, name: "jacket", price: 480 }, { id: 2, name: "tee", price: 120 }], sawAuthorization: !!req.headers.authorization, token: "srv-secret-token" }, { "Set-Cookie": "sid=server-session; Path=/" });
+  if (p === "/api/echo") {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => json(res, 200, { got: body.length, type: req.headers["content-type"] ?? "" }));
+    return true;
+  }
+  if (p === "/api/slow") {
+    setTimeout(() => json(res, 200, { slow: true, ms: Number(url.searchParams.get("ms") ?? 1000) }), Number(url.searchParams.get("ms") ?? 1000));
+    return true;
+  }
+  if (p === "/api/big") return json(res, 200, { data: "x".repeat(1024 * Number(url.searchParams.get("kb") ?? 100)) });
+  if (p === "/api/mode") {
+    api.mode = url.searchParams.get("set") ?? api.mode;
+    return json(res, 200, { mode: api.mode });
+  }
+  if (p === "/api/poll") {
+    api.polls++;
+    if (api.mode === "down") return json(res, 500, { error: "down" });
+    return json(res, 200, api.mode === "blank" ? { readings: [] } : { readings: [{ t: Date.now(), value: 21.5 + (api.polls % 5) / 10 }] });
+  }
+  if (p === "/sse") {
+    res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-store" });
+    let n = 0;
+    const t = setInterval(() => {
+      res.write(`data: tick ${++n}\n\n`);
+      if (n >= 3) clearInterval(t);
+    }, 100);
+    req.on("close", () => clearInterval(t));
+    return true;
+  }
+  return false;
+}
+
 function fixtureServer(port, other) {
   const srv = createServer((req, res) => {
     const url = new URL(req.url, "http://x");
+    if (url.pathname.startsWith("/api/") || url.pathname === "/sse") {
+      if (apiRoute(req, res, url) !== false) return;
+    }
     if (url.pathname === "/tone.wav") {
       res.writeHead(200, { "Content-Type": "audio/wav" });
       return res.end(TONE);
@@ -104,6 +153,14 @@ function fixtureServer(port, other) {
     res.writeHead(200, { "Content-Type": TYPES[extname(file)] || "application/octet-stream", "Cache-Control": "no-store" });
     res.end(body);
   });
+  // WebSocket: echoes, then pushes three messages; ?flood=1 pushes 300.
+  const wss = new WebSocketServer({ server: srv, path: "/ws" });
+  wss.on("connection", (ws, req) => {
+    ws.on("message", (m) => ws.send(`echo:${m}`));
+    const n = new URL(req.url, "http://x").searchParams.get("flood") ? 300 : 3;
+    for (let i = 1; i <= n; i++) ws.send(`push ${i}`);
+  });
+  srv.on("close", () => wss.close());
   return new Promise((ok) => srv.listen(port, "127.0.0.1", () => ok(srv)));
 }
 
@@ -148,7 +205,7 @@ export async function startHarness({ log = false, waitMs = 45_000, setup = false
     AB_DISABLE_STDIO_MCP: "1",
   };
   const out = log ? "inherit" : "ignore";
-  const daemon = spawn(process.execPath, [join(server, "dist/index.js")], { env, stdio: ["ignore", out, out] });
+  let daemon = spawn(process.execPath, [join(server, "dist/index.js")], { env, stdio: ["ignore", out, out] });
   // The flags bin/launch-chrome.sh uses for the agent browser; no automation
   // switches. A Chrome already open on the test profile (a run that did not
   // clean up) is closed first, or it would keep the old extension secret.
@@ -203,6 +260,21 @@ export async function startHarness({ log = false, waitMs = 45_000, setup = false
     };
   }
 
+  /** Kill the server and start it again on the same state: what launchd does after a crash. */
+  async function restartDaemon() {
+    daemon.kill("SIGTERM");
+    await new Promise((r) => daemon.once("exit", r));
+    daemon = spawn(process.execPath, [join(server, "dist/index.js")], { env, stdio: ["ignore", out, out] });
+    const t = Date.now();
+    while (Date.now() - t < 30_000) {
+      try {
+        if ((await (await fetch(`${base}/status`)).json()).bridgeConnected) return true;
+      } catch {}
+      await sleep(300);
+    }
+    return false;
+  }
+
   async function stop() {
     for (const c of clients) await c.close().catch(() => {});
     chrome.kill("SIGTERM");
@@ -219,6 +291,9 @@ export async function startHarness({ log = false, waitMs = 45_000, setup = false
     url: (path, which = "A") => `http://127.0.0.1:${which === "A" ? webA : webB}/${path}`,
     state,
     base,
+    restartDaemon,
+    /** This instance's config/local.json: the server re-reads it when it changes. */
+    localConfig: env.AB_LOCAL_CONFIG,
     /** The build stamp the server would find on disk. */
     buildInfoFile: join(server, "dist/build-info.json"),
   };

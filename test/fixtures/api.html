@@ -1,0 +1,69 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>API</title>
+<h1>API</h1>
+<p>Each button makes the page talk to its server one way. The page shows what
+it got back, so a test can tell it still works with capture on.</p>
+<button id="json">Load JSON</button>
+<button id="xhr">Send XHR</button>
+<button id="fail">Fail</button>
+<button id="offline">Offline</button>
+<button id="socket">Socket</button>
+<button id="flood">Flood</button>
+<button id="stream">Stream</button>
+<button id="slow">Slow</button>
+<button id="big">Big</button>
+<pre id="out"></pre>
+<pre id="checks"></pre>
+<iframe id="same" src="/api-frame.html" width="300" height="60"></iframe>
+<iframe id="cross" src="{{OTHER}}/api-frame.html" width="300" height="60"></iframe>
+<script>
+  const out = (t) => (document.getElementById("out").textContent = t);
+  const on = (id, fn) => document.getElementById(id).addEventListener("click", fn);
+  on("json", async () => {
+    const r = await fetch("/api/items?token=abc123&q=jacket", { headers: { Authorization: "Bearer page-secret" } });
+    const d = await r.json();
+    out(`items: ${d.items.map((i) => i.name).join(", ")}`);
+  });
+  on("xhr", () => {
+    const x = new XMLHttpRequest();
+    x.open("POST", "/api/echo");
+    x.setRequestHeader("Content-Type", "application/json");
+    x.onload = () => out(`echo: ${x.responseText}`);
+    x.send(JSON.stringify({ password: "hunter2", q: "x" }));
+  });
+  on("fail", async () => out(`fail: ${(await fetch("/status/500")).status}`));
+  on("offline", () => fetch("http://127.0.0.1:1/").catch((e) => out(`offline: ${e.name}`)));
+  on("socket", () => {
+    const ws = new WebSocket(`ws://${location.host}/ws`);
+    ws.onopen = () => ws.send("hello");
+    ws.onmessage = (e) => e.data.startsWith("echo:") && (out(`socket: ${e.data}`), ws.close());
+  });
+  on("flood", () => {
+    const ws = new WebSocket(`ws://${location.host}/ws?flood=1`);
+    let n = 0;
+    ws.onmessage = () => ++n === 300 && (out(`flood: ${n}`), ws.close());
+  });
+  on("stream", () => {
+    const es = new EventSource("/sse");
+    let n = 0;
+    es.onmessage = (e) => ++n === 3 && (out(`stream: ${e.data}`), es.close());
+  });
+  on("slow", async () => out(`slow: ${JSON.stringify(await (await fetch("/api/slow?ms=27000")).json())}`));
+  on("big", async () => out(`big: ${(await (await fetch("/api/big?kb=100")).text()).length}`));
+
+  // What a page could check to find a hook. Each line must say true.
+  const ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => ws.close();
+  const xhr = new XMLHttpRequest();
+  xhr.open("GET", "/api/items");
+  document.getElementById("checks").textContent = [
+    `fetchNative=${/\{\s*\[native code\]\s*\}$/.test(Function.prototype.toString.call(fetch)) && /^function fetch\(/.test(String(fetch))}`,
+    `toStringNative=${Function.prototype.toString.toString() === "function toString() { [native code] }"}`,
+    `noPrototype=${!("prototype" in fetch)}`,
+    `xhrNoKeys=${Object.keys(xhr).length === 0}`,
+    `wsConstructor=${ws.constructor === WebSocket && ws instanceof WebSocket}`,
+    `wsNative=${/\[native code\]/.test(String(WebSocket))}`,
+    `noCaptureGlobals=${!Object.getOwnPropertyNames(window).some((k) => /^__abNet|^ab[0-9a-f]{32}/.test(k))}`,
+  ].join("\n");
+</script>

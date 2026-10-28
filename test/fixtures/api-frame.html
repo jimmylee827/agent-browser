@@ -1,0 +1,7 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>API frame</title>
+<p id="f">frame</p>
+<script>
+  fetch(`/api/items?from=frame-${location.port}`).then((r) => r.json()).then((d) => (document.getElementById("f").textContent = `frame got ${d.items.length}`));
+</script>

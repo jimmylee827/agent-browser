@@ -1,0 +1,18 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Poll</title>
+<h1>Readings</h1>
+<p id="r">Loading</p>
+<script>
+  // Polls by itself, as a dashboard does; shows a reading, or that it has none.
+  async function poll() {
+    try {
+      const d = await (await fetch("/api/poll")).json();
+      document.getElementById("r").textContent = d.readings?.length ? `Reading: ${d.readings[0].value} °C` : "No data";
+    } catch {
+      document.getElementById("r").textContent = "No data";
+    }
+  }
+  poll();
+  setInterval(poll, 1000);
+</script>

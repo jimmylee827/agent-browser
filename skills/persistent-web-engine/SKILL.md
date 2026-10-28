@@ -213,6 +213,43 @@ The tree also shows `pressed`, `current`, and media nodes with their state;
 on identity, payment and banking domains (`EVAL_BLOCKED`) and where the page's
 CSP forbids eval — use `browser_inspect` there.
 
+### "Read the data a page loaded (its API responses)"
+Pages fetch their data as JSON; reading that is exact where the screen is not.
+```text
+agent_browser_visit({ url })              # result.network names the API calls the page made
+browser_network({ urlPattern: "/api/products", includeBodies: true })
+# → entries[]: { method, url, status, json (parsed body), via: fetch|xhr|ws|sse, ts }
+browser_network({ type: "ws", includeBodies: true })   # WebSocket / EventSource messages
+browser_network({ action: "export", format: "har" })   # → file: a HAR in the session's evidence folder
+```
+Without `includeBodies` you get 200-character previews: list first, then ask for
+the bodies of the few entries you need. Secrets are already removed
+(`[redacted]`). On identity, payment and banking sites nothing but status is
+recorded (`note` says so). A page opened before capture was on has no bodies
+(`degraded` says `CAPTURE_UNAVAILABLE`): reload it.
+
+### "Wait for a response after a click"
+```text
+agent_browser_act({ name: "Search", waitForResponse: { urlPattern: "/api/search" } })
+# → response.json: what the page got back; the screen may not show it all
+browser_wait({ response: { urlPattern: "/api/report", status: "2xx" }, timeout: 120000 })
+```
+Up to 5 minutes. `RESPONSE_TIMEOUT` lists what did arrive (`recent`).
+
+### "Keep a page open and record it" (only when the user asks)
+```text
+browser_jobs({ action: "start", id: "readings", url, capture: [{ urlPattern: "/api/readings" }],
+               health: { text: "°C" } })       # a pattern that is on screen when the page is fine
+browser_jobs({ action: "status", id: "readings" })    # running | healing | needs-attention | halted
+browser_jobs({ action: "read", id: "readings", limit: 50 })   # what it recorded; pass `next` as `after`
+browser_jobs({ action: "stop", id: "readings" })
+```
+A job runs in its own window beyond this conversation, heals its page when it
+stops answering, and caps its page loads per hour. Tell the user it exists and
+how to stop it (`npm run ab -- jobs stop <id>`). `JOB_LIMIT` means it would load
+the page too often, or there are too many jobs: ask for a slower interval, do
+not raise the limits.
+
 ### "Why did it fail?"
 visit and act results carry `diagnostics` when something went wrong in the page
 during the call ("1 failed request (/media/file 401), 1 console error").
@@ -386,4 +423,7 @@ Never edit it without their yes, and never relabel an action to get past it.
 - Don't run Selenium / Playwright / CDP / `chrome.debugger` style automation alongside. The whole point is stealth (no automation fingerprint). The MCP tools are the only correct path.
 - Don't kill / launch the agent Chrome manually. Use `agent_browser_ensure_running` if needed.
 - Don't drive another agent's or the user's tab: no `session: "default"`, no `tabId` you did not open, unless asked.
+- Don't start a background job unless the user asked for something to be watched or recorded over time, and don't leave one running unmentioned.
+- Don't edit `network.blockedDomains` or a job's limits yourself; like trustedDomains, they are the user's.
+- Don't copy recorded bodies into a report wholesale: take the fields the task needs. They can hold personal data the redaction does not know is personal.
 - Don't expect `isTrusted:true` events from synthetic input. A small minority of hardened sites gate on it; if one rejects the click, the tool surfaces the error rather than degrading stealth.
