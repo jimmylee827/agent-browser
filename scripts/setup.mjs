@@ -78,6 +78,30 @@ const chromeRunning = () => {
   }
 };
 
+/**
+ * Is Agent Bridge loaded into the agent profile, and switched on? Read from
+ * the profile's own record of its extensions, so "not connected" can say which
+ * step is missing: jmaxi's extension was loaded and enabled, and setup still
+ * told the person to Load unpacked. null when the profile can't be read.
+ */
+function installedExtension() {
+  for (const file of ["Secure Preferences", "Preferences"]) {
+    let prefs;
+    try {
+      prefs = JSON.parse(readFileSync(resolve(PROFILE, "Default", file), "utf8"));
+    } catch {
+      continue;
+    }
+    const entry = Object.values(prefs?.extensions?.settings || {}).find((e) => e?.path && resolve(e.path) === EXTENSION);
+    if (entry) {
+      const reasons = entry.disable_reasons;
+      return { loaded: true, enabled: !(Array.isArray(reasons) ? reasons.length : reasons) && entry.state !== 0 };
+    }
+    if (prefs?.extensions?.settings) return { loaded: false };
+  }
+  return null;
+}
+
 function chromeBinary() {
   const candidates = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -176,10 +200,6 @@ if (!CHECK && mac) {
 let connected = false;
 if (!CHECK) {
   step("Browser");
-  if (!chromeRunning()) {
-    spawn("bash", [resolve(root, "bin/launch-chrome.sh")], { detached: true, stdio: "ignore", cwd: root }).unref();
-    record("Chrome", "ok", "launched on the agent profile");
-  } else record("Chrome", "ok", "already running on the agent profile");
   // The extension connecting is what proves the whole chain works. It drops
   // briefly while it reloads itself, so a missed window is retried.
   const waitConnected = async (tries) => {
@@ -188,6 +208,23 @@ if (!CHECK) {
       connected = !!(await status())?.bridgeConnected;
     }
   };
+  const launch = () => spawn("bash", [resolve(root, "bin/launch-chrome.sh")], { detached: true, stdio: "ignore", cwd: root }).unref();
+  if (!chromeRunning()) {
+    launch();
+    record("Chrome", "ok", "launched on the agent profile");
+  } else {
+    // A running Chrome is not a running extension. On macOS, closing the
+    // agent profile's last window unloads the profile and its extension while
+    // the app stays up (jmaxi sat like that for hours, and setup waited on it
+    // and gave up). Launching again opens a window in that Chrome, which
+    // loads the profile back.
+    await waitConnected(16);
+    if (connected) record("Chrome", "ok", "already running on the agent profile");
+    else {
+      launch();
+      record("Chrome", "ok", "running with no window open: opened one");
+    }
+  }
   await waitConnected(120);
   if (!connected) await waitConnected(20);
 }
@@ -218,7 +255,13 @@ if (connected) {
   else if (v) record("Extension", "warn", `v${v} running, v${versionOnDisk} installed: Reload it once at chrome://extensions`);
   else record("Extension", "warn", `connected but its version is unknown: Reload it at chrome://extensions`);
 } else {
-  record("Extension", CHECK ? "fail" : "warn", "not connected");
+  record(
+    "Extension",
+    CHECK ? "fail" : "warn",
+    CHECK && chromeRunning()
+      ? "not connected, though Chrome is running: with no agent window open its extension is unloaded, and `npm run setup` opens one"
+      : "not connected",
+  );
 }
 
 // ------------------------------------------------------------------ input
@@ -259,19 +302,37 @@ if (!CHECK && has("claude")) {
 // ------------------------------------------------------------------ summary
 
 if (!connected) {
+  const installed = installedExtension();
+  const again = `Then run \`npm run setup\` again (it will say Extension: connected), or
+\`npm run doctor\` to check without changing anything.`;
   console.log(final?.extension?.stale
     ? `
 \x1b[1mThe extension did not reconnect after its update.\x1b[0m Reload it once: chrome://extensions → Reload ↻ on Agent Bridge.
 `
+    : installed?.loaded && !installed.enabled
+    ? `
+\x1b[1mAgent Bridge is loaded but switched off.\x1b[0m In the agent Chrome: chrome://extensions → switch Agent Bridge on.
+
+${again}
+`
+    : installed?.loaded
+    ? `
+\x1b[1mAgent Bridge is loaded but did not connect.\x1b[0m In the agent Chrome:
+
+  1. Keep a window open (\`npm run launch\` opens one): with none, Chrome unloads the extension
+  2. If it still says not connected: chrome://extensions → Reload ↻ on Agent Bridge, and
+     open its "Errors" button if it shows one
+
+${again}
+`
     : `
 \x1b[1mOne step is a person's:\x1b[0m Chrome allows no script to load an extension.
 
-  1. In the Chrome window just opened: chrome://extensions
+  1. In the agent Chrome (setup opens the page there): chrome://extensions
   2. Switch on Developer mode (top right)
   3. Load unpacked → ${EXTENSION}
 
-Then run \`npm run setup\` again (it will say Extension: connected), or
-\`npm run doctor\` to check without changing anything.
+${again}
 `);
   if (!CHECK) {
     // Open the page for them, as a tab in the agent Chrome.
