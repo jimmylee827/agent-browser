@@ -7,6 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- `config/local.json`, a person's own settings kept out of the repository: a
+  `policy.trustedDomains` there overrides the default and is re-read when it
+  changes, so an edit the agent proposes and the person approves takes effect
+  on the next action, without a restart. A policy block returns `allowDomain`
+  naming the domain, file and field
 - **Real input** (`trusted: true` on `agent_browser_act` for click and hover):
   a click posted by macOS through a small helper app, so the page sees
   `isTrusted: true` and Chrome grants what it withholds from scripts — sound,

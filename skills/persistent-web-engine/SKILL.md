@@ -372,6 +372,12 @@ domain to `config/default.json` is their call, not yours.
 Label honestly. Under-labelling to avoid a prompt defeats the only guardrail
 here; over-labelling ordinary clicks makes the agent useless.
 
+A blocked action returns `allowDomain: {domain, file, field}`. Tell the user the
+domain and what the action would do. **If they say yes**, propose an edit to
+that file (`config/local.json`) adding the domain to `policy.trustedDomains` —
+they approve the diff in chat, and the next action passes, with no restart.
+Never edit it without their yes, and never relabel an action to get past it.
+
 - **Kill switch**: `~/.agent-chrome/HALT` (file) blocks ALL bridge calls. If you see "HALTED: kill switch active", surface it to the user; don't try to work around it.
 - All calls audit-logged to `~/.agent-chrome/audit.log`; password / OTP / card fields are redacted from snapshots.
 

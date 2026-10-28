@@ -249,8 +249,19 @@ covers nothing else; after a rebuild macOS treats it as new and asks again.
 Navigation and ordinary interaction are unrestricted — the agent can go
 anywhere and click anything. The only gate is **action class**: a caller can
 label an action `payment`, `delete_destructive`, `credential_entry`, or
-`file_upload`, and those are refused off `policy.trustedDomains`. Add domains
-there to make them fully autonomous.
+`file_upload`, and those are refused off `policy.trustedDomains`.
+
+**Letting an agent ask, and you click approve.** Your own domains live in
+`config/local.json`, which is never committed:
+
+```json
+{ "policy": { "trustedDomains": ["shop.internal"] } }
+```
+
+When a block names a domain, the agent can propose exactly that edit; Claude
+Code shows you the diff and you approve it in chat. The server re-reads the
+file when it changes, so the next action is allowed — no restart. The agent
+never writes the file itself: your approval is what makes the change happen.
 
 - **Kill switch:** `touch ~/.agent-chrome/HALT` blocks every action.
   `npm run resume` to clear.
