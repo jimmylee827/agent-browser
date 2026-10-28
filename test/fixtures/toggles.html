@@ -1,0 +1,13 @@
+<!doctype html><meta charset="utf-8"><title>Toggles</title>
+<main><img id="hero" alt="Tee" width="120" height="120" src="/status/200?colour=black"></main>
+<div role="group" aria-label="Colour">
+  <button aria-pressed="true" data-c="black">Black</button>
+  <button aria-pressed="false" data-c="white">White</button>
+</div>
+<script>
+  for (const b of document.querySelectorAll("[data-c]"))
+    b.onclick = () => {
+      for (const o of document.querySelectorAll("[data-c]")) o.setAttribute("aria-pressed", String(o === b));
+      document.getElementById("hero").src = "/status/200?colour=" + b.dataset.c;
+    };
+</script>

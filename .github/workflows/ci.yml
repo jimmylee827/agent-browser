@@ -20,7 +20,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
 
       - name: Install dependencies
@@ -29,9 +29,12 @@ jobs:
       - name: Build mcp-server
         run: npm run build
 
+      - name: Unit tests
+        run: npm test
+
       - name: Syntax-check non-TS scripts
         run: |
-          for f in scripts/*.mjs host-helper/*.mjs packages/extension/src/*.js packages/extension/src/content/*.js; do
+          for f in scripts/*.mjs host-helper/*.mjs packages/extension/src/*.js packages/extension/src/content/*.js test/e2e/*.mjs; do
             [ -f "$f" ] && node --check "$f"
           done
 
