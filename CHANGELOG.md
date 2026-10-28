@@ -7,6 +7,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **Real input** (`trusted: true` on `agent_browser_act` for click and hover):
+  a click posted by macOS through a small helper app, so the page sees
+  `isTrusted: true` and Chrome grants what it withholds from scripts — sound,
+  fullscreen, native dialogs. It brings the agent's window forward for the
+  instant of the gesture, returns focus afterwards, and puts the cursor back.
+  Needs one Accessibility grant (`npm run input-helper:install`); scoped to the
+  agent Chrome, found by its profile.
+- `viewport {width, height, deviceScaleFactor}` on visit: a real layout at a
+  real size (375px at 3×), media queries included, kept across navigations —
+  popup-type windows, the only ones Chrome lets go below 500px
+- `mobile: true` on visit: a phone's User-Agent and client hints (per-tab
+  header rule), touch support, no hover, a coarse pointer
+- Agent windows open muted; `sound: true` unmutes a session
+- `allowPopups` on visit and act: Chrome's per-site popup switch, either way,
+  audit-logged — a window opened after a delay was otherwise blocked
+- `--autoplay-policy=no-user-gesture-required` in the launcher, so media can
+  play from a click the browser does not count as a user gesture
 - **Sessions: one agent, one window.** Each MCP connection gets its own
   background window on its first visit, and every call acts on that tab only —
   two agents no longer type into, navigate or screenshot each other's page, and

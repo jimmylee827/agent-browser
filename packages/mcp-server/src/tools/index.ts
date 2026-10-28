@@ -10,6 +10,7 @@ import { hostHelper, launchBrowser } from "../host-helper-client.js";
 import { AbError, CATALOGUE, codeOf, HALT_ADVICE, POLICY_ADVICE } from "../errors.js";
 import { buildId, buildStatus, RUNNING } from "../build.js";
 import { recordEvidence } from "../evidence.js";
+import { InputHelper, type InputConfig } from "../input.js";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { resolve } from "node:path";
@@ -40,6 +41,8 @@ interface Ctx {
   client: ClientInfo;
   /** Clients already told that the build is stale (told once each). */
   warnedStale: Set<string>;
+  /** Real input through macOS Accessibility. */
+  input: InputHelper;
 }
 
 type Text = { type: "text"; text: string };
@@ -517,24 +520,68 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
   }
 
   /**
+   * Give the page the session's viewport. Chrome resets a tab's own zoom on
+   * every navigation, so this runs after each one; it does nothing when the
+   * page already has the size.
+   */
+  async function applyViewport(call: Call, sc: Scope) {
+    if (!sc.s.viewport || sc.s.legacy) return;
+    type Got = { viewport?: Record<string, unknown>; note?: string };
+    const r: Got = await sc.req<Got>("engine.setViewport", sc.s.viewport).catch((e): Got => ({ note: (e as Error).message }));
+    if (r.viewport) call.extra.viewport = r.viewport;
+    if (r.note) call.degraded.push(`viewport not as asked: ${r.note}`);
+  }
+
+  /** Let the session's current site open popups without a click. */
+  async function allowPopups(call: Call, sc: Scope, allow = true) {
+    const r = await sc.req<{ popups: string; pattern: string }>("engine.allowPopups", { allow });
+    call.extra.popups = { setting: r.popups, site: r.pattern };
+    ctx.audit.log("session.popups", { setting: r.popups, pattern: r.pattern });
+  }
+
+  /**
    * Navigate the session's tab — opening the session's window when it has
    * none — and wait until the NEW document has committed and answers.
    * Committing is counted, not guessed from the host name: a route change on
    * the same host used to pass the check at once, and the snapshot that came
    * back was of the page being left.
    */
-  async function navigateAndWait(call: Call, sc: Scope, nav: { url?: string; history?: "back" | "forward" | "reload" }, timeoutMs: number) {
+  async function navigateAndWait(
+    call: Call,
+    sc: Scope,
+    nav: { url?: string; history?: "back" | "forward" | "reload" },
+    timeoutMs: number,
+    mobileChanged = false,
+  ) {
     const s = sc.s;
     let before = 0;
     let beforeUrl = "";
-    if (!s.legacy && s.tabId === undefined) {
+    // A viewport needs a popup-type window (only those go narrower than
+    // 500px), so a session that asks for one gets a new window.
+    const needsPopup = !!s.viewport && s.windowType !== "popup";
+    if (!s.legacy && (s.tabId === undefined || (needsPopup && nav.url))) {
       if (!nav.url) throw new AbError("NO_SESSION_TAB", "this session has no page yet — there is no history to move through");
-      const w = await ctx.bridge.request<{ tabId: number; windowId: number }>("engine.openSessionWindow", { url: nav.url });
+      const old = s.tabId !== undefined ? s.windowId : undefined;
+      // A phone's headers must be on the very first request: open blank, set
+      // them, then load.
+      const w = await ctx.bridge.request<{ tabId: number; windowId: number; type: string }>("engine.openSessionWindow", {
+        url: s.mobile ? "about:blank" : nav.url,
+        viewport: s.viewport,
+        sound: s.sound,
+      });
       ctx.sessions.bind(s, w.tabId, w.windowId);
+      s.windowType = w.type;
       call.tabId = w.tabId;
-      call.extra.openedWindow = { tabId: w.tabId, windowId: w.windowId, hint: "this session's own window, opened in the background" };
-      ctx.audit.log("session.open_window", { session: s.key.slice(0, 12), tabId: w.tabId });
+      if (old !== undefined) await ctx.bridge.request("engine.closeWindow", { windowId: old }).catch(() => {});
+      call.extra.openedWindow = { tabId: w.tabId, windowId: w.windowId, hint: "this session's own window, opened in the background, muted" };
+      ctx.audit.log("session.open_window", { session: s.key.slice(0, 12), tabId: w.tabId, type: w.type });
+      if (s.mobile) {
+        await sc.req("engine.mobile", { mobile: true });
+        before = (await ping(sc).catch(() => ({}) as Ping)).tab?.navCount ?? 0;
+        await sc.req("engine.navigate", { url: nav.url });
+      }
     } else {
+      if (mobileChanged && !s.legacy) await sc.req("engine.mobile", { mobile: !!s.mobile });
       const p = await ping(sc).catch(() => ({}) as Ping);
       before = p.tab?.navCount ?? 0;
       beforeUrl = p.tab?.url ?? "";
@@ -659,21 +706,47 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
       text: z.boolean().default(false).describe("Also return the page's visible text (first 8000 chars; the result says how to page on)."),
       snapshot: snapshotOption.describe("Tree size: full (default), viewport (only what is on screen), none (no tree — with text:true, just the text)"),
       details: z.boolean().default(false).describe("Also give each link's href and each image's or video's src in the tree"),
+      viewport: z
+        .object({
+          width: z.number().int().min(150).max(4000),
+          height: z.number().int().min(150).max(4000),
+          deviceScaleFactor: z.number().min(0.5).max(4).optional(),
+        })
+        .optional()
+        .describe("Give this session's page exactly this size in CSS pixels (and pixel ratio, e.g. 3 for a phone) — a real narrow layout, media queries included. Kept for the session's later visits."),
+      mobile: z
+        .boolean()
+        .optional()
+        .describe("Present as a phone: mobile User-Agent and client hints, touch support, no hover, a coarse pointer. An approximation (no CDP); pair with viewport. Kept for the session; false turns it off."),
+      sound: z.boolean().optional().describe("Agent windows are muted; true lets this session's tab be heard, false mutes it again"),
+      allowPopups: z
+        .boolean()
+        .optional()
+        .describe("Let this site open popups without a click (an OAuth window opened after a delay is otherwise blocked by Chrome); false blocks them again. Recorded in the audit log."),
       session: SESSION_ARG,
       tabId: TAB_ARG,
       lock: z.boolean().optional().describe("Shared sessions: true takes (or renews) a lease so other clients cannot act until it ends; false releases it"),
       leaseMs: z.number().int().min(1000).max(600_000).optional(),
     },
-    async ({ url, history, text, snapshot, details, session, tabId, lock, leaseMs }, call) => {
+    async ({ url, history, text, snapshot, details, viewport, mobile, sound, allowPopups: popups, session, tabId, lock, leaseMs }, call) => {
       if (!url === !history) throw new AbError("BAD_REQUEST", "give exactly one of url or history", { recovery: "e.g. {url:\"https://…\"} or {history:\"back\"}" });
       await ensureBrowser(45_000);
       const sc = scope(call, { session, tabId, lock, leaseMs }, url ? "open" : "tab");
+      if ((viewport || mobile !== undefined || sound !== undefined) && sc.s.legacy)
+        throw new AbError("BAD_REQUEST", "viewport, mobile and sound belong to a session's own window; drop session \"default\"");
+      if (viewport) sc.s.viewport = viewport;
+      const mobileChanged = mobile !== undefined && mobile !== !!sc.s.mobile;
+      if (mobile !== undefined) sc.s.mobile = mobile;
+      if (sound !== undefined) {
+        sc.s.sound = sound;
+        if (sc.s.tabId !== undefined) await sc.req("engine.setSound", { sound });
+      }
       // Navigation is read-only and unrestricted — any URL is fair game. The
       // sensitive-action gate lives in agent_browser_act, and only for the
       // action classes a caller explicitly labels.
       return inSession(call, sc, async () => {
         const t0 = Date.now();
-        const nav = await navigateAndWait(call, sc, url ? { url } : { history }, url ? 15_000 : 10_000);
+        const nav = await navigateAndWait(call, sc, url ? { url } : { history }, url ? 15_000 : 10_000, mobileChanged);
         if (!nav.landed) {
           if (history)
             throw new AbError("NAV_TIMEOUT", `${history} did not change the page (still on ${nav.from})`, {
@@ -683,6 +756,8 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
             recovery: "retry, or call agent_browser_status to check the bridge",
           });
         }
+        await applyViewport(call, sc);
+        if (popups !== undefined) await allowPopups(call, sc, popups);
         const settled = await settlePage(call, sc);
         const snap = reportWall(call, await attachText(sc, await observeAs(sc, snapshot, details), text));
         const diagnostics = await diagSummary(sc, t0);
@@ -752,6 +827,14 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         .describe(
           "Dead-click handling for action=click. auto (default): if the click provably did nothing, retry in the page's own JS world (handles React fiber handlers, unhydrated listeners, focus-gated effects). always: skip straight to it. never: for non-idempotent buttons where a double-fire would be harmful.",
         ),
+      allowPopups: z
+        .boolean()
+        .optional()
+        .describe("Let this site open popups without a click first (a window opened after a delay is otherwise blocked by Chrome). Recorded in the audit log."),
+      trusted: z
+        .boolean()
+        .optional()
+        .describe("click/hover only, macOS: a REAL mouse event from the operating system, for pages that gate on a user gesture (sound, fullscreen, native dialogs). The agent window comes forward for the instant of the gesture and focus returns afterwards; the cursor does not move. Needs the input helper (npm run input-helper:install)."),
       session: SESSION_ARG,
       tabId: TAB_ARG,
       lock: z.boolean().optional().describe("Shared sessions: true takes (or renews) a lease so other clients cannot act until it ends; false releases it"),
@@ -778,6 +861,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
           throw new AbError("POLICY_BLOCKED", `blocked by policy: ${d.reason}`, { recovery: POLICY_ADVICE });
         }
         if (DRY_RUN) return { dryRun: true, wouldAct: { action, name, role, value }, currentUrl: tabUrl, policy: d.reason };
+        if (args.allowPopups !== undefined) await allowPopups(call, sc, args.allowPopups);
 
         // 1. Locate. For a drag, the drop target is found by the engine in
         //    the same pass as the action: a second lookup from here could
@@ -801,8 +885,40 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
           host?: string;
           [k: string]: unknown;
         };
-        let result: ActResult;
-        try {
+        let result: ActResult | undefined;
+        // trusted: the gesture comes from the operating system, so the page
+        // sees isTrusted:true and Chrome grants what it withholds from a
+        // script (sound, fullscreen, a native dialog).
+        if (args.trusted && (action === "click" || action === "hover")) {
+          const st = await ctx.input.status();
+          if (!st.ok || !st.trusted) throw new AbError("TRUSTED_UNAVAILABLE", st.error ?? "real input is not available", { helper: st });
+          const pid = ctx.input.pid(ctx.cfg.profileDir);
+          if (!pid) throw new AbError("TRUSTED_UNAVAILABLE", "the agent Chrome is not running on the agent profile");
+          const metrics = await sc.req<{ screenX: number; screenY: number; outerWidth: number; outerHeight: number; innerWidth: number; innerHeight: number; scrollX: number; scrollY: number }>("engine.pageMetrics");
+          const box = (await sc.req<{ rect: { x: number; y: number; width: number; height: number } }>("engine.rectOf", { ref: match.ref })).rect;
+          const at = InputHelper.screenPoint({ x: box.x + box.width / 2, y: box.y + box.height / 2 }, metrics);
+          await sc.req("engine.focusWindow", {}).catch(() => {});
+          const pageTitle = (await ping(sc).catch(() => ({}) as Ping)).engine?.title;
+          await ctx.input.focus(pid, InputHelper.windowOf(metrics), pageTitle).catch(() => {});
+          const events =
+            action === "hover"
+              ? [{ type: "move" as const, ...at }]
+              : [{ type: "move" as const, ...at }, { type: "down" as const, ...at }, { type: "up" as const, ...at }];
+          const g = await ctx.input.gesture(pid, InputHelper.windowOf(metrics), events);
+          await sleep(300);
+          // Hover is only real if the page's own :hover applies now.
+          if (action === "hover") {
+            const h = await sc.req<{ hovered: boolean }>("engine.hoverState", { ref: match.ref }).catch(() => null);
+            if (h && !h.hovered) {
+              await sleep(400);
+              const again = await sc.req<{ hovered: boolean }>("engine.hoverState", { ref: match.ref }).catch(() => null);
+              if (!again?.hovered) throw new AbError("HOVER_NOT_EFFECTIVE", "HOVER_NOT_EFFECTIVE: the real pointer moved but the page has no :hover for this element");
+            }
+          }
+          call.extra.trustedInput = { from: "macOS Accessibility", raised: g.raised, gaveFocusBackTo: g.gaveFocusBackTo ?? null };
+          result = { acted: true, changed: true, signals: { trusted: true, navigated: false, domMutations: 0, valueChanged: false } };
+        }
+        if (!result) try {
           result = await sc.req<ActResult>("engine.act", {
             ref: match.ref,
             gen: ref !== undefined ? undefined : match.gen,
@@ -819,6 +935,8 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
           ctx.audit.log("act.navigated_mid_action", { name, role, action, url: tabUrl });
           result = { acted: true, changed: true, signals: { navigated: true, portClosed: true } };
         }
+        // One of the two branches always sets it; this keeps the type honest.
+        if (!result) throw new AbError("ENGINE_ERROR", "the action produced no result");
 
         // 2b. Dead-click escalation. Modern SPA buttons routinely ignore a
         // synthetic click from an isolated world: the handler is a React
@@ -868,6 +986,20 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
             call.tabId = child.tabId;
             await sc.req("engine.waitForStable", { timeout: 6000, quietMs: 400 }).catch(() => {});
           }
+        }
+
+        // A navigation reset the tab's zoom; a new tab has none. Put the
+        // session's viewport back before looking.
+        if (sc.s.viewport && (switchedTab || ((await ping(sc).catch(() => ({}) as Ping)).tab?.url ?? tabUrl) !== tabUrl)) {
+          if (switchedTab && !sc.s.legacy) {
+            // A tab opened from a popup window lands in an ordinary one: move it into its own popup window.
+            const w = await ctx.bridge.request<{ windowId: number }>("engine.toPopupWindow", { tabId: call.tabId }).catch(() => null);
+            if (w) {
+              sc.s.windowId = w.windowId;
+              sc.s.windowType = "popup";
+            }
+          }
+          await applyViewport(call, sc);
         }
 
         // 4. Re-observe so the agent's next call has fresh state.

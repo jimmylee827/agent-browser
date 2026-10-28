@@ -27,6 +27,12 @@ export interface Session {
   ownerClient: string;
   tabId?: number;
   windowId?: number;
+  /** "popup" once the session has a viewport: only popup windows go below 500px wide. */
+  windowType?: string;
+  /** What the session asked its pages to be: a viewport, a phone, with sound. */
+  viewport?: { width: number; height: number; deviceScaleFactor?: number };
+  mobile?: boolean;
+  sound?: boolean;
   lastActor?: string;
   lastActAt?: number;
   lease?: { client: string; until: number };

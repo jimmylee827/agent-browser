@@ -30,6 +30,7 @@ export interface AppConfig {
   };
   perception: { maxSnapshotTokensApprox: number; screenshotOnAmbiguity: boolean };
   eval: { blockedDomains: string[] };
+  input: { enabled: boolean; port: number; secretFile: string };
   diagnostics: { hosts: string[] };
   evidence: { enabled: boolean; retainDays: number };
   audit: { file: string };
@@ -55,6 +56,7 @@ export function loadConfig(): AppConfig {
   cfg.bridge.secretFile = expandHome(cfg.bridge.secretFile);
   cfg.audit.file = expandHome(cfg.audit.file);
   cfg.eval ??= { blockedDomains: [] };
+  cfg.input ??= { enabled: false, port: 8790, secretFile: "~/.agent-chrome/input-helper-secret" };
   cfg.diagnostics ??= { hosts: [] };
   cfg.evidence ??= { enabled: true, retainDays: 14 };
   if (env.AB_BIND_HOST) cfg.bridge.host = env.AB_BIND_HOST;

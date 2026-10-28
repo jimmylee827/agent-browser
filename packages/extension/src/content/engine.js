@@ -525,6 +525,8 @@
       scrollX, scrollY, innerWidth, innerHeight,
       scrollHeight: Math.max(se.scrollHeight, innerHeight),
       devicePixelRatio,
+      // Where the page sits on the screen, for input from the operating system.
+      screenX, screenY, outerWidth, outerHeight,
     };
   }
 
@@ -1558,6 +1560,13 @@
     return { pointer: done };
   }
 
+  // Whether the page's own hover styling applies to this element right now —
+  // after real input, the honest check that the hover did something.
+  function hoverState(p = {}) {
+    const el = resolve(p.ref, p.gen);
+    return { hovered: el.matches(":hover") };
+  }
+
   // ---- inspect: what a test needs to assert about one element.
   function inspect(p = {}) {
     const el = resolve(p.ref, p.gen);
@@ -1671,6 +1680,7 @@
         else if (m === "pageState") sendResponse(pageState());
         else if (m === "prepareElementCapture") sendResponse(await prepareElementCapture(msg.params));
         else if (m === "inspect") sendResponse(inspect(msg.params));
+        else if (m === "hoverState") sendResponse(hoverState(msg.params));
         else if (m === "detectWall") sendResponse({ needsHuman: detectWall() });
         else if (m === "diagnostics") sendResponse(diagnostics(msg.params));
         else if (m === "clearMarks") {

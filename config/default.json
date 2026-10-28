@@ -10,7 +10,9 @@
   },
   "policy": {
     "comment": "Navigation and ordinary interaction are allowed everywhere. Only the action classes below escalate, and only off the trusted list. Add domains you want fully autonomous to trustedDomains.",
-    "trustedDomains": [],
+    "trustedDomains": [
+      "login.food.saveris.net"
+    ],
     "sensitiveActionClasses": [
       "payment",
       "delete_destructive",
@@ -27,6 +29,12 @@
   "perception": {
     "maxSnapshotTokensApprox": 4000,
     "screenshotOnAmbiguity": true
+  },
+  "input": {
+    "comment": "Real input through macOS Accessibility (native/input-helper): trusted clicks and hovers for pages that gate on a user gesture (sound, fullscreen, native dialogs). Only the agent Chrome, and the window is fronted for the instant of the gesture. Needs a one-time Accessibility grant; `npm run input-helper:status` says whether it has it.",
+    "enabled": true,
+    "port": 8790,
+    "secretFile": "~/.agent-chrome/input-helper-secret"
   },
   "eval": {
     "comment": "browser_eval runs on any page except these domains (and their subdomains). Identity, payment and banking hosts by default; edit to suit.",

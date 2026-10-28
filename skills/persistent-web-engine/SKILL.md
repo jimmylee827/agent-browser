@@ -178,6 +178,25 @@ The result gives `rects.before/after` and the value or `aria-valuenow` before
 and after. For anything else (press-and-hold, a path, a wheel), use
 `browser_pointer({ sequence: [{type:"down", x, y}, {type:"move", …}, {type:"up", …}] })`.
 
+### "Something only works for a real person" (sound, fullscreen, a native dialog)
+```text
+agent_browser_act({ name: "Play", trusted: true })     # a real click from the OS
+```
+A synthetic click is `isTrusted:false`, and Chrome withholds a real gesture's
+privileges from it. `trusted: true` posts the click from the operating system:
+the page sees a person's input. The agent window comes forward for the instant
+of the gesture, then focus returns. Needs the input helper
+(`npm run input-helper:install` and one Accessibility grant); without it the
+call fails `TRUSTED_UNAVAILABLE` — say so rather than claiming it worked.
+
+### "Phone or narrow-screen layout"
+```text
+agent_browser_visit({ url, viewport: { width: 375, height: 812, deviceScaleFactor: 3 } })
+agent_browser_visit({ url, mobile: true })   # a phone's UA, touch, no hover
+```
+A real viewport, not a scaled picture: media queries answer correctly, and it
+stays for the session's later visits.
+
 ### "Hover"
 `action: "hover"` applies the page's own `:hover` styles and fires the hover
 events. If nothing changes, it fails `HOVER_NOT_EFFECTIVE` — do not describe a

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Agent Bridge",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "description": "Local AI browser-control bridge. Stealth-first: no CDP, no debugger.",
   "minimum_chrome_version": "120",
   "background": {
@@ -13,6 +13,8 @@
     "scripting",
     "webNavigation",
     "webRequest",
+    "contentSettings",
+    "declarativeNetRequest",
     "downloads",
     "storage",
     "alarms"

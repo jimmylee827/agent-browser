@@ -217,6 +217,33 @@ URL matching this, and what were its query params?" *after* the chain settles.
 That's what makes OAuth consent, SSO hand-off, payment returns, and magic links
 tractable — you never have to out-run a redirect.
 
+## Real input, viewports and mobile
+
+Synthetic events from an extension carry `isTrusted: false`, and Chrome refuses
+some things without a real gesture: sound, fullscreen, some native dialogs.
+`agent_browser_act({..., trusted: true})` posts the click or hover from the
+operating system instead, through a small macOS helper — the page sees a
+person's input. The agent's window comes forward for the instant of the gesture
+and focus goes back afterwards; the cursor is put back where it was.
+
+```bash
+npm run input-helper:install    # build + start it (asks for Accessibility once)
+npm run input-helper:status     # running? allowed?
+npm run input-helper:uninstall
+```
+
+macOS needs a one-time Accessibility grant: System Settings → Privacy & Security
+→ Accessibility → **Agent Browser Input**. It is a separate app so the grant
+covers nothing else; after a rebuild macOS treats it as new and asks again.
+
+| Option | On | Gives |
+| --- | --- | --- |
+| `trusted: true` | `agent_browser_act` (click, hover) | a real gesture: sound without a click first, fullscreen, native dialogs |
+| `viewport: {width, height, deviceScaleFactor}` | `agent_browser_visit` (kept for the session) | a real layout at that size — 375px at 3×, media queries included |
+| `mobile: true` | `agent_browser_visit` (kept for the session) | a phone's User-Agent and client hints, touch, no hover, a coarse pointer (an approximation, no CDP) |
+| `sound: true` | `agent_browser_visit` | this session's page may be heard (agent windows open muted) |
+| `allowPopups: true \| false` | visit, act | let the site open a popup without a click (or stop it) — audit-logged |
+
 ## Safety
 
 Navigation and ordinary interaction are unrestricted — the agent can go

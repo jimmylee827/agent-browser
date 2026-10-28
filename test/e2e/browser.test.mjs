@@ -298,3 +298,79 @@ test("a connection that does not identify itself is told it shares a window", { 
     await c.close();
   }
 });
+
+test("a viewport is real: 375px at 3x, media queries included, and kept across navigation", { skip }, async () => {
+  const A = await as("viewport");
+  const v = await A("agent_browser_visit", { url: h.url("viewport.html"), viewport: { width: 375, height: 700, deviceScaleFactor: 3 }, snapshot: "none" });
+  assert.ok(!v.isError, JSON.stringify(v.data));
+  assert.equal(v.data.viewport.width, 375, JSON.stringify(v.data.viewport));
+  assert.equal(v.data.viewport.deviceScaleFactor, 3);
+  const page = await A("browser_eval", { expression: "({ w: innerWidth, dpr: devicePixelRatio, narrow: matchMedia('(max-width: 480px)').matches, wideShown: getComputedStyle(document.querySelector('.wide')).display })" });
+  assert.deepEqual(page.data.value, { w: 375, dpr: 3, narrow: true, wideShown: "none" });
+  await A("agent_browser_visit", { url: h.url("form.html"), snapshot: "none" });
+  const again = await A("browser_eval", { expression: "({ w: innerWidth, dpr: devicePixelRatio })" });
+  assert.deepEqual(again.data.value, { w: 375, dpr: 3 });
+});
+
+test("mobile mode tells the server and the page it is a phone", { skip }, async () => {
+  const A = await as("mobile");
+  await A("agent_browser_visit", { url: h.url("ua"), mobile: true, viewport: { width: 390, height: 760, deviceScaleFactor: 3 }, snapshot: "none" });
+  const seen = await A("browser_observe", { mode: "read" });
+  assert.match(seen.data.text, /Mobile Safari/);
+  assert.match(seen.data.text, /mobile=\?1/);
+  await A("agent_browser_visit", { url: h.url("viewport.html"), snapshot: "none" });
+  const page = await A("browser_eval", { expression: "({ ua: navigator.userAgent.includes('Mobile'), touch: 'ontouchstart' in window, points: navigator.maxTouchPoints, noHover: matchMedia('(hover: none)').matches, coarse: matchMedia('(pointer: coarse)').matches })" });
+  assert.deepEqual(page.data.value, { ua: true, touch: true, points: 5, noHover: true, coarse: true });
+});
+
+test("a popup opened late is blocked, unless the site is allowed", { skip }, async () => {
+  const A = await as("popups");
+  // The test profile keeps site settings between runs: start from "block".
+  const v = await A("agent_browser_visit", { url: h.url("media.html"), allowPopups: false, snapshot: "none" });
+  const parent = v.data.tabId;
+  await A("agent_browser_act", { name: "Open later", snapshot: "none" });
+  await new Promise((r) => setTimeout(r, 700));
+  assert.equal((await A("browser_eval", { expression: "window.results.popup" })).data.value, "blocked");
+  const r = await A("agent_browser_act", { name: "Open later", allowPopups: true, snapshot: "none" });
+  assert.equal(r.data.popups.setting, "allow");
+  await new Promise((r2) => setTimeout(r2, 900));
+  const tabs = await A("browser_tabs", {});
+  assert.ok(tabs.data.tabs.some((t) => /form\.html/.test(t.url)), JSON.stringify(tabs.data.tabs.map((t) => t.url)));
+  // Back on the page that opened it, the page knows it worked.
+  await A("browser_tabs", { action: "switch", tabId: parent });
+  assert.equal((await A("browser_eval", { expression: "window.results.popup" })).data.value, "opened");
+  await A("agent_browser_visit", { url: h.url("media.html"), allowPopups: false, snapshot: "none" });
+});
+
+test("sound plays from an agent's click, in a window that is muted", { skip }, async () => {
+  const A = await as("sound");
+  const v = await A("agent_browser_visit", { url: h.url("media.html"), snapshot: "none" });
+  await A("agent_browser_act", { name: "Play sound", snapshot: "none" });
+  await new Promise((r) => setTimeout(r, 600));
+  assert.equal((await A("browser_eval", { expression: "window.results.play" })).data.value, "playing");
+  const tabs = await A("browser_tabs", {});
+  assert.equal(tabs.data.tabs.find((t) => t.tabId === v.data.tabId).muted, true);
+  await A("agent_browser_visit", { url: h.url("media.html"), sound: true, snapshot: "none" });
+  const after = await A("browser_tabs", {});
+  assert.equal(after.data.tabs.find((t) => t.tabId === v.data.tabId).muted, undefined);
+});
+
+test("trusted input: the page sees a real gesture, which synthetic clicks cannot give", { skip }, async () => {
+  const A = await as("trusted");
+  await A("agent_browser_visit", { url: h.url("trusted.html"), snapshot: "none" });
+  // The ordinary synthetic click the tool has always made.
+  await A("agent_browser_act", { name: "Record gesture", snapshot: "none" });
+  assert.deepEqual((await A("browser_eval", { expression: "window.seen" })).data.value, { trusted: false, active: false });
+  // The same click, posted by the operating system.
+  const r = await A("agent_browser_act", { name: "Record gesture", trusted: true, snapshot: "none" });
+  if (r.data.code === "TRUSTED_UNAVAILABLE") return; // helper not granted here: covered by npm run input-helper:status
+  assert.ok(!r.isError, JSON.stringify(r.data));
+  assert.equal(r.data.trustedInput.from, "macOS Accessibility");
+  assert.deepEqual((await A("browser_eval", { expression: "window.seen" })).data.value, { trusted: true, active: true });
+  // Fullscreen is gated on a real gesture; only the trusted path gets it.
+  await A("agent_browser_act", { name: "Fullscreen", trusted: true, snapshot: "none" });
+  await new Promise((res) => setTimeout(res, 600));
+  const fs = (await A("browser_eval", { expression: "window.seen" })).data.value;
+  assert.equal(fs.trusted, true, JSON.stringify(fs));
+  assert.equal(fs.fullscreen, true, JSON.stringify(fs));
+});

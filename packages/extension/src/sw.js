@@ -97,15 +97,139 @@ async function tabFor(params = {}) {
 const NAV_COUNT = new Map();
 // Tabs opened from another tab (target=_blank, window.open), newest last.
 const OPENED = [];
-chrome.tabs.onCreated.addListener((t) => {
+chrome.tabs.onCreated.addListener(async (t) => {
   if (t.openerTabId == null) return;
   OPENED.push({ tabId: t.id, openerTabId: t.openerTabId, windowId: t.windowId, ts: Date.now() });
   if (OPENED.length > 50) OPENED.shift();
+  // A tab opened from a muted agent tab is muted too; one opened from a
+  // mobile-emulated tab is emulated too.
+  const opener = await chrome.tabs.get(t.openerTabId).catch(() => null);
+  if (opener?.mutedInfo?.muted && opener.mutedInfo.reason === "extension") chrome.tabs.update(t.id, { muted: true }).catch(() => {});
+  if (MOBILE.has(t.openerTabId)) setMobile(t, MOBILE.get(t.openerTabId)).catch(() => {});
 });
 chrome.tabs.onRemoved.addListener((id) => {
   NAV_COUNT.delete(id);
   NET.delete(id);
+  if (MOBILE.delete(id)) chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [ruleIdFor(id)] }).catch(() => {});
 });
+
+// ---- viewport: a real one, not a scaled picture. The window is sized so the
+// page's own width and height are what was asked, and the tab's zoom sets the
+// device pixel ratio (150% on a 2x screen is 3x, like a phone). Media queries,
+// layout and devicePixelRatio are then the browser's own answers.
+async function setViewport(tab, v) {
+  const metrics = () => callEngine(tab.id, "pageMetrics", {});
+  let zoom = await chrome.tabs.getZoom(tab.id);
+  let m = await metrics();
+  const native = m.devicePixelRatio / zoom;
+  const want = v.deviceScaleFactor ? v.deviceScaleFactor / native : 1;
+  if (Math.abs(want - zoom) > 0.01) {
+    // Per tab: other tabs of the same site keep their zoom. Chrome resets a
+    // per-tab zoom on navigation, so the server applies it again after each.
+    await chrome.tabs.setZoomSettings(tab.id, { mode: "automatic", scope: "per-tab" });
+    await chrome.tabs.setZoom(tab.id, want);
+    zoom = want;
+    await sleep(250);
+  }
+  for (let i = 0; i < 3; i++) {
+    m = await metrics();
+    const dw = Math.round((v.width - m.innerWidth) * zoom);
+    const dh = Math.round((v.height - m.innerHeight) * zoom);
+    if (!dw && !dh) break;
+    const win = await chrome.windows.get(tab.windowId);
+    await chrome.windows.update(tab.windowId, { width: win.width + dw, height: win.height + dh });
+    await sleep(250);
+  }
+  m = await metrics();
+  const got = { width: m.innerWidth, height: m.innerHeight, deviceScaleFactor: Math.round(m.devicePixelRatio * 100) / 100 };
+  const off = got.width !== v.width || (v.deviceScaleFactor && Math.abs(got.deviceScaleFactor - v.deviceScaleFactor) > 0.05);
+  return { viewport: got, zoom, ...(off ? { note: `asked for ${v.width}x${v.height}${v.deviceScaleFactor ? ` @${v.deviceScaleFactor}x` : ""}; Chrome gave ${got.width}x${got.height} @${got.deviceScaleFactor}x` } : {}) };
+}
+
+// ---- mobile: an approximation, for sessions that ask. The site is told it is
+// a phone the way a phone tells it — the User-Agent and client-hint headers
+// (a per-tab header rule) — and the page sees touch support and a coarse,
+// hoverless pointer (page-world patches, re-applied on every load).
+const MOBILE = new Map();
+const ruleIdFor = (tabId) => (tabId % 2147483000) + 1;
+function mobileUA() {
+  const major = (navigator.userAgent.match(/Chrome\/(\d+)/) || [])[1] || "120";
+  return `Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Mobile Safari/537.36`;
+}
+async function setMobile(tab, opts) {
+  const on = opts.mobile !== false;
+  const id = ruleIdFor(tab.id);
+  await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [id] });
+  if (!on) {
+    MOBILE.delete(tab.id);
+    return { mobile: false };
+  }
+  const ua = mobileUA();
+  await chrome.declarativeNetRequest.updateSessionRules({
+    addRules: [{
+      id,
+      priority: 1,
+      condition: { tabIds: [tab.id], resourceTypes: ["main_frame", "sub_frame", "xmlhttprequest", "script", "stylesheet", "image", "media", "font", "other", "ping", "websocket"] },
+      action: {
+        type: "modifyHeaders",
+        requestHeaders: [
+          { header: "user-agent", operation: "set", value: ua },
+          { header: "sec-ch-ua-mobile", operation: "set", value: "?1" },
+          { header: "sec-ch-ua-platform", operation: "set", value: '"Android"' },
+        ],
+      },
+    }],
+  });
+  MOBILE.set(tab.id, { mobile: true, ua });
+  await chrome.scripting.executeScript({ target: { tabId: tab.id, allFrames: true }, world: "MAIN", injectImmediately: true, func: mobilePatch, args: [ua] }).catch(() => {});
+  return { mobile: true, userAgent: ua };
+}
+
+// Page world. Touch support, a phone's navigator, and the hover/pointer media
+// features a phone reports — in matchMedia and in the page's stylesheets.
+function mobilePatch(ua) {
+  if (window.__abMobile) return;
+  window.__abMobile = true;
+  const nav = Object.getPrototypeOf(navigator);
+  const define = (obj, key, value) => { try { Object.defineProperty(obj, key, { configurable: true, get: () => value }); } catch {} };
+  define(nav, "userAgent", ua);
+  define(nav, "appVersion", ua.replace(/^Mozilla\//, ""));
+  define(nav, "platform", "Linux armv8l");
+  define(nav, "maxTouchPoints", 5);
+  if (navigator.userAgentData) {
+    const data = navigator.userAgentData;
+    define(data, "mobile", true);
+    define(data, "platform", "Android");
+  }
+  if (!("ontouchstart" in window)) window.ontouchstart = null;
+  // (hover: hover) and (pointer: fine) are false on a phone; their opposites true.
+  const TRUE = "(min-width: 0px)", FALSE = "(max-width: 0px)";
+  const rewrite = (q) =>
+    String(q)
+      .replace(/\((any-)?hover\s*:\s*hover\)/g, FALSE).replace(/\((any-)?hover\s*:\s*none\)/g, TRUE)
+      .replace(/\((any-)?pointer\s*:\s*fine\)/g, FALSE).replace(/\((any-)?pointer\s*:\s*coarse\)/g, TRUE);
+  const mm = window.matchMedia.bind(window);
+  window.matchMedia = (q) => mm(rewrite(q));
+  const fixSheets = () => {
+    for (const sheet of document.styleSheets) {
+      let rules;
+      try { rules = sheet.cssRules; } catch { continue; }
+      const walk = (list) => {
+        for (const r of list) {
+          if (r.media && /hover|pointer/.test(r.media.mediaText)) {
+            const next = rewrite(r.media.mediaText);
+            if (next !== r.media.mediaText) r.media.mediaText = next;
+          }
+          if (r.cssRules) walk(r.cssRules);
+        }
+      };
+      walk(rules);
+    }
+  };
+  document.addEventListener("DOMContentLoaded", fixSheets);
+  window.addEventListener("load", fixSheets);
+  new MutationObserver(fixSheets).observe(document.documentElement, { childList: true, subtree: true });
+}
 
 // ---- diagnostics: failed requests, per tab. webRequest only observes; the
 // page cannot tell it is there, so this runs on every host.
@@ -478,16 +602,53 @@ async function screenshot(tab, params = {}) {
 async function dispatch(method, params) {
   // A session's own window: opened in the background, so an agent starting
   // work never pulls the user's window away or lands in the user's tab.
+  // Muted unless the session asked for sound: an agent's page should never
+  // start playing at the person beside it. A session with a viewport gets a
+  // popup-type window, the kind Chrome lets go narrower than 500px.
   if (method === "engine.openSessionWindow") {
     const like = await chrome.windows.getLastFocused().catch(() => null);
     const win = await chrome.windows.create({
       url: params.url || "about:blank",
       focused: false,
-      ...(like?.width ? { width: like.width, height: like.height } : {}),
+      ...(params.viewport
+        ? { type: "popup", width: Math.max(params.viewport.width, 100), height: params.viewport.height + 90 }
+        : like?.width ? { width: like.width, height: like.height } : {}),
     });
     const tab = win.tabs?.[0];
-    return { tabId: tab?.id, windowId: win.id };
+    if (tab && !params.sound) await chrome.tabs.update(tab.id, { muted: true }).catch(() => {});
+    return { tabId: tab?.id, windowId: win.id, type: win.type };
   }
+  // Bring a session's window to the front. The browser's own API, no OS
+  // permission: needed before input posted by the operating system, which
+  // macOS delivers to the frontmost window only.
+  if (method === "engine.focusWindow") {
+    const t = await tabFor(params);
+    await chrome.tabs.update(t.id, { active: true });
+    await chrome.windows.update(t.windowId, { focused: true });
+    await sleep(250);
+    return { focused: true, windowId: t.windowId, tabId: t.id };
+  }
+  if (method === "engine.setSound") {
+    await chrome.tabs.update(params.tabId, { muted: !params.sound });
+    return { muted: !params.sound };
+  }
+  // Popups a page opens late (after a fetch, from a timer) are blocked unless
+  // the host is allowed — the same per-site switch a person would flip.
+  if (method === "engine.allowPopups") {
+    const t = await tabFor(params);
+    const u = new URL(t.url);
+    const pattern = `${u.protocol}//${u.hostname}/*`;
+    const setting = params.allow === false ? "block" : "allow";
+    await chrome.contentSettings.popups.set({ primaryPattern: pattern, setting });
+    return { popups: setting, pattern };
+  }
+  if (method === "engine.setViewport") return await setViewport(await tabFor(params), params);
+  if (method === "engine.toPopupWindow") {
+    const t = await tabFor(params);
+    const win = await chrome.windows.create({ tabId: t.id, type: "popup", focused: false });
+    return { windowId: win.id };
+  }
+  if (method === "engine.mobile") return await setMobile(await tabFor(params), params);
   if (method === "engine.closeWindow") {
     await chrome.windows.remove(params.windowId).catch(() => {});
     return { closed: true };
@@ -581,7 +742,7 @@ async function dispatch(method, params) {
     const active = await activeTab().catch(() => null);
     const all = await chrome.tabs.query({});
     return {
-      tabs: all.map((t) => ({ tabId: t.id, url: t.url, title: t.title, active: t.id === active?.id, frontOfWindow: t.active, windowId: t.windowId })),
+      tabs: all.map((t) => ({ tabId: t.id, url: t.url, title: t.title, active: t.id === active?.id, frontOfWindow: t.active, windowId: t.windowId, ...(t.mutedInfo?.muted ? { muted: true } : {}) })),
       activeTabId: active?.id,
       ...(created ? { createdTabId: created.id } : {}),
       ...(focusedWindow ? { focusedWindow } : {}),
@@ -645,8 +806,13 @@ async function dispatch(method, params) {
     "engine.locate": "locate", "engine.scroll": "scrollPage", "engine.waitFor": "waitFor",
     "engine.waitForStable": "waitForStable", "engine.settle": "settle", "engine.pageState": "pageState",
     "engine.inspect": "inspect", "engine.detectWall": "detectWall",
+    "engine.pageMetrics": "pageMetrics", "engine.hoverState": "hoverState",
   };
   if (ENGINE[method]) return await callEngine(tab.id, ENGINE[method], params);
+  // Anything else named engine.* goes to the content engine as-is; it answers
+  // "unknown engine method" for names it does not have, so a new engine
+  // method needs no entry here.
+  if (method.startsWith("engine.")) return await callEngine(tab.id, method.slice("engine.".length), params);
   throw new Error(`unknown method: ${method}`);
 }
 
@@ -966,6 +1132,9 @@ function dialogTamer() {
 }
 
 chrome.webNavigation.onCommitted.addListener((d) => {
+  // A mobile-emulated tab keeps its page-world patches on every load.
+  if (MOBILE.has(d.tabId))
+    chrome.scripting.executeScript({ target: { tabId: d.tabId, frameIds: [d.frameId] }, world: "MAIN", injectImmediately: true, func: mobilePatch, args: [MOBILE.get(d.tabId).ua] }).catch(() => {});
   if (d.frameId !== 0) return;
   recordNav(d.url, d.tabId); // so redirect-based flows can be inspected after the fact
   NAV_COUNT.set(d.tabId, (NAV_COUNT.get(d.tabId) || 0) + 1);
@@ -1022,7 +1191,7 @@ async function diskHash() {
 async function reloadIfStale() {
   try {
     const sw = await (await fetch(chrome.runtime.getURL("src/sw.js"), { cache: "no-store" })).text();
-    const running = [connect, dispatch, callEngine, screenshot, screenshotElement, captureRegion, robustClick, evalInPage, applyConfig, diskHash, reloadIfStale];
+    const running = [connect, dispatch, callEngine, screenshot, screenshotElement, captureRegion, robustClick, evalInPage, applyConfig, setViewport, setMobile, mobilePatch, diskHash, reloadIfStale];
     const codeStale = !running.every((fn) => sw.includes(String(fn)));
     const disk = await diskHash();
     const { loadedFor, reloadedFor } = await chrome.storage.local.get(["loadedFor", "reloadedFor"]);

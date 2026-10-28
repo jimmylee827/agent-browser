@@ -11,6 +11,7 @@ import { startControl, type ClientInfo } from "./control.js";
 import { registerTools } from "./tools/index.js";
 import { buildId, RUNNING } from "./build.js";
 import { pruneEvidence } from "./evidence.js";
+import { InputHelper } from "./input.js";
 
 async function main() {
   const cfg = loadConfig();
@@ -26,9 +27,10 @@ async function main() {
   const sessions = new SessionManager();
   const policy = new Policy(cfg);
   const warnedStale = new Set<string>();
+  const input = new InputHelper(cfg.input);
   const makeServer = (client: ClientInfo): McpServer => {
     const s = new McpServer({ name: "agent-browser", version: "0.0.1" });
-    registerTools(s, { bridge, policy, sessions, audit, cfg, client, warnedStale });
+    registerTools(s, { bridge, policy, sessions, audit, cfg, client, warnedStale, input });
     return s;
   };
 

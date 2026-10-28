@@ -1,0 +1,3 @@
+<!doctype html><meta charset="utf-8"><title>Media</title>
+<button onclick="window.results={}; new Audio('/tone.wav').play().then(() => (results.play = 'playing')).catch((e) => (results.play = e.name))">Play sound</button>
+<button onclick="window.results={}; setTimeout(() => { const w = window.open('/form.html', '_blank', 'width=320,height=320'); results.popup = w ? 'opened' : 'blocked';  }, 300)">Open later</button>

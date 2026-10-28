@@ -67,9 +67,28 @@ const TYPES = { ".html": "text/html; charset=utf-8", ".js": "text/javascript", "
 // video, a missing script); everything else is a file from test/fixtures,
 // with {{OTHER}} replaced by the other origin, so a page can embed a
 // cross-origin frame.
+// A short, quiet tone for the sound tests.
+const TONE = (() => {
+  const rate = 22050, n = 4000, b = Buffer.alloc(44 + n * 2);
+  b.write("RIFF", 0); b.writeUInt32LE(36 + n * 2, 4); b.write("WAVEfmt ", 8); b.writeUInt32LE(16, 16); b.writeUInt16LE(1, 20); b.writeUInt16LE(1, 22);
+  b.writeUInt32LE(rate, 24); b.writeUInt32LE(rate * 2, 28); b.writeUInt16LE(2, 32); b.writeUInt16LE(16, 34); b.write("data", 36); b.writeUInt32LE(n * 2, 40);
+  for (let i = 0; i < n; i++) b.writeInt16LE(Math.round(Math.sin(i / 8) * 1500), 44 + i * 2);
+  return b;
+})();
+const escapeHtml = (t) => String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+
 function fixtureServer(port, other) {
   const srv = createServer((req, res) => {
     const url = new URL(req.url, "http://x");
+    if (url.pathname === "/tone.wav") {
+      res.writeHead(200, { "Content-Type": "audio/wav" });
+      return res.end(TONE);
+    }
+    // What the browser said it is, as the server saw it.
+    if (url.pathname === "/ua") {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      return res.end(`<!doctype html><title>UA</title><pre id="ua">${escapeHtml(req.headers["user-agent"])} | mobile=${escapeHtml(req.headers["sec-ch-ua-mobile"] ?? "")}</pre>`);
+    }
     const st = url.pathname.match(/^\/status\/(\d{3})/);
     if (st) {
       res.writeHead(+st[1], { "Content-Type": "text/plain" });
@@ -139,6 +158,7 @@ export async function startHarness({ log = false, waitMs = 45_000, setup = false
       `--user-data-dir=${profile}`,
       "--disable-features=Translate",
       "--disable-backgrounding-occluded-windows",
+      "--autoplay-policy=no-user-gesture-required",
       "--no-first-run",
       "--no-default-browser-check",
       "--window-size=1280,900",

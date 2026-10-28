@@ -27,6 +27,7 @@ export type Code =
   | "EVAL_FAILED"
   | "STALE_BUILD"
   | "EXTENSION_STALE"
+  | "TRUSTED_UNAVAILABLE"
   | "BAD_REQUEST"
   | "CAPTURE_FAILED"
   | "ENGINE_ERROR";
@@ -98,6 +99,11 @@ export const CATALOGUE: Record<Code, Entry> = {
     agentCanFix: false,
     fixSteps: ["stop and ask the user to reload the browser extension (one click); then retry"],
     humanAction: "press Reload on the Agent Bridge card at chrome://extensions in the agent browser",
+  },
+  TRUSTED_UNAVAILABLE: {
+    agentCanFix: false,
+    fixSteps: ["use the ordinary synthetic action (drop trusted:true)", "tell the user real input is not available"],
+    humanAction: "grant Accessibility to Agent Browser Input once: npm run input-helper:install, then switch it on in System Settings → Privacy & Security → Accessibility",
   },
   BAD_REQUEST: { agentCanFix: true, fixSteps: ["fix the arguments as the error says"], humanAction: null },
   CAPTURE_FAILED: { agentCanFix: true, fixSteps: ["retry once", "if it repeats, call agent_browser_status"], humanAction: null },
