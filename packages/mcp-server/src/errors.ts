@@ -30,6 +30,11 @@ export type Code =
   | "TRUSTED_UNAVAILABLE"
   | "BAD_REQUEST"
   | "CAPTURE_FAILED"
+  | "RESPONSE_TIMEOUT"
+  | "NETWORK_BLOCKED"
+  | "CAPTURE_UNAVAILABLE"
+  | "JOB_NOT_FOUND"
+  | "JOB_LIMIT"
   | "ENGINE_ERROR";
 
 interface Entry {
@@ -114,6 +119,27 @@ export const CATALOGUE: Record<Code, Entry> = {
   },
   BAD_REQUEST: { agentCanFix: true, fixSteps: ["fix the arguments as the error says"], humanAction: null },
   CAPTURE_FAILED: { agentCanFix: true, fixSteps: ["retry once", "if it repeats, call agent_browser_status"], humanAction: null },
+  RESPONSE_TIMEOUT: {
+    agentCanFix: true,
+    fixSteps: ["look at what did arrive (recent, or browser_network)", "widen urlPattern, or raise timeout", "check the action that should have sent it ran (noEffect?)"],
+    humanAction: null,
+  },
+  NETWORK_BLOCKED: {
+    agentCanFix: false,
+    fixSteps: ["work without this site's traffic (read the page instead), or stop and ask the user"],
+    humanAction: "if the agent should record this site, remove it from network.blockedDomains in config/local.json",
+  },
+  CAPTURE_UNAVAILABLE: {
+    agentCanFix: true,
+    fixSteps: ["reload the page (agent_browser_visit({history:\"reload\"})) so it loads with capture on", "then repeat the action that sends the request"],
+    humanAction: null,
+  },
+  JOB_NOT_FOUND: { agentCanFix: true, fixSteps: ["list the jobs (browser_jobs({action:\"list\"}))", "retry with an id from the list"], humanAction: null },
+  JOB_LIMIT: {
+    agentCanFix: false,
+    fixSteps: ["stop a job you no longer need, or ask for a slower interval", "do not raise the limits yourself"],
+    humanAction: "raise jobs.maxJobs or the job's maxLoadsPerHour in config/local.json if this job is wanted",
+  },
   ENGINE_ERROR: { agentCanFix: true, fixSteps: ["retry once", "if it repeats, call agent_browser_status"], humanAction: null },
 };
 

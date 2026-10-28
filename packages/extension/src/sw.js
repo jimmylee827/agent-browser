@@ -323,7 +323,7 @@ async function store(records) {
   const jobs = await jobTabs();
   for (const r of records) {
     const j = jobFor(jobs, r.tabId, r);
-    r.status = j ? "pending" : "buffer";
+    r.queue = j ? "pending" : "buffer";
     if (j) r.jobId = j.jobId;
   }
   await netstore.addMany(records);

@@ -6,6 +6,8 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { buildStatus } from "./build.js";
 import { rejectBrowserOrigin } from "./http-guard.js";
+import { secondPassRedact, toHar, toNdjson, type NetEntry } from "./network.js";
+import { writeEvidenceFile } from "./evidence.js";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
@@ -178,6 +180,37 @@ export function startControl(
         audit.log("control.navigate", { host });
         return send(res, 200, await bridge.request("engine.navigate", { url: to }));
       }
+      // Recorded traffic of one tab, for the CLI (`npm run ab -- network`).
+      if (url.pathname === "/network" || url.pathname === "/network/export" || url.pathname === "/network/clear") {
+        const q = url.searchParams;
+        const tabId = Number(q.get("tabId"));
+        if (!Number.isInteger(tabId) || !q.get("tabId")) return send(res, 400, { error: "tabId required (see `npm run ab -- tabs`)" });
+        if (url.pathname === "/network/clear") {
+          audit.log("control.network_clear", { tabId });
+          return send(res, 200, await bridge.request("net.clear", { tabId }));
+        }
+        const exporting = url.pathname === "/network/export";
+        const r = await bridge.request<{ url?: string; entries: NetEntry[]; matched: number }>("net.query", {
+          tabId,
+          urlPattern: q.get("url") ?? undefined,
+          method: q.get("method") ?? undefined,
+          status: q.get("status") ?? undefined,
+          type: q.get("type") ?? "api",
+          since: q.get("since") ? Number(q.get("since")) : undefined,
+          includeBodies: exporting || q.get("bodies") === "1",
+          includeHeaders: exporting || q.get("headers") === "1",
+          bodyChars: exporting ? 65536 : Number(q.get("bodyChars") ?? 4000),
+          limit: exporting ? 500 : Number(q.get("limit") ?? 50),
+        });
+        const entries = r.entries.map((e) => secondPassRedact(e, cfg.network.redactHeaders));
+        if (!exporting) return send(res, 200, { ...r, entries });
+        const format = q.get("format") === "ndjson" ? "ndjson" : "har";
+        const oldest = [...entries].reverse();
+        const file = writeEvidenceFile(cfg, `cli-tab-${tabId}`, "network", format, format === "har" ? JSON.stringify(toHar(oldest, { page: r.url }), null, 2) : toNdjson(oldest));
+        audit.log("control.network_export", { tabId, format, file });
+        return send(res, file ? 200 : 500, file ? { file, format, entries: entries.length, matched: r.matched } : { error: "could not write the export" });
+      }
+      if (url.pathname === "/tabs") return send(res, 200, await bridge.request("engine.tabs", { action: "list" }));
       if (url.pathname === "/robust-click" && req.method === "POST") {
         const body = await new Promise<string>((resolve) => {
           let b = "";
@@ -201,7 +234,8 @@ export function startControl(
       send(res, 404, {
         error: "not found",
         routes: [
-          "/status", "/ping", "/observe", "/locate", "/wait", "/navigate", "/visit",
+          "/status", "/ping", "/observe", "/locate", "/wait", "/navigate", "/visit", "/tabs",
+          "/network?tabId=", "/network/export?tabId=&format=har|ndjson", "/network/clear?tabId=",
           "POST /act", "POST /robust-click", "POST /mcp", "POST /session/release?client=",
         ],
       });

@@ -9,7 +9,8 @@ import type { ClientInfo } from "../control.js";
 import { agentChromeRunning as agentChromeRunningOn, hostHelper, launchBrowser } from "../host-helper-client.js";
 import { AbError, CATALOGUE, codeOf, HALT_ADVICE, POLICY_ADVICE } from "../errors.js";
 import { buildId, buildStatus, RUNNING } from "../build.js";
-import { recordEvidence } from "../evidence.js";
+import { recordEvidence, writeEvidenceFile } from "../evidence.js";
+import { bodyView, secondPassRedact, summarize, toHar, toNdjson, type NetEntry } from "../network.js";
 import { InputHelper, type InputConfig } from "../input.js";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -482,6 +483,47 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
     return parts.length ? `${parts.join(", ")} — details: browser_diagnostics` : undefined;
   }
 
+  type NetQuery = { tabId: number; url?: string; entries: NetEntry[]; matched: number; total: number; blocked?: boolean };
+
+  /** One line on the API calls the page made since `since`. */
+  async function networkSummary(sc: Scope, since: number): Promise<string | undefined> {
+    const r = await sc.req<NetQuery>("net.query", { since, type: "api", limit: 20 }).catch(() => null);
+    return r ? summarize([...r.entries].reverse()) : undefined;
+  }
+
+  /**
+   * Wait for a response the page receives. Polled from here, one short bridge
+   * call at a time, so it can wait longer than one call may take (25s).
+   */
+  async function waitForResponse(
+    sc: Scope,
+    want: { urlPattern: string; method?: string; status?: string },
+    since: number,
+    timeoutMs: number,
+    bodyChars = 16000,
+  ): Promise<{ response: ReturnType<typeof bodyView>; waitedMs: number }> {
+    const t0 = Date.now();
+    for (;;) {
+      const r = await sc.req<NetQuery>("net.query", { ...want, since, type: "all", limit: 1, includeBodies: true, bodyChars });
+      const hit = r.entries[0];
+      if (hit) return { response: bodyView(secondPassRedact(hit, ctx.cfg.network.redactHeaders)), waitedMs: Date.now() - t0 };
+      if (Date.now() - t0 >= timeoutMs) {
+        const recent = await sc.req<NetQuery>("net.query", { since, type: "all", limit: 10 }).catch(() => null);
+        throw new AbError("RESPONSE_TIMEOUT", `no response matching ${want.urlPattern}${want.method ? ` (${want.method})` : ""}${want.status ? ` with status ${want.status}` : ""} within ${timeoutMs}ms`, {
+          recent: (recent?.entries ?? []).map((e) => `${e.method} ${e.url} ${e.status ?? e.error ?? ""}`),
+        });
+      }
+      await sleep(300);
+    }
+  }
+
+  /** A document loaded before capture was on records headers, never bodies. */
+  async function captureState(call: Call, sc: Scope): Promise<void> {
+    const p = await sc.req<{ engine?: { netHook?: boolean; error?: string } }>("engine.ping").catch(() => null);
+    if (p?.engine && !p.engine.error && p.engine.netHook === false)
+      call.degraded.push("CAPTURE_UNAVAILABLE: this page loaded before network capture was on (or capture is off here), so its bodies are missing: reload it to record them");
+  }
+
   /** A viewport image and a record on disk, to cite later. */
   async function evidence(sc: Scope, tool: string, info: { url?: unknown; title?: unknown; [k: string]: unknown }, image?: string) {
     if (!ctx.cfg.evidence.enabled) return undefined;
@@ -750,7 +792,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         if (popups !== undefined) await allowPopups(call, sc, popups);
         const settled = await settlePage(call, sc);
         const snap = reportWall(call, await attachText(sc, await observeAs(sc, snapshot, details), text));
-        const diagnostics = await diagSummary(sc, t0);
+        const [diagnostics, network] = await Promise.all([diagSummary(sc, t0), networkSummary(sc, t0)]);
         const ev = await evidence(sc, "visit", { url: snap.url, title: snap.title, ...(history ? { history } : {}) });
         ctx.audit.log("tool.agent_browser_visit", { ...(history ? { history, from: nav.from } : { url }), to: snap.url, tabId: call.tabId, ...(ev ? { evidence: ev.file } : {}) });
         return {
@@ -758,6 +800,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
           tabId: call.tabId,
           ...(settled.settled ? {} : { settled: false, settleReason: settled.reason }),
           ...(diagnostics ? { diagnostics } : {}),
+          ...(network ? { network } : {}),
           ...(ev ? { evidence: ev } : {}),
         };
       });
@@ -821,6 +864,15 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         .boolean()
         .optional()
         .describe("Let this site open popups without a click first (a window opened after a delay is otherwise blocked by Chrome). Recorded in the audit log."),
+      waitForResponse: z
+        .object({
+          urlPattern: z.string().describe("Regular expression (or plain text) the response URL must match"),
+          method: z.string().optional(),
+          status: z.string().optional().describe("e.g. \"2xx\", \"200\", \"failed\""),
+          timeout: z.number().int().min(100).max(120_000).optional().describe("ms, default 15000"),
+        })
+        .optional()
+        .describe("After the action, wait for the page to receive a matching response and return it (JSON parsed) as `response`: one call for \"click Search, read the results the page fetched\"."),
       trusted: z
         .boolean()
         .optional()
@@ -1076,7 +1128,10 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
           const w = passwordHostWarning(result.host);
           if (w) call.warnings.push(w);
         }
-        const diagnostics = await diagSummary(sc, t0);
+        const [diagnostics, network] = await Promise.all([diagSummary(sc, t0), networkSummary(sc, t0)]);
+        // The data the action fetched, in the same call: "click Search, read the JSON".
+        let awaited: Awaited<ReturnType<typeof waitForResponse>> | undefined;
+        if (args.waitForResponse) awaited = await waitForResponse(sc, args.waitForResponse, t0, args.waitForResponse.timeout ?? 15_000);
 
         const { acted: _a, changed: _c, signals, dialogs, credentialStoreBlocked, passwordField: _p, host: _h, snapshotStale: _st, action: _ac, ...engineExtra } = result;
         ctx.audit.log("tool.agent_browser_act", { name, role, action, urlBefore: tabUrl, urlAfter: after.url, noEffect, tabId: call.tabId });
@@ -1099,6 +1154,8 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
           ...(credentialStoreBlocked ? { credentialStoreBlocked } : {}),
           ...(switchedTab ? { switchedTab } : {}),
           ...(diagnostics ? { diagnostics } : {}),
+          ...(network ? { network } : {}),
+          ...(awaited ? { response: awaited.response, responseWaitedMs: awaited.waitedMs } : {}),
           urlBefore: tabUrl,
           urlAfter: after.url,
           snapshotAfter: after,
@@ -1301,7 +1358,8 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
     "browser_wait",
     [
       "Wait for your session's page. With text, or name/role: until that text or element appears ",
-      "(gone:true — until it disappears), up to 25s. With neither: until the page is ",
+      "(gone:true — until it disappears), up to 25s. With response: until the page receives a matching response, up to ",
+      "5 minutes, and get it back (JSON parsed). With none of them: until the page is ",
       "DOM/network-quiet and its layout and animations have stopped. Use after an action that loads something.",
       ADV_RULES,
     ].join(""),
@@ -1312,11 +1370,29 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
       name: z.string().optional().describe("Wait until an element with this accessible name exists"),
       role: z.string().optional().describe("Narrow `name` to a role, or wait for any element of this role"),
       gone: z.boolean().default(false).describe("Wait for the text/element to disappear instead"),
+      response: z
+        .object({
+          urlPattern: z.string().describe("Regular expression (or plain text) the response URL must match"),
+          method: z.string().optional(),
+          status: z.string().optional().describe("e.g. \"2xx\", \"200\", \"failed\""),
+        })
+        .optional()
+        .describe("Wait for the page to receive this response, and return it"),
+      lookbackMs: z.number().int().min(0).max(60_000).default(5000).describe("response: also accept one that arrived this long before the call"),
       timeout: z.number().int().default(8000),
       quietMs: z.number().int().default(600),
     },
     async (args, call) => {
       const sc = scope(call, args, "tab");
+      if (args.response) {
+        if (args.text !== undefined || args.name !== undefined || args.role !== undefined)
+          throw new AbError("BAD_REQUEST", "wait for a response, or for text/an element — not both in one call");
+        // No session lock: a long wait must not keep a shared tab from others.
+        ctx.audit.log("tool.browser_wait", { response: args.response.urlPattern });
+        await captureState(call, sc);
+        const timeout = Math.min(Math.max(args.timeout, 100), 300_000);
+        return await waitForResponse(sc, args.response, Date.now() - args.lookbackMs, timeout);
+      }
       return inSession(call, sc, async () => {
         const targeted = args.text !== undefined || args.name !== undefined || args.role !== undefined;
         ctx.audit.log("tool.browser_wait", { targeted });
@@ -1572,7 +1648,8 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
       "What went wrong in your session's page: failed or non-2xx requests (url, method, status, type, error — on every ",
       "host), and on development hosts (localhost, 127.0.0.1, private IPs, *.local, *.test, and diagnostics.hosts in the ",
       "config) also console errors and warnings, uncaught exceptions and unhandled rejections with their source. Media ",
-      "elements that failed to load are listed too. `since` is a ms timestamp; default: everything kept (last 100 requests, 200 entries).",
+      "elements that failed to load are listed too. `since` is a ms timestamp; default: everything kept for this tab. ",
+      "For everything the page sent and received (bodies included), browser_network.",
       ADV_RULES,
     ].join(""),
     { session: SESSION_ARG, tabId: TAB_ARG, since: z.number().int().optional() },
@@ -1591,6 +1668,88 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
           ctx.cfg.diagnostics.hosts.some((h) => host === h || host.endsWith(`.${h}`));
         return { ...r, ...(dev ? {} : { note: `console capture is off on ${host || "this page"} (not a development host); network failures are still listed` }) };
       });
+    },
+  );
+
+  tool(
+    "browser_network",
+    [
+      "What your session's page sent and received: fetch and XHR requests with their bodies (JSON parsed), WebSocket ",
+      "and EventSource messages, and (type:\"all\") documents and other requests with headers and timing. Recorded on ",
+      "every page except network.blockedDomains (identity, payment, banking); secrets are removed before anything is ",
+      "stored. Use it to read the data a page loaded instead of scraping the screen. Without includeBodies you get ",
+      "200-character previews; ask for bodies of the few entries you need (urlPattern). action:\"export\" writes a HAR ",
+      "(or NDJSON) file into the session's evidence folder and returns its path; \"clear\" forgets this tab's record.",
+      ADV_RULES,
+    ].join(""),
+    {
+      session: SESSION_ARG,
+      tabId: TAB_ARG,
+      action: z.enum(["query", "export", "clear"]).default("query"),
+      urlPattern: z.string().optional().describe("Regular expression (or plain text) the URL must match, e.g. \"/api/search\""),
+      method: z.string().optional(),
+      status: z.string().optional().describe("\"2xx\", \"4xx\", \"failed\" (no answer or ≥400), \"ok\", or an exact code"),
+      type: z
+        .enum(["api", "fetch", "xhr", "ws", "sse", "document", "failed", "all"])
+        .default("api")
+        .describe("api (default): fetch, XHR, WebSocket and EventSource. all: every recorded request, documents included"),
+      since: z.number().int().optional().describe("ms timestamp; default: everything kept for this tab"),
+      includeBodies: z.boolean().default(false).describe("Return bodies (up to bodyChars each), JSON parsed when it parses"),
+      includeHeaders: z.boolean().default(false),
+      parse: z.boolean().default(true).describe("With includeBodies: JSON bodies as `json` instead of text"),
+      bodyChars: z.number().int().min(100).max(65536).default(4000),
+      limit: z.number().int().min(1).max(500).default(50).describe("Newest first"),
+      format: z.enum(["har", "ndjson"]).default("har").describe("export: HAR opens in browser devtools; NDJSON is one entry per line"),
+    },
+    async (args, call) => {
+      const sc = scope(call, args, "tab");
+      ctx.sessions.touch(sc.s, ctx.client.id);
+      if (args.action === "clear") {
+        ctx.audit.log("tool.browser_network", { action: "clear", tabId: call.tabId });
+        return await sc.req<Record<string, unknown>>("net.clear");
+      }
+      const exporting = args.action === "export";
+      const r = await sc.req<NetQuery>("net.query", {
+        urlPattern: args.urlPattern,
+        method: args.method,
+        status: args.status,
+        type: args.type,
+        since: args.since,
+        includeBodies: exporting || args.includeBodies,
+        includeHeaders: exporting || args.includeHeaders,
+        bodyChars: exporting ? 65536 : args.bodyChars,
+        limit: exporting ? 500 : args.limit,
+      });
+      await captureState(call, sc);
+      const entries = r.entries.map((e) => secondPassRedact(e, ctx.cfg.network.redactHeaders));
+      const note = r.blocked
+        ? "this page's host is on network.blockedDomains: only failures and metadata are recorded here, no bodies or headers"
+        : undefined;
+      ctx.audit.log("tool.browser_network", { action: args.action, tabId: call.tabId, matched: r.matched, ...(exporting ? { format: args.format } : {}) });
+      if (exporting) {
+        const oldestFirst = [...entries].reverse();
+        const content =
+          args.format === "har" ? JSON.stringify(toHar(oldestFirst, { page: r.url, version: buildId(RUNNING) }), null, 2) : toNdjson(oldestFirst);
+        const file = writeEvidenceFile(ctx.cfg, evidenceDir(sc.s), "network", args.format, content);
+        if (!file) throw new AbError("CAPTURE_FAILED", `could not write the ${args.format} file under ${ctx.cfg.stateDir}/sessions`);
+        return { file, format: args.format, entries: entries.length, matched: r.matched, ...(r.matched > 500 ? { note: "the newest 500 entries were exported" } : {}) };
+      }
+      let view = entries.map((e) => (args.includeBodies ? bodyView(e, args.parse) : e));
+      // A result an agent can read in one go; the rest is a narrower query away.
+      let cut = 0;
+      while (view.length > 1 && JSON.stringify(view).length > 100_000) {
+        view = view.slice(0, Math.ceil(view.length / 2));
+        cut = entries.length - view.length;
+      }
+      return {
+        url: r.url,
+        tabId: r.tabId,
+        matched: r.matched,
+        shown: view.length,
+        ...(cut ? { cut, hint: "result was too large: narrow urlPattern, lower bodyChars or limit, or export it" } : {}),
+        ...(note ? { note } : {}),
+        entries: view,
+      };
     },
   );
 

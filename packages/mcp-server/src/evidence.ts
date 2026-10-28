@@ -38,6 +38,21 @@ export function recordEvidence(
   }
 }
 
+/** A file an agent asked to keep (an export), beside the session's other evidence. */
+export function writeEvidenceFile(cfg: AppConfig, session: string, tool: string, ext: string, content: string): string | undefined {
+  try {
+    const dir = resolve(cfg.stateDir, "sessions", safe(session));
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const base = `${new Date().toISOString().replace(/[:.]/g, "-")}-${String(++seq).padStart(4, "0")}-${tool}`;
+    const file = resolve(dir, `${base}.${ext}`);
+    // Recorded traffic is private: other users of this Mac may not read it.
+    writeFileSync(file, content, { mode: 0o600 });
+    return file;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Remove session directories untouched for longer than retainDays. */
 export function pruneEvidence(cfg: AppConfig, now = Date.now()): number {
   const root = resolve(cfg.stateDir, "sessions");

@@ -4,7 +4,7 @@
 // browser's own database, inside the agent profile (which already holds that
 // site's cookies, so no new trust boundary). Modelled on testohelper's queue.
 //
-// Each record has a status:
+// Each record has a queue state (not "status": that is the HTTP status):
 //   buffer   — an ordinary session's traffic; pruned by age and count
 //   pending  — a background job's, not yet written to its file; never pruned
 //   written  — a job's, already on disk; pruned like buffer
@@ -15,12 +15,14 @@ let dbp = null;
 function open() {
   if (dbp) return dbp;
   dbp = new Promise((resolve, reject) => {
-    const r = indexedDB.open(DB, 1);
+    const r = indexedDB.open(DB, 2);
     r.onupgradeneeded = () => {
       const db = r.result;
+      // v1 kept the queue state in `status`, over the HTTP status. Start again.
+      for (const name of [...db.objectStoreNames]) db.deleteObjectStore(name);
       const s = db.createObjectStore("entries", { keyPath: "id", autoIncrement: true });
       s.createIndex("tab_ts", ["tabId", "ts"]);
-      s.createIndex("status", "status");
+      s.createIndex("queue", "queue");
       s.createIndex("ts", "ts");
       db.createObjectStore("meta");
     };
@@ -95,19 +97,19 @@ export function clearTab(tabId, { keepPending = true } = {}) {
   return deleteWhere(
     IDBKeyRange.bound([tabId, 0], [tabId, Number.MAX_SAFE_INTEGER]),
     "tab_ts",
-    (r) => keepPending && r.status === "pending",
+    (r) => keepPending && r.queue === "pending",
   );
 }
 
 /** A new browser session reuses tab ids; old records would land on new tabs. */
 export function wipeUnpending() {
-  return deleteWhere(null, null, (r) => r.status === "pending");
+  return deleteWhere(null, null, (r) => r.queue === "pending");
 }
 
 /** A job's unwritten records older than `olderThan`, up to about `maxBytes`. */
 export async function takePending(jobId, { olderThan = Date.now(), maxBytes = 2_000_000 } = {}) {
   const db = await open();
-  const idx = db.transaction("entries").objectStore("entries").index("status");
+  const idx = db.transaction("entries").objectStore("entries").index("queue");
   const all = await req(idx.getAll(IDBKeyRange.only("pending")));
   const out = [];
   let bytes = 0;
@@ -128,8 +130,8 @@ export async function markWritten(ids) {
   let n = 0;
   for (const id of ids) {
     const r = await req(store.get(id));
-    if (r && r.status === "pending") {
-      r.status = "written";
+    if (r && r.queue === "pending") {
+      r.queue = "written";
       store.put(r);
       n++;
     }
@@ -146,7 +148,7 @@ export async function markWritten(ids) {
  */
 export async function prune({ perTab = 500, total = 20000, retainMs = 24 * 3600_000, maxPending = 100_000 } = {}) {
   const cutoff = Date.now() - retainMs;
-  let removed = await deleteWhere(IDBKeyRange.upperBound(cutoff), "ts", (r) => r.status === "pending");
+  let removed = await deleteWhere(IDBKeyRange.upperBound(cutoff), "ts", (r) => r.queue === "pending");
 
   const db = await open();
   const all = await req(db.transaction("entries").objectStore("entries").index("ts").getAll());
@@ -156,7 +158,7 @@ export async function prune({ perTab = 500, total = 20000, retainMs = 24 * 3600_
   let pending = 0;
   for (let i = all.length - 1; i >= 0; i--) {
     const r = all[i];
-    if (r.status === "pending") {
+    if (r.queue === "pending") {
       if (++pending > maxPending) drop.add(r.id);
       continue;
     }
@@ -186,7 +188,7 @@ export async function stats() {
   const store = tx.objectStore("entries");
   const [count, pending, droppedPending] = await Promise.all([
     req(store.count()),
-    req(store.index("status").count(IDBKeyRange.only("pending"))),
+    req(store.index("queue").count(IDBKeyRange.only("pending"))),
     req(tx.objectStore("meta").get("droppedPending")),
   ]);
   return { records: count, pending, droppedPending: droppedPending || 0 };

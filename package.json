@@ -19,6 +19,7 @@
   ],
   "scripts": {
     "launch": "bin/launch-chrome.sh",
+    "ab": "node scripts/ab.mjs",
     "build": "npm run build -w packages/mcp-server",
     "mcp": "npm run start -w packages/mcp-server",
     "mcp:dev": "npm run dev -w packages/mcp-server",
