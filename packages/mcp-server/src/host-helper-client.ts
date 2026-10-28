@@ -1,5 +1,5 @@
 import { readFileSync, existsSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -49,6 +49,17 @@ export const hostHelper = {
   },
   launchChrome: () => call<{ ok: true; pid: number }>("/launch-chrome"),
 };
+
+/** Is a Chrome running on the agent profile? (Unknown counts as yes.) */
+export function agentChromeRunning(profileDir: string): boolean {
+  try {
+    // No leading "--" in the pattern: pgrep would read it as an option.
+    execFileSync("pgrep", ["-f", `user-data-dir=${profileDir}`], { stdio: "ignore" });
+    return true;
+  } catch (e) {
+    return (e as { status?: number }).status !== 1; // 1 = no match
+  }
+}
 
 /**
  * Start the agent Chrome by whichever route works: the host helper when it

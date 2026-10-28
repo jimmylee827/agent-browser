@@ -50,6 +50,49 @@
     "comment": "Console and page-error capture runs only on development hosts: localhost, 127.0.0.1, ::1, *.localhost, *.local, *.test, private IPs, and the hosts listed here. Failed network requests are recorded on every host (invisible to the page).",
     "hosts": []
   },
+  "network": {
+    "comment": "The agent browser records the traffic of every page except these domains (and their subdomains): request and response bodies of fetch and XHR, WebSocket and EventSource messages, and headers. It is kept in the browser per tab and leaves it only when a tool asks: browser_network, or a background job's own files. Secrets are removed before anything is stored: the headers listed, and any JSON, form or query field whose name (lower-case, separators removed) matches redactKeys.",
+    "enabled": true,
+    "blockedDomains": [
+      "accounts.google.com",
+      "login.microsoftonline.com",
+      "login.live.com",
+      "appleid.apple.com",
+      "paypal.com",
+      "checkout.stripe.com",
+      "bank"
+    ],
+    "frames": "same-origin",
+    "maxBodyChars": 65536,
+    "skipBodyTypes": ["image/", "font/", "video/", "audio/", "application/octet-stream", "application/wasm", "application/pdf", "text/css", "javascript", "text/event-stream"],
+    "maxEntriesPerTab": 500,
+    "maxTotalEntries": 20000,
+    "retainHours": 24,
+    "captureWebSockets": true,
+    "maxFramesPerSocket": 200,
+    "maxFrameChars": 2000,
+    "wireTypes": ["main_frame", "sub_frame", "xmlhttprequest", "websocket", "ping", "other"],
+    "redactHeaders": ["authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key", "x-auth-token", "x-csrf-token", "x-xsrf-token", "x-amz-security-token"],
+    "redactKeys": "^(pass|pwd|pin|otp|cvv|cvc|csc|ssn|sig|sid|code|auth|jwt|session|signature|cookie|cardnumber|ccnumber|cardcvc)$|password|passwd|passcode|secret|token|apikey|credential|sessionid|privatekey"
+  },
+  "jobs": {
+    "comment": "Background jobs keep a page open in their own window, record the responses that match, and heal it when it stops answering: reload, then navigate again, then reopen the window, then stop and say so. Page loads (scheduled and remedial) are capped per hour. Records go to <stateDir>/jobs/<id>/<date>.ndjson, removed after evidence.retainDays.",
+    "enabled": true,
+    "maxJobs": 5,
+    "checkEveryMs": 60000,
+    "minIntervalMs": 60000,
+    "defaults": {
+      "maxLoadsPerHour": 4,
+      "staleAfterMs": 1200000,
+      "faultAfterMs": 90000,
+      "cooldownMs": 300000,
+      "recoveryQuietMs": 120000,
+      "pageGraceMs": 30000,
+      "confirmStrikes": 2
+    },
+    "bridgeDownRecoverAfterMs": 180000,
+    "maxBrowserLaunchesPerDay": 6
+  },
   "evidence": {
     "comment": "Each visit and screenshot is recorded under <stateDir>/sessions/<session>/ with a viewport image; directories older than retainDays are removed at startup.",
     "enabled": true,

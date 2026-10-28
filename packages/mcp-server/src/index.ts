@@ -2,7 +2,8 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { loadConfig, ensureBridgeSecret } from "./config.js";
+import { watchFile } from "node:fs";
+import { loadConfig, ensureBridgeSecret, localConfigPath, reloadLocal } from "./config.js";
 import { Audit } from "./audit.js";
 import { Bridge } from "./bridge/server.js";
 import { Policy } from "./policy.js";
@@ -52,7 +53,25 @@ async function main() {
       sessions.unbind(s);
     }
   }, 600_000).unref();
-  if (cfg.evidence.enabled) pruneEvidence(cfg);
+  // The daemon runs for weeks; pruning only at start let evidence pile up.
+  const prune = () => {
+    if (cfg.evidence.enabled) pruneEvidence(cfg);
+  };
+  prune();
+  setInterval(prune, 24 * 3600_000).unref();
+
+  // A person's edit to config/local.json (often one they approved in chat)
+  // applies without a restart, here and in the extension.
+  watchFile(localConfigPath(), { interval: 2000 }, (cur, prev) => {
+    if (cur.mtimeMs === prev.mtimeMs) return;
+    try {
+      reloadLocal(cfg);
+      bridge.pushConfig();
+      audit.log("config.reloaded", { file: localConfigPath() });
+    } catch (e) {
+      audit.log("config.reload_failed", { error: String((e as Error).message) });
+    }
+  }).unref();
 
   // Transport 1: stdio — for direct `node packages/mcp-server/dist/index.js`
   // launches (Claude Code et al.). Skip if AB_DISABLE_STDIO_MCP=1 (Docker mode

@@ -34,9 +34,83 @@ export interface AppConfig {
   eval: { blockedDomains: string[] };
   input: { enabled: boolean; port: number; secretFile: string };
   diagnostics: { hosts: string[] };
+  network: NetworkConfig;
+  jobs: JobsConfig;
   evidence: { enabled: boolean; retainDays: number };
   audit: { file: string };
 }
+
+export interface NetworkConfig {
+  enabled: boolean;
+  blockedDomains: string[];
+  frames: "top" | "same-origin";
+  maxBodyChars: number;
+  skipBodyTypes: string[];
+  maxEntriesPerTab: number;
+  maxTotalEntries: number;
+  retainHours: number;
+  captureWebSockets: boolean;
+  maxFramesPerSocket: number;
+  maxFrameChars: number;
+  wireTypes: string[];
+  redactHeaders: string[];
+  redactKeys: string;
+}
+
+export interface LadderSettings {
+  maxLoadsPerHour: number;
+  staleAfterMs: number;
+  faultAfterMs: number;
+  cooldownMs: number;
+  recoveryQuietMs: number;
+  pageGraceMs: number;
+  confirmStrikes: number;
+}
+
+export interface JobsConfig {
+  enabled: boolean;
+  maxJobs: number;
+  checkEveryMs: number;
+  minIntervalMs: number;
+  defaults: LadderSettings;
+  bridgeDownRecoverAfterMs: number;
+  maxBrowserLaunchesPerDay: number;
+}
+
+const NETWORK_DEFAULTS: NetworkConfig = {
+  enabled: true,
+  blockedDomains: [],
+  frames: "same-origin",
+  maxBodyChars: 65536,
+  skipBodyTypes: [],
+  maxEntriesPerTab: 500,
+  maxTotalEntries: 20000,
+  retainHours: 24,
+  captureWebSockets: true,
+  maxFramesPerSocket: 200,
+  maxFrameChars: 2000,
+  wireTypes: ["main_frame", "sub_frame", "xmlhttprequest", "websocket", "ping", "other"],
+  redactHeaders: ["authorization", "proxy-authorization", "cookie", "set-cookie"],
+  redactKeys: "password|passwd|secret|token",
+};
+
+const JOBS_DEFAULTS: JobsConfig = {
+  enabled: true,
+  maxJobs: 5,
+  checkEveryMs: 60000,
+  minIntervalMs: 60000,
+  defaults: {
+    maxLoadsPerHour: 4,
+    staleAfterMs: 1_200_000,
+    faultAfterMs: 90_000,
+    cooldownMs: 300_000,
+    recoveryQuietMs: 120_000,
+    pageGraceMs: 30_000,
+    confirmStrikes: 2,
+  },
+  bridgeDownRecoverAfterMs: 180_000,
+  maxBrowserLaunchesPerDay: 6,
+};
 
 /**
  * A person's own settings, kept out of the repository: the file an agent may
@@ -71,9 +145,33 @@ function applyLocal(cfg: AppConfig, local: Partial<AppConfig> | null): AppConfig
   }
   if (local.eval?.blockedDomains) cfg.eval.blockedDomains = local.eval.blockedDomains;
   if (local.diagnostics?.hosts) cfg.diagnostics.hosts = local.diagnostics.hosts;
+  if (local.network) cfg.network = { ...cfg.network, ...local.network };
+  if (local.jobs) {
+    cfg.jobs = { ...cfg.jobs, ...local.jobs, defaults: { ...cfg.jobs.defaults, ...(local.jobs.defaults ?? {}) } };
+  }
   if (local.input) cfg.input = { ...cfg.input, ...local.input };
   if (local.evidence) cfg.evidence = { ...cfg.evidence, ...local.evidence };
   return cfg;
+}
+
+// What a person may change in config/local.json while the daemon runs. Ports,
+// paths and secrets are read once, at start.
+const RELOADABLE = ["policy", "eval", "diagnostics", "network", "jobs", "evidence"] as const;
+
+/**
+ * Re-read config/local.json into the config every part of the daemon shares.
+ * Rebuilt from the defaults each time, so a line the person deleted goes back
+ * to its default instead of lingering.
+ */
+export function reloadLocal(cfg: AppConfig): void {
+  const fresh = loadConfig();
+  for (const k of RELOADABLE) (cfg as unknown as Record<string, unknown>)[k] = fresh[k];
+}
+
+/** The part of the config the extension acts on; it cannot read files itself. */
+export function extensionConfig(cfg: AppConfig): Record<string, unknown> {
+  const { comment: _comment, ...network } = cfg.network as NetworkConfig & { comment?: string };
+  return { diagnosticsHosts: cfg.diagnostics.hosts, network };
 }
 
 export function loadConfig(): AppConfig {
@@ -99,6 +197,8 @@ export function loadConfig(): AppConfig {
   cfg.eval ??= { blockedDomains: [] };
   cfg.input ??= { enabled: false, port: 8790, secretFile: "~/.agent-chrome/input-helper-secret" };
   cfg.diagnostics ??= { hosts: [] };
+  cfg.network = { ...NETWORK_DEFAULTS, ...(cfg.network ?? {}) };
+  cfg.jobs = { ...JOBS_DEFAULTS, ...(cfg.jobs ?? {}), defaults: { ...JOBS_DEFAULTS.defaults, ...(cfg.jobs?.defaults ?? {}) } };
   cfg.evidence ??= { enabled: true, retainDays: 14 };
   if (env.AB_BIND_HOST) cfg.bridge.host = env.AB_BIND_HOST;
   if (env.AB_BRIDGE_SECRET_FILE) cfg.bridge.secretFile = env.AB_BRIDGE_SECRET_FILE;

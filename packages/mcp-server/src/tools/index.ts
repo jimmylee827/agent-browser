@@ -6,13 +6,12 @@ import { resolveKey, short, type Session, type SessionManager } from "../session
 import type { Audit } from "../audit.js";
 import type { AppConfig } from "../config.js";
 import type { ClientInfo } from "../control.js";
-import { hostHelper, launchBrowser } from "../host-helper-client.js";
+import { agentChromeRunning as agentChromeRunningOn, hostHelper, launchBrowser } from "../host-helper-client.js";
 import { AbError, CATALOGUE, codeOf, HALT_ADVICE, POLICY_ADVICE } from "../errors.js";
 import { buildId, buildStatus, RUNNING } from "../build.js";
 import { recordEvidence } from "../evidence.js";
 import { InputHelper, type InputConfig } from "../input.js";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { execFileSync } from "node:child_process";
 import { resolve } from "node:path";
 
 export { HALT_ADVICE };
@@ -301,16 +300,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
   // Browser up
   // ============================================================
 
-  /** Is a Chrome running on the agent profile? (Unknown counts as yes.) */
-  const agentChromeRunning = () => {
-    try {
-      // No leading "--" in the pattern: pgrep would read it as an option.
-      execFileSync("pgrep", ["-f", `user-data-dir=${ctx.cfg.profileDir}`], { stdio: "ignore" });
-      return true;
-    } catch (e) {
-      return (e as { status?: number }).status !== 1; // 1 = no match
-    }
-  };
+  const agentChromeRunning = () => agentChromeRunningOn(ctx.cfg.profileDir);
 
   /**
    * Bring the browser up if the bridge isn't connected. Shared by every tool

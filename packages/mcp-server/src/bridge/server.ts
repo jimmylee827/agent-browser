@@ -2,7 +2,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
-import type { AppConfig } from "../config.js";
+import { extensionConfig, type AppConfig } from "../config.js";
 import type { Audit } from "../audit.js";
 
 interface Pending {
@@ -20,6 +20,7 @@ const READ_ONLY = new Set([
   "engine.ping", "engine.observe", "engine.locate", "engine.waitForStable",
   "engine.screenshot", "engine.navHistory", "engine.waitFor", "engine.settle",
   "engine.pageState", "engine.inspect", "engine.diagnostics", "engine.tabs.list",
+  "net.query", "net.summary", "net.stats",
 ]);
 const DROPPED = "BRIDGE_DROPPED";
 
@@ -85,8 +86,9 @@ export class Bridge {
         this.extension = msg.extension;
         this.audit.log("bridge.connected", { ip });
         // What the extension needs from the config: where console capture may
-        // run. It has no other way to read config/default.json.
-        ws.send(JSON.stringify({ type: "auth_ok", config: { diagnosticsHosts: this.cfg.diagnostics.hosts } }));
+        // run, and what network capture records. It has no other way to read
+        // config/default.json.
+        ws.send(JSON.stringify({ type: "auth_ok", config: extensionConfig(this.cfg) }));
         ws.on("message", (b) => this.onMessage(b.toString()));
 
         // Keep the MV3 service worker alive.
@@ -145,6 +147,11 @@ export class Bridge {
       if (msg.detail) err.detail = msg.detail;
       p.reject(err);
     }
+  }
+
+  /** Hand the extension a changed config (config/local.json was edited). */
+  pushConfig(): void {
+    if (this.connected()) this.client!.send(JSON.stringify({ type: "config", config: extensionConfig(this.cfg) }));
   }
 
   connected(): boolean {

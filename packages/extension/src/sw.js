@@ -52,6 +52,11 @@ function connect() {
     // resets this worker's ~30s idle timer, which is what keeps the bridge up
     // between tool calls instead of dying and waiting on the alarm backstop.
     if (msg.type === "keepalive") return;
+    // The person edited config/local.json; the server re-sends what we act on.
+    if (msg.type === "config") {
+      applyConfig(msg.config || {}).catch((e) => console.warn("[agent-bridge] config", e));
+      return;
+    }
     if (!msg.id || !msg.method) return;
     try {
       const result = await dispatch(msg.method, msg.params || {});
