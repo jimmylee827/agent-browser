@@ -4,6 +4,9 @@
 // Static import (reliable in MV3 module SW). No top-level await, no dynamic
 // import. generated-secret.js is produced by scripts/sync-ext-secret.mjs.
 import { BRIDGE_SECRET, BRIDGE_PORT } from "./generated-secret.js";
+import * as netstore from "./lib/netstore.js";
+import { keyMatcher, redactHeaders, redactUrl, redactBody, redactValues } from "./lib/redact.js";
+import { mergeStreams, filterEntries, isFailed } from "./lib/net-merge.js";
 
 console.log("[agent-bridge] service worker started; port", BRIDGE_PORT);
 const cfg = { BRIDGE_SECRET, BRIDGE_PORT };
@@ -114,7 +117,7 @@ chrome.tabs.onCreated.addListener(async (t) => {
 });
 chrome.tabs.onRemoved.addListener((id) => {
   NAV_COUNT.delete(id);
-  NET.delete(id);
+  netstore.clearTab(id, { keepPending: true }).catch(() => {});
   if (MOBILE.delete(id)) chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [ruleIdFor(id)] }).catch(() => {});
 });
 
@@ -236,33 +239,337 @@ function mobilePatch(ua) {
   new MutationObserver(fixSheets).observe(document.documentElement, { childList: true, subtree: true });
 }
 
-// ---- diagnostics: failed requests, per tab. webRequest only observes; the
-// page cannot tell it is there, so this runs on every host.
-const NET = new Map();
-const NET_MAX = 100;
-function recordNet(d, entry) {
-  if (d.tabId < 0) return;
-  let list = NET.get(d.tabId);
-  if (!list) NET.set(d.tabId, (list = []));
-  list.push({ ts: Date.now(), url: d.url, method: d.method, type: d.type, ...entry });
-  if (list.length > NET_MAX) list.shift();
+// ---- network: what every agent tab sent and received ----------------------
+// Two streams (see lib/net-merge.js): "wire" records from webRequest, which the
+// page cannot see, on every host; and "page" records from net-hook.js (bodies,
+// WebSocket and EventSource frames), on every host but the blocked ones. Both
+// go to IndexedDB with secrets removed first, so nothing stored or read back
+// holds an Authorization header or a typed password.
+const NETCFG_DEFAULT = {
+  enabled: true,
+  blockedDomains: [],
+  wireTypes: ["main_frame", "sub_frame", "xmlhttprequest", "websocket", "ping", "other"],
+  redactHeaders: ["authorization", "proxy-authorization", "cookie", "set-cookie"],
+  redactKeys: "password|passwd|secret|token",
+  maxBodyChars: 65536,
+  maxEntriesPerTab: 500,
+  maxTotalEntries: 20000,
+  retainHours: 24,
+};
+let NETCFG = null;
+let isSecretKey = keyMatcher(NETCFG_DEFAULT.redactKeys);
+// The worker may wake for a request before the server has sent any config.
+const netReady = chrome.storage.local.get("netConfig").then(({ netConfig }) => setNetConfig(netConfig)).catch(() => setNetConfig(null));
+function setNetConfig(c) {
+  NETCFG = { ...NETCFG_DEFAULT, ...(c || {}) };
+  isSecretKey = keyMatcher(NETCFG.redactKeys);
 }
-chrome.webRequest?.onCompleted.addListener(
-  (d) => { if (d.statusCode >= 400) recordNet(d, { status: d.statusCode, statusLine: d.statusLine }); },
-  { urls: ["<all_urls>"] },
-);
-chrome.webRequest?.onErrorOccurred.addListener(
-  // An abort is a page cancelling its own request (navigation, a superseded
-  // fetch), not a failure worth reporting.
-  (d) => { if (d.error !== "net::ERR_ABORTED") recordNet(d, { error: d.error }); },
-  { urls: ["<all_urls>"] },
-);
+const hostBlocked = (url) => {
+  try {
+    const h = new URL(url).hostname;
+    return (NETCFG?.blockedDomains || []).some((d) => h === d || h.endsWith("." + d));
+  } catch {
+    return false;
+  }
+};
+
+// Values the agent typed into password fields, kept in memory for a few
+// minutes so the request that sends them is redacted whatever its field names.
+const TYPED_SECRETS = [];
+function rememberSecret(value) {
+  if (typeof value !== "string" || value.length < 4) return;
+  TYPED_SECRETS.push({ value, until: Date.now() + 600_000 });
+}
+function typedSecrets() {
+  const t = Date.now();
+  while (TYPED_SECRETS.length && TYPED_SECRETS[0].until < t) TYPED_SECRETS.shift();
+  return TYPED_SECRETS.map((s) => s.value);
+}
+function scrubText(text, contentType) {
+  if (typeof text !== "string") return text;
+  return redactValues(redactBody(text, contentType, isSecretKey), typedSecrets());
+}
+
+// Background jobs' tabs: a matching record there is "pending" until the daemon
+// writes it to the job's file. Kept in the store's meta, so it survives sleep.
+let JOB_TABS = null;
+async function jobTabs() {
+  if (!JOB_TABS) JOB_TABS = new Map(Object.entries((await netstore.getMeta("jobTabs").catch(() => null)) || {}).map(([k, v]) => [Number(k), v]));
+  return JOB_TABS;
+}
+async function saveJobTabs() {
+  await netstore.setMeta("jobTabs", Object.fromEntries(JOB_TABS || []));
+}
+const JOB_SOCKETS = new Set();
+function jobFor(jobs, tabId, rec) {
+  const j = jobs.get(tabId);
+  if (!j) return null;
+  if (rec.socketId !== undefined && rec.kind !== "ws-open" && rec.kind !== "sse-open") {
+    return JOB_SOCKETS.has(`${tabId}|${rec.socketId}`) ? j : null;
+  }
+  const hit = (j.patterns || []).some((p) => {
+    try {
+      return new RegExp(p, "i").test(rec.url || "");
+    } catch {
+      return String(rec.url || "").includes(p);
+    }
+  });
+  if (hit && rec.socketId !== undefined) JOB_SOCKETS.add(`${tabId}|${rec.socketId}`);
+  return hit ? j : null;
+}
+
+async function store(records) {
+  if (!records.length) return;
+  const jobs = await jobTabs();
+  for (const r of records) {
+    const j = jobFor(jobs, r.tabId, r);
+    r.status = j ? "pending" : "buffer";
+    if (j) r.jobId = j.jobId;
+  }
+  await netstore.addMany(records);
+}
+
+/** What the hook in a page sent. Only `sender` says which tab: a page cannot forge it. */
+async function netIntake(records, sender) {
+  await netReady;
+  if (!NETCFG.enabled || !Array.isArray(records) || !sender.tab) return;
+  const out = [];
+  for (const r of records.slice(0, 200)) {
+    if (!r || typeof r !== "object") continue;
+    const rec = {
+      ...r,
+      tabId: sender.tab.id,
+      frameId: sender.frameId,
+      documentId: sender.documentId,
+      frameUrl: sender.frameId ? sender.url : undefined,
+      ts: typeof r.ts === "number" ? r.ts : Date.now(),
+    };
+    if (rec.url) rec.url = redactUrl(String(rec.url), isSecretKey);
+    if (hostBlocked(rec.url)) {
+      delete rec.body;
+      delete rec.requestBody;
+      rec.skipped = "blocked";
+    }
+    if (rec.requestBody !== undefined) rec.requestBody = scrubText(rec.requestBody, "");
+    if (rec.body !== undefined) rec.body = scrubText(rec.body, rec.contentType);
+    if (rec.data !== undefined) rec.data = scrubText(rec.data, "");
+    out.push(rec);
+  }
+  await store(out);
+}
+
+chrome.runtime.onMessage.addListener((msg, sender) => {
+  if (msg?.type !== "ab-net") return false;
+  netIntake(msg.records, sender).catch((e) => console.warn("[agent-bridge] net intake", e));
+  return false;
+});
+
+// webRequest: partial records keyed by requestId until the request ends.
+const INFLIGHT = new Map();
+let WIRE_OUT = [];
+let wireTimer = null;
+function wireFlush() {
+  wireTimer = null;
+  const batch = WIRE_OUT;
+  WIRE_OUT = [];
+  store(batch).catch((e) => console.warn("[agent-bridge] net store", e));
+}
+function formBody(rb) {
+  if (!rb) return undefined;
+  if (rb.formData) {
+    return Object.entries(rb.formData)
+      .flatMap(([k, vs]) => vs.map((v) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`))
+      .join("&");
+  }
+  if (rb.raw?.length) {
+    try {
+      const bytes = rb.raw.map((p) => (p.bytes ? new Uint8Array(p.bytes) : new Uint8Array())).reduce((a, b) => {
+        const c = new Uint8Array(a.length + b.length);
+        c.set(a);
+        c.set(b, a.length);
+        return c;
+      });
+      return new TextDecoder().decode(bytes).slice(0, NETCFG?.maxBodyChars || 65536);
+    } catch {
+      return "[binary]";
+    }
+  }
+  return undefined;
+}
+function wireFinish(d, extra) {
+  const p = INFLIGHT.get(d.requestId) || { ts: d.timeStamp, method: d.method, type: d.type, tabId: d.tabId, frameId: d.frameId, documentId: d.documentId };
+  INFLIGHT.delete(d.requestId);
+  if (!NETCFG?.enabled && !(extra.status >= 400 || extra.error)) return;
+  const keep = (NETCFG?.wireTypes || NETCFG_DEFAULT.wireTypes).includes(d.type) || extra.status >= 400 || !!extra.error;
+  if (!keep) return;
+  const blockedHost = hostBlocked(d.url);
+  const rec = {
+    kind: "wire",
+    ...p,
+    url: redactUrl(d.url, isSecretKey),
+    tsEnd: d.timeStamp,
+    ...extra,
+    requestHeaders: blockedHost ? undefined : redactHeaders(p.requestHeaders, NETCFG?.redactHeaders),
+    responseHeaders: blockedHost ? undefined : redactHeaders(extra.responseHeaders, NETCFG?.redactHeaders),
+    requestBody: blockedHost || p.requestBody === undefined ? undefined : scrubText(p.requestBody, "application/x-www-form-urlencoded"),
+  };
+  WIRE_OUT.push(rec);
+  if (WIRE_OUT.length >= 50) wireFlush();
+  else if (!wireTimer) wireTimer = setTimeout(wireFlush, 500);
+}
+if (chrome.webRequest) {
+  const all = { urls: ["<all_urls>"] };
+  chrome.webRequest.onBeforeRequest.addListener((d) => {
+    if (d.tabId < 0) return;
+    // Long polls and streams that never end must not grow this forever.
+    if (INFLIGHT.size > 2000) {
+      const cutoff = Date.now() - 600_000;
+      for (const [id, v] of INFLIGHT) if (v.ts < cutoff) INFLIGHT.delete(id);
+    }
+    INFLIGHT.set(d.requestId, {
+      ts: d.timeStamp, method: d.method, type: d.type, tabId: d.tabId, frameId: d.frameId, documentId: d.documentId,
+      // A form a document posts is invisible to the page hook; this is its only record.
+      ...((d.type === "main_frame" || d.type === "sub_frame") && d.method === "POST" ? { requestBody: formBody(d.requestBody) } : {}),
+    });
+  }, all, ["requestBody"]);
+  chrome.webRequest.onSendHeaders.addListener((d) => {
+    const p = INFLIGHT.get(d.requestId);
+    if (p) p.requestHeaders = d.requestHeaders;
+  }, all, ["requestHeaders"]);
+  chrome.webRequest.onCompleted.addListener((d) => {
+    if (d.tabId < 0) return;
+    wireFinish(d, { status: d.statusCode, statusLine: d.statusLine, responseHeaders: d.responseHeaders, fromCache: d.fromCache, ip: d.ip });
+  }, all, ["responseHeaders"]);
+  chrome.webRequest.onErrorOccurred.addListener((d) => {
+    if (d.tabId < 0) return;
+    // An abort is a page cancelling its own request (navigation, a superseded
+    // fetch), not a failure worth reporting.
+    if (d.error === "net::ERR_ABORTED") return void INFLIGHT.delete(d.requestId);
+    wireFinish(d, { error: d.error });
+  }, all);
+}
+
+// Entries for a tab, joined and filtered. Bodies are cut here, before they
+// cross the bridge: an agent asks for what it needs, not every byte.
+async function netQuery(tab, params) {
+  await netReady;
+  const since = params.since ?? 0;
+  // Wire records are stamped when the request started: look a little earlier
+  // so a request whose page record is inside the range keeps its headers.
+  const records = await netstore.queryTab(tab.id, { since: Math.max(0, since - 5000) });
+  const all = mergeStreams(records);
+  const matched = filterEntries(all, { ...params, since, limit: undefined });
+  const limit = Math.min(params.limit || 50, 500);
+  const bodyChars = Math.min(params.bodyChars || 4000, NETCFG.maxBodyChars || 65536);
+  const entries = matched.slice(0, limit).map((e) => {
+    const out = { ...e };
+    for (const k of ["body", "requestBody"]) {
+      if (typeof out[k] !== "string") continue;
+      if (!params.includeBodies) {
+        out[k + "Preview"] = out[k].slice(0, 200);
+        delete out[k];
+      } else if (out[k].length > bodyChars) {
+        out[k] = out[k].slice(0, bodyChars);
+        out[k + "Cut"] = true;
+      }
+    }
+    if (!params.includeHeaders) {
+      delete out.requestHeaders;
+      delete out.responseHeaders;
+    }
+    if (out.frames && !params.includeBodies) out.frames = out.frames.slice(-10);
+    return out;
+  });
+  return { tabId: tab.id, url: tab.url, entries, matched: matched.length, total: all.length, blocked: hostBlocked(tab.url || "") };
+}
+
+/** The old diagnostics shape: failed requests only. */
+async function netFailures(tabId, since) {
+  const records = await netstore.queryTab(tabId, { since: Math.max(0, since - 5000) }).catch(() => []);
+  return mergeStreams(records)
+    .filter((e) => e.ts >= since && isFailed(e))
+    .map((e) => ({ ts: e.ts, url: e.url, method: e.method, type: e.wireType || e.type, ...(e.error ? { error: e.error } : { status: e.status, statusLine: e.statusText }) }));
+}
+
+async function netDispatch(method, params) {
+  if (method === "net.watch") {
+    const jobs = await jobTabs();
+    jobs.set(params.tabId, { jobId: params.jobId, patterns: params.patterns || [] });
+    await saveJobTabs();
+    return { watching: params.tabId };
+  }
+  if (method === "net.unwatch") {
+    const jobs = await jobTabs();
+    for (const [tabId, j] of jobs) if (tabId === params.tabId || j.jobId === params.jobId) jobs.delete(tabId);
+    await saveJobTabs();
+    return { watching: false };
+  }
+  if (method === "net.drain") {
+    const records = await netstore.takePending(params.jobId, { olderThan: Date.now() - (params.olderThanMs ?? 2000), maxBytes: params.maxBytes });
+    return { entries: mergeStreams(records), ids: records.map((r) => r.id) };
+  }
+  if (method === "net.ack") return { written: await netstore.markWritten(params.ids || []) };
+  if (method === "net.stats") return { ...(await netstore.stats()), jobTabs: Object.fromEntries(await jobTabs()) };
+  const tab = await tabFor(params);
+  if (method === "net.query") return await netQuery(tab, params);
+  if (method === "net.clear") return { cleared: await netstore.clearTab(tab.id, { keepPending: true }) };
+  throw new Error(`unknown method: ${method}`);
+}
+
+async function netPrune() {
+  await netReady;
+  await netstore.prune({ perTab: NETCFG.maxEntriesPerTab, total: NETCFG.maxTotalEntries, retainMs: NETCFG.retainHours * 3600_000 });
+}
+chrome.alarms.create("ab-net-prune", { periodInMinutes: 15 });
+
+// A new browser session reuses tab ids from 1: last session's records would
+// be read as this session's. storage.session is empty again after a restart.
+chrome.storage.session.get("abBoot").then(async ({ abBoot }) => {
+  if (abBoot) return;
+  await netstore.wipeUnpending().catch(() => {});
+  JOB_TABS = new Map();
+  await saveJobTabs().catch(() => {});
+  await chrome.storage.session.set({ abBoot: Date.now() });
+}).catch(() => {});
+
+// Patterns for the blocklist: a domain and its subdomains.
+const DOMAIN = /^[a-z0-9.-]+$/i;
+const blockedPatterns = (list) => (list || []).filter((d) => DOMAIN.test(d)).flatMap((d) => [`*://${d}/*`, `*://*.${d}/*`]);
+
+async function applyNetConfig(net) {
+  const c = { ...NETCFG_DEFAULT, ...(net || {}) };
+  await chrome.storage.local.set({ netConfig: c });
+  setNetConfig(c);
+  const want = c.enabled ? JSON.stringify({ exclude: blockedPatterns(c.blockedDomains), v: 1 }) : "off";
+  const have = await chrome.scripting.getRegisteredContentScripts({ ids: ["ab-net-hook", "ab-net-relay"] }).catch(() => []);
+  const { netRegistered } = await chrome.storage.local.get("netRegistered");
+  // Re-registering leaves a gap in which pages load unrecorded: only when it changed.
+  if (netRegistered === want && have.length === (c.enabled ? 2 : 0)) return;
+  await chrome.scripting.unregisterContentScripts({ ids: ["ab-net-hook", "ab-net-relay"] }).catch(() => {});
+  if (c.enabled) {
+    const common = {
+      matches: ["http://*/*", "https://*/*"],
+      excludeMatches: blockedPatterns(c.blockedDomains),
+      runAt: "document_start",
+      allFrames: true,
+      // Kept across browser restarts, so a job's page is recorded from its
+      // first load, before the server has had a chance to connect.
+      persistAcrossSessions: true,
+    };
+    await chrome.scripting.registerContentScripts([
+      { id: "ab-net-relay", js: ["src/content/net-relay.js"], world: "ISOLATED", ...common },
+      { id: "ab-net-hook", js: ["src/main/net-hook.js"], world: "MAIN", ...common },
+    ]);
+  }
+  await chrome.storage.local.set({ netRegistered: want });
+}
 
 // Console and page-error capture is a MAIN-world hook, which a page could
 // detect, so it runs only on development hosts (and hosts the user lists).
 const DEV_PATTERNS = ["*://localhost/*", "*://127.0.0.1/*", "*://[::1]/*", "*://*.localhost/*", "*://*.local/*", "*://*.test/*"];
 const PRIVATE_IP = /^(10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)$/;
 async function applyConfig(config) {
+  await applyNetConfig(config.network).catch((e) => console.warn("[agent-bridge] network capture", e));
   const extra = (config.diagnosticsHosts || []).flatMap((h) => [`*://${h}/*`, `*://*.${h}/*`]);
   await chrome.scripting.unregisterContentScripts({ ids: ["ab-diag"] }).catch(() => {});
   await chrome.scripting.registerContentScripts([{
@@ -610,6 +917,7 @@ async function dispatch(method, params) {
   // Muted unless the session asked for sound: an agent's page should never
   // start playing at the person beside it. A session with a viewport gets a
   // popup-type window, the kind Chrome lets go narrower than 500px.
+  if (method.startsWith("net.")) return await netDispatch(method, params);
   if (method === "engine.openSessionWindow") {
     const like = await chrome.windows.getLastFocused().catch(() => null);
     const win = await chrome.windows.create({
@@ -792,7 +1100,9 @@ async function dispatch(method, params) {
     // A drag hands the pointer to whatever element captures it; the page's
     // setPointerCapture refuses a synthetic pointer unless shimmed first.
     if (params.action === "drag" || params.action === "pointer") await injectMain(tab.id, pointerCaptureShim);
-    return await callEngine(tab.id, "act", params);
+    const r = await callEngine(tab.id, "act", params);
+    if (r?.passwordField) rememberSecret(params.value);
+    return r;
   }
   if (method === "engine.robustClick") return await robustClick(tab.id, params);
   if (method === "engine.screenshot") return await screenshot(tab, params);
@@ -804,7 +1114,7 @@ async function dispatch(method, params) {
   if (method === "engine.diagnostics") {
     const since = params.since || 0;
     const page = await callEngine(tab.id, "diagnostics", { since }).catch(() => ({ console: [], media: [] }));
-    return { network: (NET.get(tab.id) || []).filter((n) => n.ts >= since), ...page };
+    return { network: await netFailures(tab.id, since), ...page };
   }
   // Everything else is a content-engine method of the same name.
   const ENGINE = {
@@ -1172,6 +1482,7 @@ chrome.webNavigation.onReferenceFragmentUpdated.addListener((d) => {
 chrome.alarms.create("ab-reconnect", { periodInMinutes: 1 });
 chrome.alarms.onAlarm.addListener((a) => {
   if (a.name === "ab-reconnect") ensureConnected();
+  if (a.name === "ab-net-prune") netPrune().catch(() => {});
 });
 chrome.runtime.onStartup.addListener(ensureConnected);
 chrome.runtime.onInstalled.addListener(ensureConnected);
@@ -1184,7 +1495,10 @@ chrome.runtime.onInstalled.addListener(ensureConnected);
 // September build for a month; a test browser kept dialling last run's port).
 // On every start and every reconnect, compare the code running, and every
 // file the extension is made of, with what is on disk; reload once if they differ.
-const EXTENSION_FILES = ["manifest.json", "src/sw.js", "src/generated-secret.js", "src/content/engine.js", "src/content/diag-hook.js"];
+const EXTENSION_FILES = [
+  "manifest.json", "src/sw.js", "src/generated-secret.js", "src/content/engine.js", "src/content/diag-hook.js",
+  "src/content/net-relay.js", "src/main/net-hook.js", "src/lib/netstore.js", "src/lib/redact.js", "src/lib/net-merge.js",
+];
 async function diskHash() {
   let h = 5381;
   for (const f of EXTENSION_FILES) {
@@ -1196,7 +1510,7 @@ async function diskHash() {
 async function reloadIfStale() {
   try {
     const sw = await (await fetch(chrome.runtime.getURL("src/sw.js"), { cache: "no-store" })).text();
-    const running = [connect, dispatch, callEngine, screenshot, screenshotElement, captureRegion, robustClick, evalInPage, applyConfig, setViewport, setMobile, mobilePatch, diskHash, reloadIfStale];
+    const running = [connect, dispatch, callEngine, screenshot, screenshotElement, captureRegion, robustClick, evalInPage, applyConfig, setViewport, setMobile, mobilePatch, diskHash, reloadIfStale, netIntake, netQuery, netDispatch, applyNetConfig];
     const codeStale = !running.every((fn) => sw.includes(String(fn)));
     const disk = await diskHash();
     const { loadedFor, reloadedFor } = await chrome.storage.local.get(["loadedFor", "reloadedFor"]);

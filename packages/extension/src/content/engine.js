@@ -1023,8 +1023,18 @@
   async function waitFor(p = {}) {
     const timeout = Math.min(p.timeout || 10000, 25000);
     const want = (p.text || "").toLowerCase();
+    // A pattern, for checks like "a reading is on screen" that no fixed text names.
+    let pattern = null;
+    if (p.textPattern) {
+      try {
+        pattern = new RegExp(p.textPattern, "i");
+      } catch (e) {
+        throw Object.assign(new Error(`bad textPattern: ${e.message}`), { code: "BAD_REQUEST" });
+      }
+    }
     const present = () => {
       if (want && !(document.body?.innerText || "").toLowerCase().includes(want)) return false;
+      if (pattern && !pattern.test(document.body?.innerText || "")) return false;
       if (p.name || p.role) {
         buildTree({});
         if (!locate({ role: p.role, name: p.name }).matches.length) return false;
@@ -1678,7 +1688,14 @@
       try {
         const m = msg.method;
         if (m === "ping")
-          sendResponse({ pong: true, url: location.href, title: document.title, ts: Date.now(), documentGeneration: pageState().documentGeneration });
+          sendResponse({
+            pong: true, url: location.href, title: document.title, ts: Date.now(),
+            documentGeneration: pageState().documentGeneration,
+            // Whether this document's traffic is being recorded: one opened
+            // before capture was switched on (or on a blocked host) is not.
+            netHook: !!window.__abNetRelay?.hooked,
+            visibility: document.visibilityState,
+          });
         else if (m === "observe") sendResponse(await observe(msg.params));
         else if (m === "pageMetrics") sendResponse(pageMetrics());
         else if (m === "scrollToY") sendResponse(await scrollToY(msg.params));

@@ -148,6 +148,8 @@ export function mergeStreams(records, { windowMs = 3000 } = {}) {
     if (!e) continue;
     if (f.kind === "ws-close") {
       e.closed = { ts: f.ts, code: f.code, reason: f.reason };
+      // The hook stops sending frames past its cap and reports the count here.
+      if (f.dropped) e.dropped = Math.max(e.dropped, f.dropped);
       continue;
     }
     if (f.dropped) e.dropped += f.dropped;
