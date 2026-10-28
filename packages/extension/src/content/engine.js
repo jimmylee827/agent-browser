@@ -12,6 +12,7 @@
   if (window.__ab_engine_loaded && chrome.runtime?.id) return;
   window.__ab_engine_loaded = true;
   const AB = (window.__AB = window.__AB || { gen: 0, refs: new Map() });
+  AB.refOf = AB.refOf || new WeakMap();
   const REDACT_SEL = [
     "input[type=password]",
     "input[autocomplete*=cc-]",
@@ -79,13 +80,33 @@
 
   const clip = (s, n) => (s || "").replace(/\s+/g, " ").trim().slice(0, n);
 
-  // Native dialogs auto-handled by the MAIN-world tamer are reported here.
-  AB.dialogs = AB.dialogs || [];
-  window.addEventListener("ab-dialog", (e) => {
-    AB.dialogs.push(e.detail);
-    if (AB.dialogs.length > 20) AB.dialogs.shift();
-  });
-  const recentDialogs = () => AB.dialogs.slice(-5);
+  // Native dialogs are answered in the page's own world (main/page.js), and
+  // the relay (content/net-relay.js, this same world) keeps what they asked,
+  // with any credential a page tried to store and its console errors.
+  const relayState = () => window.__abNetRelay;
+  const dialogList = () => relayState()?.dialogs ?? [];
+  const credentialList = () => relayState()?.credentials ?? [];
+  const shapeDialog = ({ dialog, message, answer, ts }) => ({ kind: dialog, message, answer, ts });
+  const recentDialogs = () => dialogList().slice(-5).map(shapeDialog);
+  /** Tell the page-world scripts something, on this document's secret channel. */
+  const pageCfg = (m) => {
+    const ch = relayState()?.channel;
+    if (!ch) return;
+    try {
+      document.dispatchEvent(new CustomEvent(ch + ":cfg", { detail: JSON.stringify(m) }));
+    } catch {}
+  };
+
+  // The few marks the engine must put into a page (a hover state, the one
+  // element a page-world retry has to find) have random names, made once per
+  // document: no page can look for a name it knows. Refs never go into the
+  // page at all; they live in AB.refs and AB.refOf, which only this world sees.
+  const rnd = () => "x" + Math.random().toString(36).slice(2, 10);
+  AB.names = AB.names || { hover: rnd(), target: rnd(), marks: rnd(), sheet: rnd() };
+  const setRef = (el, r) => {
+    AB.refs.set(r, el);
+    AB.refOf.set(el, r);
+  };
 
   // An editing host — a contenteditable element, or the body of a document in
   // design mode (the iframe a rich-text editor such as TinyMCE types into).
@@ -338,13 +359,7 @@
     const maxNodes = opts.maxNodes || 220;
     AB.gen = Date.now();
     AB.refs = new Map();
-    // Clear old refs in iframes too: robustClick finds an element by its ref
-    // attribute in every frame, so a stale one there could be clicked instead.
-    for (const d of [document, ...(AB.frameDocs || [])]) {
-      try {
-        d.querySelectorAll("[data-ab-ref]").forEach((n) => n.removeAttribute("data-ab-ref"));
-      } catch {}
-    }
+    AB.refOf = new WeakMap();
     AB.frameDocs = new Set();
 
     // Every qualifying element gets a ref, so locate/act can reach the whole
@@ -360,8 +375,7 @@
         // gets a ref, so it can be screenshotted and named in a result.
         if (!visible(el)) continue;
         ref += 1;
-        el.setAttribute("data-ab-ref", String(ref));
-        AB.refs.set(ref, el);
+        setRef(el, ref);
         if (out.length < maxNodes)
           out.push({
             ref, depth, role: "iframe", name: clip(el.getAttribute("title") || el.src, 60), crossOrigin: true,
@@ -380,8 +394,7 @@
       if (!interactive && !name) continue;
 
       ref += 1;
-      el.setAttribute("data-ab-ref", String(ref));
-      AB.refs.set(ref, el);
+      setRef(el, ref);
       if (out.length >= maxNodes || (opts.viewportOnly && !inViewport(el))) {
         omitted += 1;
         continue;
@@ -425,18 +438,27 @@
 
   // A ref for any element, given on demand (an occluder, a dismiss button).
   function refFor(el) {
-    const have = +el.getAttribute("data-ab-ref") || 0;
+    const have = AB.refOf?.get(el);
     if (have && AB.refs.get(have) === el) return have;
     const r = Math.max(0, ...AB.refs.keys()) + 1;
-    el.setAttribute("data-ab-ref", String(r));
-    AB.refs.set(r, el);
+    setRef(el, r);
     return r;
   }
 
+  // The one element a page-world retry (robustClick in sw.js) must find, for
+  // the instant it takes to find it: a random attribute it removes at once.
+  function markTarget(p = {}) {
+    const el = resolve(p.ref, p.gen);
+    const attr = AB.names.target;
+    el.setAttribute(attr, "");
+    setTimeout(() => el.removeAttribute(attr), 5000);
+    return { attr };
+  }
+
   function drawMarks() {
-    document.getElementById("__ab_marks")?.remove();
+    document.getElementById(AB.names.marks)?.remove();
     const layer = document.createElement("div");
-    layer.id = "__ab_marks";
+    layer.id = AB.names.marks;
     layer.style.cssText =
       "position:fixed;inset:0;z-index:2147483647;pointer-events:none;";
     for (const [r, el] of AB.refs) {
@@ -455,7 +477,7 @@
     }
     document.documentElement.appendChild(layer);
   }
-  const clearMarks = () => document.getElementById("__ab_marks")?.remove();
+  const clearMarks = () => document.getElementById(AB.names.marks)?.remove();
 
   // Resolve after the next painted frame, or after `ms` if frames are
   // throttled (a hidden or occluded window never runs rAF).
@@ -574,15 +596,40 @@
   // macOS flashes its overlay scrollbar on every programmatic scroll, so each
   // slice of a stitched capture carried a scrollbar thumb down the right edge.
   function hideScrollbar() {
-    if (document.getElementById("__ab_noscrollbar")) return { ok: true };
-    const s = document.createElement("style");
-    s.id = "__ab_noscrollbar";
-    s.textContent =
-      "html,body{scrollbar-width:none!important}html::-webkit-scrollbar,body::-webkit-scrollbar{display:none!important}";
-    document.documentElement.appendChild(s);
+    if (AB.scrollSheet) return { ok: true };
+    AB.scrollSheet = addSheet(document, "html,body{scrollbar-width:none!important}html::-webkit-scrollbar,body::-webkit-scrollbar{display:none!important}");
     return { ok: true };
   }
-  const restoreScrollbar = () => (document.getElementById("__ab_noscrollbar")?.remove(), { ok: true });
+  const restoreScrollbar = () => {
+    removeSheet(document, AB.scrollSheet);
+    AB.scrollSheet = null;
+    return { ok: true };
+  };
+
+  // Styles the engine needs for a moment go in a constructed stylesheet
+  // (adoptedStyleSheets): no element in the page's DOM, nothing a
+  // MutationObserver sees. A <style> with a random id where that fails.
+  function addSheet(doc, css) {
+    try {
+      const sheet = new doc.defaultView.CSSStyleSheet();
+      sheet.replaceSync(css);
+      doc.adoptedStyleSheets = [...doc.adoptedStyleSheets, sheet];
+      return sheet;
+    } catch {
+      const style = doc.createElement("style");
+      style.id = AB.names.sheet;
+      style.textContent = css;
+      (doc.head || doc.documentElement).appendChild(style);
+      return style;
+    }
+  }
+  function removeSheet(doc, sheet) {
+    if (!sheet) return;
+    try {
+      if (sheet.ownerNode !== undefined && sheet.tagName === "STYLE") sheet.remove();
+      else doc.adoptedStyleSheets = doc.adoptedStyleSheets.filter((s) => s !== sheet);
+    } catch {}
+  }
 
   function restoreFixed() {
     for (const [el, v, prio] of AB.hiddenFixed || []) {
@@ -639,11 +686,10 @@
     found.sort((a, b) => outer(a) - outer(b));
     let next = Math.max(0, ...AB.refs.keys()) + 1;
     return found.slice(0, 20).map((el) => {
-      let r = +el.getAttribute("data-ab-ref") || 0;
+      let r = AB.refOf?.get(el) || 0;
       if (!r || AB.refs.get(r) !== el) {
         r = next++;
-        el.setAttribute("data-ab-ref", String(r));
-        AB.refs.set(r, el);
+        setRef(el, r);
       }
       return { ref: r, role: roleName, name: structuralName(el) };
     });
@@ -897,7 +943,7 @@
     // Whatever an earlier hover left marked ends with the next action, as it
     // would when the mouse moves on. Before the observer starts, so it is
     // not counted as this action's effect.
-    if (AB.hovered || document.getElementById("__ab_hover")) clearHover();
+    if (AB.hovered || AB.hoverSheets?.size) clearHover();
     // A pointer sequence may have no target: then it acts on the page.
     const el = p.action === "pointer" && p.ref == null ? null : resolve(p.ref, p.gen); // throws STALE_SNAPSHOT / REF_NOT_FOUND
     if (!el) return { acted: true, action: "pointer", changed: true, signals: {}, ...(await pointerSequence(null, p)), snapshotStale: true };
@@ -909,18 +955,14 @@
     // dialog handler reads these attributes when the dialog opens. Set before
     // the observer starts, or setting them counts as a change on the page and
     // hides a genuine no-op.
-    const root = document.documentElement;
-    root.setAttribute("data-ab-dialog", p.onDialog === "dismiss" ? "dismiss" : "accept");
-    if (p.dialogText != null) root.setAttribute("data-ab-dialog-text", String(p.dialogText));
-    else root.removeAttribute("data-ab-dialog-text");
-    const dialogsBefore = AB.dialogs.length;
-    const credsBefore = (AB.credentials || []).length;
+    pageCfg({ dialog: p.onDialog === "dismiss" ? "dismiss" : "accept", dialogText: p.dialogText ?? null });
+    const actedAt = Date.now();
     let mutated = 0;
     let extra = {};
     // Our own markers (hover, gesture, refs) are not the page's doing.
     const ours = (r) =>
       (r.type === "attributes" && SELF_ATTRS.has(r.attributeName)) ||
-      [...r.addedNodes, ...r.removedNodes].some((n) => n.id === "__ab_hover");
+      [...r.addedNodes, ...r.removedNodes].some((n) => n.id === AB.names.sheet);
     const mo = new MutationObserver((recs) => (mutated += recs.filter((r) => !ours(r)).length));
     // Watch the element's own document too: a change inside an iframe is not
     // a mutation of the top page.
@@ -959,8 +1001,10 @@
     // A field's value and a checkbox's state are properties, not DOM
     // mutations, so domMutations alone reads 0 for a fill that worked.
     const valueChanged = before.value !== after.value || el.checked !== checkedBefore;
-    const dialogs = AB.dialogs.slice(dialogsBefore);
-    const credentialStoreBlocked = (AB.credentials || []).slice(credsBefore);
+    const dialogs = dialogList().filter((d) => d.ts >= actedAt).map(shapeDialog);
+    const credentialStoreBlocked = credentialList()
+      .filter((c) => c.ts >= actedAt)
+      .map(({ what, type, id, ts }) => ({ kind: what, type, id, ts }));
     // A hover that changed no style and ran no handler did nothing a person
     // would see. Saying "acted" there was a lie an agent then reported.
     if (hover && !hover.styleChanged && mutated === 0) {
@@ -1330,10 +1374,10 @@
 
   // ---- hover. CSS :hover follows the real mouse, which a page script cannot
   //      move. So: copy every :hover rule the page's stylesheets can be read
-  //      for as a [data-ab-hover] rule, and mark the element and its
+  //      for as a rule on a random attribute, and mark the element and its
   //      ancestors. Then check something actually changed; if not, say so.
-  const HOVER_ATTR = "data-ab-hover";
-  const SELF_ATTRS = new Set([HOVER_ATTR, "data-ab-gesture", "data-ab-captured", "data-ab-ref", "data-ab-dialog", "data-ab-dialog-text"]);
+  const HOVER_ATTR = AB.names.hover;
+  const SELF_ATTRS = new Set([HOVER_ATTR, AB.names.target]);
   function hoverCss(doc) {
     let unreadable = 0;
     let rules = 0;
@@ -1353,7 +1397,7 @@
     };
     const out = [];
     for (const sheet of [...doc.styleSheets, ...(doc.adoptedStyleSheets || [])]) {
-      if (sheet.ownerNode?.id === "__ab_hover") continue;
+      if (AB.hoverSheets?.has(sheet) || sheet.ownerNode?.id === AB.names.sheet) continue;
       let list;
       try {
         list = sheet.cssRules;
@@ -1377,7 +1421,6 @@
     for (const d of [document, ...(AB.frameDocs || [])]) {
       try {
         d.querySelectorAll(`[${HOVER_ATTR}]`).forEach((n) => n.removeAttribute(HOVER_ATTR));
-        d.getElementById("__ab_hover")?.remove();
       } catch {}
     }
     if (AB.hovered?.isConnected) {
@@ -1386,6 +1429,8 @@
       fire(AB.hovered, "mouseout");
       fire(AB.hovered, "mouseleave", { bubbles: false });
     }
+    for (const [d, sheet] of AB.hoverSheets || []) removeSheet(d, sheet);
+    AB.hoverSheets = new Map();
     AB.hovered = null;
   }
   async function emulateHover(el, cx, cy) {
@@ -1393,10 +1438,8 @@
     const before = styleSnapshot(el);
     const { css, rules, unreadable } = hoverCss(doc);
     if (css) {
-      const style = doc.createElement("style");
-      style.id = "__ab_hover";
-      style.textContent = css;
-      (doc.head || doc.documentElement).appendChild(style);
+      AB.hoverSheets ??= new Map();
+      AB.hoverSheets.set(doc, addSheet(doc, css));
     }
     for (let n = el; n && n.nodeType === 1; n = n.parentElement) n.setAttribute(HOVER_ATTR, "");
     AB.hovered = el;
@@ -1422,7 +1465,26 @@
     };
     return { x: v(at?.x, b.width, b.left), y: v(at?.y, b.height, b.top) };
   }
-  const captured = (doc) => doc.querySelector("[data-ab-captured]");
+  // The element that captured the pointer: main/page.js accepts a capture for
+  // a synthetic pointer and announces it as the browser would, with
+  // gotpointercapture. Listened for only while a gesture runs.
+  const captured = () => (AB.captured?.isConnected ? AB.captured : null);
+  function watchCapture(doc) {
+    AB.captured = null;
+    const got = (e) => {
+      if (!e.isTrusted) AB.captured = e.composedPath()[0];
+    };
+    const lost = (e) => {
+      if (!e.isTrusted && AB.captured === e.composedPath()[0]) AB.captured = null;
+    };
+    doc.addEventListener("gotpointercapture", got, true);
+    doc.addEventListener("lostpointercapture", lost, true);
+    return () => {
+      doc.removeEventListener("gotpointercapture", got, true);
+      doc.removeEventListener("lostpointercapture", lost, true);
+      AB.captured = null;
+    };
+  }
   const box = (el) => {
     const r = el.getBoundingClientRect();
     return { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) };
@@ -1462,8 +1524,7 @@
       fire(el, "input");
       fire(el, "change");
     } else {
-      const root = doc.documentElement;
-      root.setAttribute("data-ab-gesture", "");
+      const unwatch = watchCapture(doc);
       const base = { pointerId: 1, pointerType: p.pointerType || "mouse", isPrimary: true, ...modifiersOf(p.modifiers) };
       const dnd = el.closest('[draggable="true"]') || (el.draggable && el.tagName !== "IMG" && el.tagName !== "A" ? el : null);
       try {
@@ -1510,8 +1571,7 @@
         fire(finalTarget, "mouseup", { ...at(end.x, end.y), button: 0, buttons: 0, ...modifiersOf(p.modifiers) });
         if (dnd && !accepted) AB.dragNote = "the drop target did not accept the drag (no dragover handler cancelled it), so nothing was dropped";
       } finally {
-        root.removeAttribute("data-ab-gesture");
-        doc.querySelectorAll("[data-ab-captured]").forEach((n) => n.removeAttribute("data-ab-captured"));
+        unwatch();
       }
     }
     await sleep(60);
@@ -1530,8 +1590,7 @@
   // An explicit sequence of pointer events: down / move / up / wheel.
   async function pointerSequence(el, p) {
     const doc = el ? el.ownerDocument : document;
-    const root = doc.documentElement;
-    root.setAttribute("data-ab-gesture", "");
+    const unwatch = watchCapture(doc);
     let last = el || doc.body;
     const done = [];
     try {
@@ -1564,8 +1623,7 @@
       }
     } finally {
       AB.pointerDown = false;
-      root.removeAttribute("data-ab-gesture");
-      doc.querySelectorAll("[data-ab-captured]").forEach((n) => n.removeAttribute("data-ab-captured"));
+      unwatch();
     }
     return { pointer: done };
   }
@@ -1642,7 +1700,6 @@
   };
   if (!AB.diagListening) {
     AB.diagListening = true;
-    window.addEventListener("ab-diag", (e) => pushDiag(e.detail || {}));
     // A <video> or <audio> that fails to load fires `error` on itself (or its
     // <source>); it does not bubble, so listen while it travels down.
     document.addEventListener(
@@ -1661,15 +1718,12 @@
       },
       true,
     );
-    window.addEventListener("ab-credential", (e) => {
-      AB.credentials = AB.credentials || [];
-      AB.credentials.push(e.detail);
-    });
-    window.dispatchEvent(new CustomEvent("ab-diag-flush"));
+
   }
   function diagnostics(p = {}) {
     const since = p.since || 0;
-    const list = AB.diag.filter((d) => d.ts >= since).map(({ key: _k, replay: _r, ...d }) => d);
+    const fromPage = (relayState()?.diag ?? []).map((r) => r.entry).filter(Boolean);
+    const list = [...AB.diag.map(({ key: _k, ...d }) => d), ...fromPage].filter((d) => d.ts >= since).sort((a, b) => a.ts - b.ts);
     return { console: list.filter((d) => d.kind !== "media"), media: list.filter((d) => d.kind === "media") };
   }
 
@@ -1718,6 +1772,7 @@
         else if (m === "pointInView") sendResponse(await pointInView(msg.params));
         else if (m === "detectWall") sendResponse({ needsHuman: detectWall() });
         else if (m === "diagnostics") sendResponse(diagnostics(msg.params));
+        else if (m === "markTarget") sendResponse(markTarget(msg.params));
         else if (m === "clearMarks") {
           clearMarks();
           sendResponse({ ok: true });

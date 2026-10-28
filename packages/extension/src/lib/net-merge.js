@@ -42,7 +42,7 @@ function entryFromPage(r) {
       durationMs: r.tsEnd && r.ts ? r.tsEnd - r.ts : undefined,
     });
   }
-  for (const k of ["requestBody", "requestBodyChars", "body", "bodyChars", "truncated", "skipped", "redacted"]) {
+  for (const k of ["requestBody", "requestBodyChars", "body", "bodyChars", "truncated", "skipped", "redacted", "late"]) {
     if (r[k] !== undefined) e[k] = r[k];
   }
   if (r.kind === "ws-open" || r.kind === "sse-open") {

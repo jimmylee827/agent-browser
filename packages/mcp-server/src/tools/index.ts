@@ -1737,7 +1737,9 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
       const entries = r.entries.map((e) => secondPassRedact(e, ctx.cfg.network.redactHeaders));
       const note = r.blocked
         ? "this page's host is on network.blockedDomains: only failures and metadata are recorded here, no bodies or headers"
-        : undefined;
+        : entries.some((e) => e.late)
+          ? "recording started after this page loaded (the extension was updated under it): earlier requests are missing; reload the page for a full record"
+          : undefined;
       ctx.audit.log("tool.browser_network", { action: args.action, tabId: call.tabId, matched: r.matched, ...(exporting ? { format: args.format } : {}) });
       if (exporting) {
         const oldestFirst = [...entries].reverse();

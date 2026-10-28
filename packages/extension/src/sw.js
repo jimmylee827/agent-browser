@@ -196,18 +196,45 @@ async function setMobile(tab, opts) {
 // Page world. Touch support, a phone's navigator, and the hover/pointer media
 // features a phone reports — in matchMedia and in the page's stylesheets.
 function mobilePatch(ua) {
-  if (window.__abMobile) return;
-  window.__abMobile = true;
-  const nav = Object.getPrototypeOf(navigator);
-  const define = (obj, key, value) => { try { Object.defineProperty(obj, key, { configurable: true, get: () => value }); } catch {} };
-  define(nav, "userAgent", ua);
-  define(nav, "appVersion", ua.replace(/^Mozilla\//, ""));
-  define(nav, "platform", "Linux armv8l");
-  define(nav, "maxTouchPoints", 5);
-  if (navigator.userAgentData) {
-    const data = navigator.userAgentData;
-    define(data, "mobile", true);
-    define(data, "platform", "Android");
+  // Already done for this document: its navigator says so. (No marker on
+  // window: a page could look for one.)
+  if (navigator.userAgent === ua) return;
+  // The same disguise as main/page.js: each replaced function is a Proxy of
+  // the browser's own, and reads as native code.
+  const apply = Reflect.apply;
+  const WM = WeakMap;
+  const wmGet = WM.prototype.get;
+  const wmSet = WM.prototype.set;
+  const originals = new WM();
+  const prev = Function.prototype.toString;
+  const ts = new Proxy(prev, {
+    apply(t, self, args) {
+      const o = apply(wmGet, originals, [self]);
+      return apply(t, o === undefined ? self : o, args);
+    },
+  });
+  apply(wmSet, originals, [ts, prev]);
+  Function.prototype.toString = ts;
+  const disguise = (orig, handler) => {
+    const p = new Proxy(orig, handler);
+    apply(wmSet, originals, [p, orig]);
+    return p;
+  };
+  // On the prototype, where the browser keeps them: an own property on the
+  // object would show in Object.getOwnPropertyNames.
+  const getter = (proto, key, value) => {
+    try {
+      const d = Object.getOwnPropertyDescriptor(proto, key);
+      if (d?.get) Object.defineProperty(proto, key, { ...d, get: disguise(d.get, { apply: () => value }) });
+    } catch {}
+  };
+  getter(Navigator.prototype, "userAgent", ua);
+  getter(Navigator.prototype, "appVersion", ua.replace(/^Mozilla\//, ""));
+  getter(Navigator.prototype, "platform", "Linux armv8l");
+  getter(Navigator.prototype, "maxTouchPoints", 5);
+  if (window.NavigatorUAData) {
+    getter(NavigatorUAData.prototype, "mobile", true);
+    getter(NavigatorUAData.prototype, "platform", "Android");
   }
   if (!("ontouchstart" in window)) window.ontouchstart = null;
   // (hover: hover) and (pointer: fine) are false on a phone; their opposites true.
@@ -216,8 +243,9 @@ function mobilePatch(ua) {
     String(q)
       .replace(/\((any-)?hover\s*:\s*hover\)/g, FALSE).replace(/\((any-)?hover\s*:\s*none\)/g, TRUE)
       .replace(/\((any-)?pointer\s*:\s*fine\)/g, FALSE).replace(/\((any-)?pointer\s*:\s*coarse\)/g, TRUE);
-  const mm = window.matchMedia.bind(window);
-  window.matchMedia = (q) => mm(rewrite(q));
+  window.matchMedia = disguise(window.matchMedia, {
+    apply: (t, self, args) => apply(t, self, [rewrite(args[0]), ...args.slice(1)]),
+  });
   const fixSheets = () => {
     for (const sheet of document.styleSheets) {
       let rules;
@@ -537,31 +565,35 @@ chrome.storage.session.get("abBoot").then(async ({ abBoot }) => {
 const DOMAIN = /^[a-z0-9.-]+$/i;
 const blockedPatterns = (list) => (list || []).filter((d) => DOMAIN.test(d)).flatMap((d) => [`*://${d}/*`, `*://*.${d}/*`]);
 
+const PAGE_SCRIPTS = ["ab-page-relay", "ab-page", "ab-net-hook", "ab-net-relay"];
 async function applyNetConfig(net) {
   const c = { ...NETCFG_DEFAULT, ...(net || {}) };
   await chrome.storage.local.set({ netConfig: c });
   setNetConfig(c);
-  const want = c.enabled ? JSON.stringify({ exclude: blockedPatterns(c.blockedDomains), v: 1 }) : "off";
-  const have = await chrome.scripting.getRegisteredContentScripts({ ids: ["ab-net-hook", "ab-net-relay"] }).catch(() => []);
+  const want = JSON.stringify({ v: 2, net: c.enabled ? blockedPatterns(c.blockedDomains) : "off" });
+  const have = await chrome.scripting.getRegisteredContentScripts({ ids: PAGE_SCRIPTS }).catch(() => []);
   const { netRegistered } = await chrome.storage.local.get("netRegistered");
-  // Re-registering leaves a gap in which pages load unrecorded: only when it changed.
-  if (netRegistered === want && have.length === (c.enabled ? 2 : 0)) return;
-  await chrome.scripting.unregisterContentScripts({ ids: ["ab-net-hook", "ab-net-relay"] }).catch(() => {});
-  if (c.enabled) {
-    const common = {
-      matches: ["http://*/*", "https://*/*"],
-      excludeMatches: blockedPatterns(c.blockedDomains),
-      runAt: "document_start",
-      allFrames: true,
-      // Kept across browser restarts, so a job's page is recorded from its
-      // first load, before the server has had a chance to connect.
-      persistAcrossSessions: true,
-    };
-    await chrome.scripting.registerContentScripts([
-      { id: "ab-net-relay", js: ["src/content/net-relay.js"], world: "ISOLATED", ...common },
-      { id: "ab-net-hook", js: ["src/main/net-hook.js"], world: "MAIN", ...common },
-    ]);
-  }
+  // Re-registering leaves a gap in which pages load unhooked: only when it changed.
+  if (netRegistered === want && have.length === (c.enabled ? 3 : 2)) return;
+  await chrome.scripting.unregisterContentScripts({ ids: PAGE_SCRIPTS }).catch(() => {});
+  const common = {
+    matches: ["http://*/*", "https://*/*"],
+    runAt: "document_start",
+    allFrames: true,
+    // Kept across browser restarts, so a job's page is covered from its
+    // first load, before the server has had a chance to connect.
+    persistAcrossSessions: true,
+  };
+  // The relay and the page kit (dialogs, credential refusal, pointer capture)
+  // go on every page: the agent needs them on a login page too. The network
+  // hook stays off the blocked domains.
+  await chrome.scripting.registerContentScripts([
+    { id: "ab-page-relay", js: ["src/content/net-relay.js"], world: "ISOLATED", ...common },
+    { id: "ab-page", js: ["src/main/page.js"], world: "MAIN", ...common },
+    ...(c.enabled
+      ? [{ id: "ab-net-hook", js: ["src/main/net-hook.js"], world: "MAIN", excludeMatches: blockedPatterns(c.blockedDomains), ...common }]
+      : []),
+  ]);
   await chrome.storage.local.set({ netRegistered: want });
 }
 
@@ -1112,7 +1144,6 @@ async function dispatch(method, params) {
   if (method === "engine.act") {
     // A drag hands the pointer to whatever element captures it; the page's
     // setPointerCapture refuses a synthetic pointer unless shimmed first.
-    if (params.action === "drag" || params.action === "pointer") await injectMain(tab.id, pointerCaptureShim);
     const r = await callEngine(tab.id, "act", params);
     if (r?.passwordField) rememberSecret(params.value);
     return r;
@@ -1144,47 +1175,8 @@ async function dispatch(method, params) {
   throw new Error(`unknown method: ${method}`);
 }
 
-// Run a function in the page's own JS world. Best effort: a page the
-// extension cannot script (chrome://, the web store) simply goes without.
-async function injectMain(tabId, func) {
-  await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, world: "MAIN", func }).catch(() => {});
-}
-
-// setPointerCapture throws for a pointer the browser does not know — which is
-// every synthetic one — and a scrubber whose pointerdown handler throws never
-// starts dragging. Let the call succeed for synthetic pointers, and mark the
-// element that asked so the engine can send the moves to it, as the browser
-// would for a captured pointer.
-function pointerCaptureShim() {
-  if (window.__abPointerShim) return;
-  window.__abPointerShim = true;
-  const proto = Element.prototype;
-  const set = proto.setPointerCapture;
-  const release = proto.releasePointerCapture;
-  const has = proto.hasPointerCapture;
-  const synthetic = new WeakSet();
-  proto.setPointerCapture = function (id) {
-    try {
-      return set.call(this, id);
-    } catch (e) {
-      if (!document.documentElement.hasAttribute("data-ab-gesture")) throw e;
-      document.querySelectorAll("[data-ab-captured]").forEach((n) => n.removeAttribute("data-ab-captured"));
-      this.setAttribute("data-ab-captured", "");
-      synthetic.add(this);
-    }
-  };
-  proto.releasePointerCapture = function (id) {
-    if (synthetic.has(this)) {
-      synthetic.delete(this);
-      this.removeAttribute("data-ab-captured");
-      return;
-    }
-    return release.call(this, id);
-  };
-  proto.hasPointerCapture = function (id) {
-    return synthetic.has(this) || has.call(this, id);
-  };
-}
+// The pointer-capture shim drags need lives in main/page.js now, on every
+// page from its start, and announces a capture with gotpointercapture.
 
 // browser_eval: an expression evaluated in the page's own world, its value
 // returned as JSON. The page's Content-Security-Policy applies — a page that
@@ -1269,14 +1261,19 @@ async function robustClick(tabId, params = {}) {
   // Give the OS focus change a tick to propagate before MAIN-world runs.
   await new Promise((r) => setTimeout(r, 100));
 
-  // Try every frame — the data-ab-ref may live in a same-origin iframe.
+  // The page's world cannot see the engine's refs. The engine marks the one
+  // element with a random attribute for the instant it takes to find it here;
+  // it is removed at once. Every frame is tried: it may be in an iframe.
+  const mark = await callEngine(tabId, "markTarget", { ref: params.ref, gen: params.gen });
+  if (!mark?.attr) throw tagged("REF_NOT_FOUND", "REF_NOT_FOUND: element gone, re-observe");
   const results = await chrome.scripting.executeScript({
     target: { tabId, allFrames: true },
     world: "MAIN",
-    func: async (refValue, hydrationTimeoutMs) => {
+    func: async (attr, hydrationTimeoutMs) => {
       const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-      const el = document.querySelector(`[data-ab-ref="${refValue}"]`);
+      const el = document.querySelector(`[${attr}]`);
       if (!el) return { error: "ref not found in this frame", frameUrl: location.href };
+      el.removeAttribute(attr);
       const tried = [];
       const reactPropsKey = () => Object.keys(el).find((k) => k.startsWith("__reactProps$"));
       const reactPropsOf = () => {
@@ -1391,7 +1388,7 @@ async function robustClick(tabId, params = {}) {
         },
       };
     },
-    args: [ref, params.hydrationTimeoutMs ?? 4000],
+    args: [mark.attr, params.hydrationTimeoutMs ?? 4000],
   });
 
   // Aggregate per-frame results. NOTE executeScript wraps each return value
@@ -1418,46 +1415,6 @@ async function robustClick(tabId, params = {}) {
 // Stealthy native-dialog auto-handler: a MAIN-world page script (NOT CDP, NOT
 // debugger) that suppresses alert/confirm/prompt/beforeunload hangs and reports
 // them to the isolated content engine via a shared-DOM CustomEvent.
-function dialogTamer() {
-  if (window.__abTamed) return;
-  window.__abTamed = true;
-  const report = (kind, message, answer) =>
-    window.dispatchEvent(
-      new CustomEvent("ab-dialog", { detail: { kind, message: String(message ?? ""), answer, ts: Date.now() } }),
-    );
-  // The agent's choice for this action, set by the content engine on <html>
-  // before it acts. Default accept: the agent clicked the thing that asks.
-  const dismiss = () => document.documentElement.getAttribute("data-ab-dialog") === "dismiss";
-  window.alert = (m) => report("alert", m, "ok");
-  window.confirm = (m) => {
-    const ok = !dismiss();
-    report("confirm", m, ok ? "ok" : "cancel");
-    return ok;
-  };
-  window.prompt = (m, d) => {
-    if (dismiss()) return report("prompt", m, null), null;
-    const text = document.documentElement.getAttribute("data-ab-dialog-text") ?? d ?? "";
-    report("prompt", m, text);
-    return text;
-  };
-  window.addEventListener("beforeunload", (e) => {
-    e.stopImmediatePropagation();
-    delete e.returnValue;
-  }, true);
-  // A page can ask the browser to save a credential (credentials.store) with
-  // no prompt at all. In this persistent profile that would keep a test
-  // password for good; refuse it and say so in the action's result.
-  try {
-    if (navigator.credentials && typeof navigator.credentials.store === "function") {
-      navigator.credentials.store = (cred) => {
-        window.dispatchEvent(new CustomEvent("ab-credential", {
-          detail: { kind: "credentials.store", type: String(cred?.type ?? ""), id: String(cred?.id ?? ""), ts: Date.now() },
-        }));
-        return Promise.resolve(undefined);
-      };
-    }
-  } catch {}
-}
 
 chrome.webNavigation.onCommitted.addListener((d) => {
   // A mobile-emulated tab keeps its page-world patches on every load.
@@ -1467,9 +1424,6 @@ chrome.webNavigation.onCommitted.addListener((d) => {
   recordNav(d.url, d.tabId); // so redirect-based flows can be inspected after the fact
   NAV_COUNT.set(d.tabId, (NAV_COUNT.get(d.tabId) || 0) + 1);
   ensureConnected(); // navigation wakes the SW — opportunistically (re)connect
-  chrome.scripting
-    .executeScript({ target: { tabId: d.tabId }, world: "MAIN", func: dialogTamer })
-    .catch(() => {});
   // Private-network dev servers cannot be written as match patterns; hook
   // them here instead (a little later than document_start).
   let host = "";
@@ -1500,6 +1454,27 @@ chrome.alarms.onAlarm.addListener((a) => {
 chrome.runtime.onStartup.addListener(ensureConnected);
 chrome.runtime.onInstalled.addListener(ensureConnected);
 
+// After the extension reloads (an update), the page-world scripts in every
+// open tab have lost their relay: their records go nowhere, and pages report
+// netHook false until reloaded. Put them back into each tab as it is — never
+// reloading a page the agent may be halfway through. What happened before
+// this moment is not recorded; records say late:true.
+async function rearmOpenTabs() {
+  await netReady;
+  const tabs = await chrome.tabs.query({ url: ["http://*/*", "https://*/*"] });
+  for (const t of tabs) {
+    const target = { tabId: t.id, allFrames: true };
+    try {
+      await chrome.scripting.executeScript({ target, files: ["src/content/net-relay.js"], injectImmediately: true });
+      await chrome.scripting.executeScript({ target, files: ["src/main/page.js"], world: "MAIN", injectImmediately: true });
+      if (NETCFG.enabled && !hostBlocked(t.url || "")) await chrome.scripting.executeScript({ target, files: ["src/main/net-hook.js"], world: "MAIN", injectImmediately: true });
+    } catch {} // a tab Chrome will not let us script (the web store, a crashed page)
+  }
+}
+chrome.runtime.onInstalled.addListener((d) => {
+  if (d.reason === "update") rearmOpenTabs().catch((e) => console.warn("[agent-bridge] rearm", e));
+});
+
 // Chrome keeps running an unpacked extension's cached service worker after
 // sw.js changes on disk — across browser restarts, and even past a manifest
 // version bump — until someone presses Reload on chrome://extensions. The
@@ -1510,7 +1485,7 @@ chrome.runtime.onInstalled.addListener(ensureConnected);
 // file the extension is made of, with what is on disk; reload once if they differ.
 const EXTENSION_FILES = [
   "manifest.json", "src/sw.js", "src/generated-secret.js", "src/content/engine.js", "src/content/diag-hook.js",
-  "src/content/net-relay.js", "src/main/net-hook.js", "src/lib/netstore.js", "src/lib/redact.js", "src/lib/net-merge.js",
+  "src/content/net-relay.js", "src/main/net-hook.js", "src/main/page.js", "src/lib/netstore.js", "src/lib/redact.js", "src/lib/net-merge.js",
 ];
 async function diskHash() {
   let h = 5381;

@@ -57,6 +57,8 @@ export interface JobState extends LadderState {
   heartbeatAt?: number;
   bridgeDownSince?: number;
   windowState?: string;
+  /** The extension version the page was loaded under. */
+  extVersion?: string;
 }
 
 interface Job {
@@ -497,6 +499,20 @@ export class JobRunner {
       this.log(j, "opened", { tabId: j.state.tabId, url: j.spec.url });
       tabAlive = true;
     }
+
+    // The extension was updated under the job's page: its record would start
+    // in the middle. The tab is the job's own, so load it again (within the cap).
+    const ext = this.ctx.bridge.extension?.version;
+    if (tabAlive && !first && ext && j.state.extVersion && ext !== j.state.extVersion) {
+      const recent = j.state.loads.filter((t) => t > now - 3_600_000 && t <= now);
+      if (recent.length < this.settings(j).maxLoadsPerHour) {
+        await this.ctx.bridge.request("engine.navigate", { tabId: j.state.tabId, action: "reload" });
+        j.state.loads.push(now);
+        j.state.pageLoadedAt = now;
+        this.log(j, "rearmed", { from: j.state.extVersion, to: ext });
+      } else this.log(j, "rearm_capped", { from: j.state.extVersion, to: ext });
+    }
+    if (ext) j.state.extVersion = ext;
 
     const seen = await this.drain(j);
     let healthText: boolean | null = null;

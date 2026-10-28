@@ -1,15 +1,38 @@
-// Isolated world, at document_start: the other half of net-hook.js. It hands
-// the hook a per-document secret event name and the capture settings, and
-// passes what the hook records on to the service worker in batches.
+// Isolated world, at document_start: the hub between the page-world scripts
+// (main/page.js, main/net-hook.js, content/diag-hook.js) and the extension.
+// It hands each of them the same per-document secret event name — the only
+// way they talk, so a page hears nothing under a name it could know — and:
+//   - passes network records on to the service worker, in batches;
+//   - keeps dialog, credential and console records here, for the engine
+//     (same world, same frame) to read from window.__abNetRelay.
 //
 // It is separate from engine.js because engine.js runs at document_idle, and
-// the requests that matter (a page's first API calls) fire before that. The
-// page cannot see this world's globals, so window.__abNetRelay is ours alone;
-// the engine reads it to say whether this document is being recorded.
+// what matters (a page's first API calls, a dialog on load) comes before. The
+// page cannot see this world's globals, so window.__abNetRelay is ours alone.
 (() => {
-  if (window.__abNetRelay) return;
-  const state = (window.__abNetRelay = { hooked: false, records: 0, dropped: 0 });
+  // A relay left from before the extension reloaded cannot reach it any more
+  // (its chrome.runtime is gone): replace it. A live one stays.
+  try {
+    if (window.__abNetRelay?.alive?.()) return;
+  } catch {}
   const channel = "ab" + crypto.randomUUID().replace(/-/g, "");
+  const state = (window.__abNetRelay = {
+    channel,
+    hooked: false,
+    late: false,
+    records: 0,
+    dropped: 0,
+    dialogs: [],
+    credentials: [],
+    diag: [],
+    alive: () => {
+      try {
+        return !!chrome.runtime?.id;
+      } catch {
+        return false;
+      }
+    },
+  });
   const HELLO = "ab-net-hello";
   let config = null;
   let topOnly = false;
@@ -38,6 +61,10 @@
     if (out.length >= 20) flush();
     else if (!timer) timer = setTimeout(flush, 250);
   };
+  const keep = (list, rec, max) => {
+    list.push(rec);
+    if (list.length > max) list.shift();
+  };
 
   document.addEventListener(channel, (e) => {
     let batch;
@@ -47,16 +74,32 @@
       return;
     }
     if (!Array.isArray(batch)) return;
-    state.hooked = true;
-    if (topOnly && window !== window.top) return;
-    state.records += batch.length;
-    for (const r of batch) out.push(r);
-    if (batch.length) schedule();
+    let net = 0;
+    for (const r of batch) {
+      if (!r || typeof r !== "object") continue;
+      if (r.kind === "hello") {
+        // The network hook is in this document (and whether it came late).
+        state.hooked = true;
+        state.late = !!r.late;
+      } else if (r.kind === "dialog") keep(state.dialogs, r, 20);
+      else if (r.kind === "credential") keep(state.credentials, r, 20);
+      else if (r.kind === "diag") keep(state.diag, r, 200);
+      else if (!(topOnly && window !== window.top)) {
+        out.push(r);
+        net++;
+      }
+    }
+    state.records += net;
+    if (net) schedule();
   });
 
+  const netPart = ({ enabled, maxBodyChars, skipBodyTypes, blockedDomains, captureWebSockets, maxFramesPerSocket, maxFrameChars }) => ({
+    enabled, maxBodyChars, skipBodyTypes, blockedDomains, captureWebSockets, maxFramesPerSocket, maxFrameChars,
+  });
   const reply = () =>
-    document.dispatchEvent(new CustomEvent(HELLO, { detail: JSON.stringify({ channel, config }) }));
-  // Whichever of the two scripts runs second completes the exchange.
+    document.dispatchEvent(new CustomEvent(HELLO, { detail: JSON.stringify({ channel, config: config && netPart(config) }) }));
+  // Whichever side runs second completes the exchange; every page-world
+  // script that says hello gets the same channel.
   document.addEventListener(HELLO, (e) => {
     if (e.detail === "hook") reply();
   });
@@ -68,12 +111,7 @@
       if (!netConfig) return;
       config = netConfig;
       topOnly = netConfig.frames === "top";
-      const { enabled, maxBodyChars, skipBodyTypes, blockedDomains, captureWebSockets, maxFramesPerSocket, maxFrameChars } = netConfig;
-      document.dispatchEvent(
-        new CustomEvent(channel + ":cfg", {
-          detail: JSON.stringify({ enabled, maxBodyChars, skipBodyTypes, blockedDomains, captureWebSockets, maxFramesPerSocket, maxFrameChars }),
-        }),
-      );
+      document.dispatchEvent(new CustomEvent(channel + ":cfg", { detail: JSON.stringify(netPart(netConfig)) }));
     })
     .catch(() => {});
 

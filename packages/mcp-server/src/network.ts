@@ -31,6 +31,8 @@ export interface NetEntry {
   bodyCut?: boolean;
   truncated?: boolean | string;
   skipped?: string;
+  /** Recorded by a hook installed after the page loaded. */
+  late?: boolean;
   durationMs?: number;
   fromCache?: boolean;
   ip?: string;

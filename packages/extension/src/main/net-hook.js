@@ -38,6 +38,9 @@
   const URLc = URL;
   const doc = document;
   const loc = location;
+  // Installed after the page started (the extension was updated under an open
+  // tab, and re-armed it): what came before is not recorded, so say so.
+  const late = doc.readyState !== "loading";
 
   const get = (m, k) => apply(wmGet, m, [k]);
   const put = (m, k, v) => apply(wmSet, m, [k, v]);
@@ -127,6 +130,7 @@
     if (!cfg.enabled) return;
     rec.ts ??= now();
     if (W !== W.top) rec.frameUrl = loc.href;
+    if (late) rec.late = true;
     queue.push(rec);
     if (queue.length > 200) queue.shift(); // no relay yet: keep the newest
     if (channel && !scheduled) {
@@ -154,7 +158,7 @@
     if (msg.config) Object.assign(cfg, msg.config);
     // Tell the relay we are here even before there is traffic.
     try {
-      apply(dispatch, doc, [new CE(channel, { detail: "[]" })]);
+      apply(dispatch, doc, [new CE(channel, { detail: stringify([{ kind: "hello", late }]) })]);
     } catch {}
     flush();
   };
