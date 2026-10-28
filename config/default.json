@@ -28,6 +28,27 @@
     "maxSnapshotTokensApprox": 4000,
     "screenshotOnAmbiguity": true
   },
+  "eval": {
+    "comment": "browser_eval runs on any page except these domains (and their subdomains). Identity, payment and banking hosts by default; edit to suit.",
+    "blockedDomains": [
+      "accounts.google.com",
+      "login.microsoftonline.com",
+      "login.live.com",
+      "appleid.apple.com",
+      "paypal.com",
+      "checkout.stripe.com",
+      "bank"
+    ]
+  },
+  "diagnostics": {
+    "comment": "Console and page-error capture runs only on development hosts: localhost, 127.0.0.1, ::1, *.localhost, *.local, *.test, private IPs, and the hosts listed here. Failed network requests are recorded on every host (invisible to the page).",
+    "hosts": []
+  },
+  "evidence": {
+    "comment": "Each visit and screenshot is recorded under <stateDir>/sessions/<session>/ with a viewport image; directories older than retainDays are removed at startup.",
+    "enabled": true,
+    "retainDays": 14
+  },
   "audit": {
     "file": "~/.agent-chrome/audit.log"
   }

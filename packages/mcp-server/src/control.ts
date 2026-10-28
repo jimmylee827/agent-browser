@@ -4,11 +4,25 @@ import type { Bridge } from "./bridge/server.js";
 import type { Audit } from "./audit.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { buildStatus } from "./build.js";
+
+/** Who is calling: one id per MCP client connection (one launcher process). */
+export interface ClientInfo {
+  id: string;
+  launcherBuild?: string;
+}
 
 interface McpHooks {
-  makeMcpServer: () => McpServer;
+  makeMcpServer: (client: ClientInfo) => McpServer;
   makeHttpTransport: () => StreamableHTTPServerTransport;
+  /** A client went away: close what it owned. */
+  releaseClient: (id: string) => Promise<number>;
 }
+
+const header = (req: IncomingMessage, name: string) => {
+  const v = req.headers[name];
+  return (Array.isArray(v) ? v[0] : v) || undefined;
+};
 
 // Tiny localhost control plane so scripts/diagnostics talk to ONE persistent
 // server (no per-test ephemeral servers racing the extension SW). Also hosts
@@ -45,7 +59,12 @@ export function startControl(
       try {
         // Stateless: spin up a fresh server+transport per request. Avoids
         // session bookkeeping; matches the way agents typically use MCP.
-        const server = mcp.makeMcpServer();
+        // The launcher names itself on every request. A client that does not
+        // (a direct HTTP MCP client) shares one anonymous identity.
+        const server = mcp.makeMcpServer({
+          id: header(req, "x-ab-client") ?? "anonymous",
+          launcherBuild: header(req, "x-ab-launcher-build"),
+        });
         const transport = mcp.makeHttpTransport();
         res.on("close", () => {
           transport.close().catch(() => {});
@@ -62,7 +81,12 @@ export function startControl(
 
     try {
       if (url.pathname === "/status") {
-        return send(res, 200, { bridgeConnected: bridge.connected() });
+        return send(res, 200, { bridgeConnected: bridge.connected(), build: buildStatus() });
+      }
+      if (url.pathname === "/session/release" && req.method === "POST" && mcp) {
+        const id = url.searchParams.get("client") ?? "";
+        if (!id) return send(res, 400, { error: "missing client" });
+        return send(res, 200, { closed: await mcp.releaseClient(id) });
       }
       if (url.pathname === "/ping") {
         return send(res, 200, await bridge.request("engine.ping", {}));
@@ -158,7 +182,7 @@ export function startControl(
         error: "not found",
         routes: [
           "/status", "/ping", "/observe", "/locate", "/wait", "/navigate", "/visit",
-          "POST /act", "POST /robust-click", "POST /mcp",
+          "POST /act", "POST /robust-click", "POST /mcp", "POST /session/release?client=",
         ],
       });
     } catch (e) {
