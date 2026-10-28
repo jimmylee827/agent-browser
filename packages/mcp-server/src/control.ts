@@ -5,6 +5,7 @@ import type { Audit } from "./audit.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { buildStatus } from "./build.js";
+import { rejectBrowserOrigin } from "./http-guard.js";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
@@ -50,6 +51,11 @@ export function startControl(
     if (!inContainer && ip !== "127.0.0.1" && ip !== "::1" && ip !== "::ffff:127.0.0.1") {
       res.writeHead(403).end();
       return;
+    }
+    const refused = rejectBrowserOrigin(req.headers);
+    if (refused) {
+      audit.log("control.refused", { reason: refused, path: (req.url ?? "").split("?")[0] });
+      return send(res, 403, { error: refused });
     }
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
 
