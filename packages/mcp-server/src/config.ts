@@ -12,6 +12,8 @@ export function expandHome(p: string): string {
 }
 
 export interface AppConfig {
+  /** The unpacked extension Chrome loads (for version checks). */
+  extensionDir: string;
   profileDir: string;
   stateDir: string;
   bridge: {
@@ -27,18 +29,38 @@ export interface AppConfig {
     redactSelectors: string[];
   };
   perception: { maxSnapshotTokensApprox: number; screenshotOnAmbiguity: boolean };
+  eval: { blockedDomains: string[] };
+  input: { enabled: boolean; port: number; secretFile: string };
+  diagnostics: { hosts: string[] };
+  evidence: { enabled: boolean; retainDays: number };
   audit: { file: string };
 }
 
 export function loadConfig(): AppConfig {
-  const raw = readFileSync(resolve(repoRoot, "config/default.json"), "utf8");
+  const raw = readFileSync(process.env.AB_CONFIG ?? resolve(repoRoot, "config/default.json"), "utf8");
   const cfg = JSON.parse(raw) as AppConfig;
+  const env = process.env;
+  // A second, isolated instance (the end-to-end tests) moves everything that
+  // would collide with the user's own: state, profile, ports.
+  if (env.AB_STATE_DIR) {
+    cfg.stateDir = env.AB_STATE_DIR;
+    cfg.bridge.secretFile = resolve(env.AB_STATE_DIR, "bridge-secret");
+    cfg.audit.file = resolve(env.AB_STATE_DIR, "audit.log");
+  }
+  if (env.AB_PROFILE_DIR) cfg.profileDir = env.AB_PROFILE_DIR;
+  if (env.AB_BRIDGE_PORT) cfg.bridge.port = Number(env.AB_BRIDGE_PORT);
+  if (env.AB_CONTROL_PORT) cfg.bridge.controlPort = Number(env.AB_CONTROL_PORT);
+  cfg.extensionDir = env.AB_EXTENSION_DIR ?? resolve(repoRoot, "packages/extension");
   cfg.profileDir = expandHome(cfg.profileDir);
   cfg.stateDir = expandHome(cfg.stateDir);
   cfg.bridge.secretFile = expandHome(cfg.bridge.secretFile);
   cfg.audit.file = expandHome(cfg.audit.file);
-  if (process.env.AB_BIND_HOST) cfg.bridge.host = process.env.AB_BIND_HOST;
-  if (process.env.AB_BRIDGE_SECRET_FILE) cfg.bridge.secretFile = process.env.AB_BRIDGE_SECRET_FILE;
+  cfg.eval ??= { blockedDomains: [] };
+  cfg.input ??= { enabled: false, port: 8790, secretFile: "~/.agent-chrome/input-helper-secret" };
+  cfg.diagnostics ??= { hosts: [] };
+  cfg.evidence ??= { enabled: true, retainDays: 14 };
+  if (env.AB_BIND_HOST) cfg.bridge.host = env.AB_BIND_HOST;
+  if (env.AB_BRIDGE_SECRET_FILE) cfg.bridge.secretFile = env.AB_BRIDGE_SECRET_FILE;
   return cfg;
 }
 

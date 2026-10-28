@@ -28,7 +28,7 @@ function connect() {
   ws = new WebSocket(`ws://127.0.0.1:${cfg.BRIDGE_PORT}`);
 
   ws.onopen = () => {
-    ws.send(JSON.stringify({ type: "auth", secret: cfg.BRIDGE_SECRET }));
+    ws.send(JSON.stringify({ type: "auth", secret: cfg.BRIDGE_SECRET, extension: { version: chrome.runtime.getManifest().version } }));
   };
 
   ws.onmessage = async (ev) => {
@@ -41,6 +41,11 @@ function connect() {
     if (msg.type === "auth_ok") {
       backoff = 1000;
       console.log("[agent-bridge] connected");
+      applyConfig(msg.config || {}).catch((e) => console.warn("[agent-bridge] config", e));
+      // The heartbeat keeps this worker alive for weeks, so the check at
+      // startup alone never sees an update. Each reconnect (a server restart
+      // after a rebuild, typically) looks again.
+      reloadIfStale();
       return;
     }
     // Server heartbeat. Nothing to do with the payload — simply RECEIVING it
@@ -52,7 +57,12 @@ function connect() {
       const result = await dispatch(msg.method, msg.params || {});
       ws.send(JSON.stringify({ id: msg.id, ok: true, result }));
     } catch (e) {
-      ws.send(JSON.stringify({ id: msg.id, ok: false, error: String(e && e.message || e) }));
+      // The code and detail are what callers branch on; never drop them.
+      ws.send(JSON.stringify({
+        id: msg.id, ok: false, error: String(e && e.message || e),
+        ...(e && e.code ? { code: e.code } : {}),
+        ...(e && e.detail ? { detail: e.detail } : {}),
+      }));
     }
   };
 
@@ -70,6 +80,197 @@ async function activeTab() {
   return tab;
 }
 
+const tagged = (code, message, detail) => Object.assign(new Error(message), { code, ...(detail ? { detail } : {}) });
+
+// The tab a call acts on. The server names it (each agent session owns its
+// own tab); only the legacy "default" session leaves it out and gets whatever
+// tab is focused. A named tab that is gone is an error, never a silent switch
+// to some other tab — that is how one agent used to act on another's page.
+async function tabFor(params = {}) {
+  if (params.tabId == null) return activeTab();
+  const tab = await chrome.tabs.get(params.tabId).catch(() => null);
+  if (!tab) throw tagged("TAB_GONE", `TAB_GONE: tab ${params.tabId} was closed`, { tabId: params.tabId });
+  return tab;
+}
+
+// Top-frame commits per tab, so a caller can tell the page changed under it.
+const NAV_COUNT = new Map();
+// Tabs opened from another tab (target=_blank, window.open), newest last.
+const OPENED = [];
+chrome.tabs.onCreated.addListener(async (t) => {
+  if (t.openerTabId == null) return;
+  OPENED.push({ tabId: t.id, openerTabId: t.openerTabId, windowId: t.windowId, ts: Date.now() });
+  if (OPENED.length > 50) OPENED.shift();
+  // A tab opened from a muted agent tab is muted too; one opened from a
+  // mobile-emulated tab is emulated too.
+  const opener = await chrome.tabs.get(t.openerTabId).catch(() => null);
+  if (opener?.mutedInfo?.muted && opener.mutedInfo.reason === "extension") chrome.tabs.update(t.id, { muted: true }).catch(() => {});
+  if (MOBILE.has(t.openerTabId)) setMobile(t, MOBILE.get(t.openerTabId)).catch(() => {});
+});
+chrome.tabs.onRemoved.addListener((id) => {
+  NAV_COUNT.delete(id);
+  NET.delete(id);
+  if (MOBILE.delete(id)) chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [ruleIdFor(id)] }).catch(() => {});
+});
+
+// ---- viewport: a real one, not a scaled picture. The window is sized so the
+// page's own width and height are what was asked, and the tab's zoom sets the
+// device pixel ratio (150% on a 2x screen is 3x, like a phone). Media queries,
+// layout and devicePixelRatio are then the browser's own answers.
+async function setViewport(tab, v) {
+  const metrics = () => callEngine(tab.id, "pageMetrics", {});
+  let zoom = await chrome.tabs.getZoom(tab.id);
+  let m = await metrics();
+  const native = m.devicePixelRatio / zoom;
+  const want = v.deviceScaleFactor ? v.deviceScaleFactor / native : 1;
+  if (Math.abs(want - zoom) > 0.01) {
+    // Per tab: other tabs of the same site keep their zoom. Chrome resets a
+    // per-tab zoom on navigation, so the server applies it again after each.
+    await chrome.tabs.setZoomSettings(tab.id, { mode: "automatic", scope: "per-tab" });
+    await chrome.tabs.setZoom(tab.id, want);
+    zoom = want;
+    await sleep(250);
+  }
+  for (let i = 0; i < 3; i++) {
+    m = await metrics();
+    const dw = Math.round((v.width - m.innerWidth) * zoom);
+    const dh = Math.round((v.height - m.innerHeight) * zoom);
+    if (!dw && !dh) break;
+    const win = await chrome.windows.get(tab.windowId);
+    await chrome.windows.update(tab.windowId, { width: win.width + dw, height: win.height + dh });
+    await sleep(250);
+  }
+  m = await metrics();
+  const got = { width: m.innerWidth, height: m.innerHeight, deviceScaleFactor: Math.round(m.devicePixelRatio * 100) / 100 };
+  const off = got.width !== v.width || got.height !== v.height || (v.deviceScaleFactor && Math.abs(got.deviceScaleFactor - v.deviceScaleFactor) > 0.05);
+  return { viewport: got, zoom, ...(off ? { note: `asked for ${v.width}x${v.height}${v.deviceScaleFactor ? ` @${v.deviceScaleFactor}x` : ""}; Chrome gave ${got.width}x${got.height} @${got.deviceScaleFactor}x` } : {}) };
+}
+
+// ---- mobile: an approximation, for sessions that ask. The site is told it is
+// a phone the way a phone tells it — the User-Agent and client-hint headers
+// (a per-tab header rule) — and the page sees touch support and a coarse,
+// hoverless pointer (page-world patches, re-applied on every load).
+const MOBILE = new Map();
+const ruleIdFor = (tabId) => (tabId % 2147483000) + 1;
+function mobileUA() {
+  const major = (navigator.userAgent.match(/Chrome\/(\d+)/) || [])[1] || "120";
+  return `Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Mobile Safari/537.36`;
+}
+async function setMobile(tab, opts) {
+  const on = opts.mobile !== false;
+  const id = ruleIdFor(tab.id);
+  await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [id] });
+  if (!on) {
+    MOBILE.delete(tab.id);
+    return { mobile: false };
+  }
+  const ua = mobileUA();
+  await chrome.declarativeNetRequest.updateSessionRules({
+    addRules: [{
+      id,
+      priority: 1,
+      condition: { tabIds: [tab.id], resourceTypes: ["main_frame", "sub_frame", "xmlhttprequest", "script", "stylesheet", "image", "media", "font", "other", "ping", "websocket"] },
+      action: {
+        type: "modifyHeaders",
+        requestHeaders: [
+          { header: "user-agent", operation: "set", value: ua },
+          { header: "sec-ch-ua-mobile", operation: "set", value: "?1" },
+          { header: "sec-ch-ua-platform", operation: "set", value: '"Android"' },
+        ],
+      },
+    }],
+  });
+  MOBILE.set(tab.id, { mobile: true, ua });
+  await chrome.scripting.executeScript({ target: { tabId: tab.id, allFrames: true }, world: "MAIN", injectImmediately: true, func: mobilePatch, args: [ua] }).catch(() => {});
+  return { mobile: true, userAgent: ua };
+}
+
+// Page world. Touch support, a phone's navigator, and the hover/pointer media
+// features a phone reports — in matchMedia and in the page's stylesheets.
+function mobilePatch(ua) {
+  if (window.__abMobile) return;
+  window.__abMobile = true;
+  const nav = Object.getPrototypeOf(navigator);
+  const define = (obj, key, value) => { try { Object.defineProperty(obj, key, { configurable: true, get: () => value }); } catch {} };
+  define(nav, "userAgent", ua);
+  define(nav, "appVersion", ua.replace(/^Mozilla\//, ""));
+  define(nav, "platform", "Linux armv8l");
+  define(nav, "maxTouchPoints", 5);
+  if (navigator.userAgentData) {
+    const data = navigator.userAgentData;
+    define(data, "mobile", true);
+    define(data, "platform", "Android");
+  }
+  if (!("ontouchstart" in window)) window.ontouchstart = null;
+  // (hover: hover) and (pointer: fine) are false on a phone; their opposites true.
+  const TRUE = "(min-width: 0px)", FALSE = "(max-width: 0px)";
+  const rewrite = (q) =>
+    String(q)
+      .replace(/\((any-)?hover\s*:\s*hover\)/g, FALSE).replace(/\((any-)?hover\s*:\s*none\)/g, TRUE)
+      .replace(/\((any-)?pointer\s*:\s*fine\)/g, FALSE).replace(/\((any-)?pointer\s*:\s*coarse\)/g, TRUE);
+  const mm = window.matchMedia.bind(window);
+  window.matchMedia = (q) => mm(rewrite(q));
+  const fixSheets = () => {
+    for (const sheet of document.styleSheets) {
+      let rules;
+      try { rules = sheet.cssRules; } catch { continue; }
+      const walk = (list) => {
+        for (const r of list) {
+          if (r.media && /hover|pointer/.test(r.media.mediaText)) {
+            const next = rewrite(r.media.mediaText);
+            if (next !== r.media.mediaText) r.media.mediaText = next;
+          }
+          if (r.cssRules) walk(r.cssRules);
+        }
+      };
+      walk(rules);
+    }
+  };
+  document.addEventListener("DOMContentLoaded", fixSheets);
+  window.addEventListener("load", fixSheets);
+  new MutationObserver(fixSheets).observe(document.documentElement, { childList: true, subtree: true });
+}
+
+// ---- diagnostics: failed requests, per tab. webRequest only observes; the
+// page cannot tell it is there, so this runs on every host.
+const NET = new Map();
+const NET_MAX = 100;
+function recordNet(d, entry) {
+  if (d.tabId < 0) return;
+  let list = NET.get(d.tabId);
+  if (!list) NET.set(d.tabId, (list = []));
+  list.push({ ts: Date.now(), url: d.url, method: d.method, type: d.type, ...entry });
+  if (list.length > NET_MAX) list.shift();
+}
+chrome.webRequest?.onCompleted.addListener(
+  (d) => { if (d.statusCode >= 400) recordNet(d, { status: d.statusCode, statusLine: d.statusLine }); },
+  { urls: ["<all_urls>"] },
+);
+chrome.webRequest?.onErrorOccurred.addListener(
+  // An abort is a page cancelling its own request (navigation, a superseded
+  // fetch), not a failure worth reporting.
+  (d) => { if (d.error !== "net::ERR_ABORTED") recordNet(d, { error: d.error }); },
+  { urls: ["<all_urls>"] },
+);
+
+// Console and page-error capture is a MAIN-world hook, which a page could
+// detect, so it runs only on development hosts (and hosts the user lists).
+const DEV_PATTERNS = ["*://localhost/*", "*://127.0.0.1/*", "*://[::1]/*", "*://*.localhost/*", "*://*.local/*", "*://*.test/*"];
+const PRIVATE_IP = /^(10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)$/;
+async function applyConfig(config) {
+  const extra = (config.diagnosticsHosts || []).flatMap((h) => [`*://${h}/*`, `*://*.${h}/*`]);
+  await chrome.scripting.unregisterContentScripts({ ids: ["ab-diag"] }).catch(() => {});
+  await chrome.scripting.registerContentScripts([{
+    id: "ab-diag",
+    js: ["src/content/diag-hook.js"],
+    matches: [...DEV_PATTERNS, ...extra],
+    runAt: "document_start",
+    world: "MAIN",
+    allFrames: false,
+    persistAcrossSessions: false,
+  }]);
+}
+
 // Ring buffer of recent top-frame navigations. Redirect-based flows (OAuth
 // consent, SSO hand-off, payment return, magic links) hand the interesting
 // value to the browser as a URL the agent never gets to "see" — it may bounce
@@ -78,16 +279,17 @@ async function activeTab() {
 // fact, instead of racing the redirect chain.
 const NAV_LOG = [];
 const NAV_LOG_MAX = 50;
-function recordNav(url) {
-  NAV_LOG.push({ url, ts: Date.now() });
+function recordNav(url, tabId) {
+  NAV_LOG.push({ url, ts: Date.now(), tabId });
   if (NAV_LOG.length > NAV_LOG_MAX) NAV_LOG.shift();
 }
 
-function matchNav(patternSource, sinceTs) {
+function matchNav(patternSource, sinceTs, tabId) {
   const re = new RegExp(patternSource);
   for (let i = NAV_LOG.length - 1; i >= 0; i--) {
     const n = NAV_LOG[i];
     if (n.ts < sinceTs) break;
+    if (tabId != null && n.tabId !== tabId) continue;
     if (re.test(n.url)) {
       let params = {};
       try {
@@ -110,14 +312,14 @@ async function waitForNavigation(params = {}) {
   const sinceTs = params.sinceTs ?? Date.now() - 5000;
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const hit = matchNav(pattern, sinceTs);
+    const hit = matchNav(pattern, sinceTs, params.tabId);
     if (hit) return { matched: true, ...hit };
     if (Date.now() >= deadline) {
       return {
         matched: false,
         urlPattern: pattern,
         waitedMs: timeoutMs,
-        recentUrls: NAV_LOG.slice(-10).map((n) => n.url),
+        recentUrls: NAV_LOG.filter((n) => params.tabId == null || n.tabId === params.tabId).slice(-10).map((n) => n.url),
       };
     }
     await new Promise((r) => setTimeout(r, 250));
@@ -129,7 +331,8 @@ async function waitForNavigation(params = {}) {
 const RETRY_SAFE = new Set([
   "ping", "observe", "locate", "waitForStable", "clearMarks",
   "pageMetrics", "rectOf", "scrollToY", "hideFixed", "restoreFixed",
-  "hideScrollbar", "restoreScrollbar",
+  "hideScrollbar", "restoreScrollbar", "settle", "pageState", "inspect",
+  "diagnostics", "prepareElementCapture", "detectWall",
 ]);
 
 // The engine reports its own failures (NOT_ACTIONABLE, NO_SUCH_OPTION…) as an
@@ -140,6 +343,7 @@ class EngineError extends Error {
   constructor(reply) {
     super(reply.error);
     this.code = reply.code;
+    if (reply.detail) this.detail = reply.detail;
   }
 }
 const unwrap = (reply) => {
@@ -276,6 +480,12 @@ async function captureRegion(tab, region, opts = {}) {
   let slices = 0;
   let cur = y;
   if (!fitsInView) await callEngine(tab.id, "hideScrollbar", {}).catch(() => {});
+  // An element taller than the screen: a sticky header would sit over its
+  // top edge in the first slice, so hide fixed elements from the start.
+  if (opts.hideFixedFirst) {
+    await callEngine(tab.id, "hideFixed", {});
+    hid = true;
+  }
   try {
     while (cur < y + height) {
       const viewTop = fitsInView ? m.scrollY : (await callEngine(tab.id, "scrollToY", { y: Math.min(cur, maxScroll) })).scrollY;
@@ -326,8 +536,40 @@ async function captureRegion(tab, region, opts = {}) {
   };
 }
 
+// captureVisibleTab sees only the tab in front of its window. A session's tab
+// is the only one in its window unless something opened another there; bring
+// it to the front of that window — never focusing the window itself.
+async function showTab(tab) {
+  if (tab.active) return;
+  await chrome.tabs.update(tab.id, { active: true });
+  await sleep(200);
+}
+
+// One element. The engine first scrolls it to the middle of the screen and
+// clears any fixed or sticky bar lying over it, or refuses (OCCLUDED) when
+// something else covers it. Taking the shot anyway is how a section's capture
+// once came back as the site header and cart icon.
+async function screenshotElement(tab, params) {
+  const prep = await callEngine(tab.id, "prepareElementCapture", { ref: params.ref, gen: params.gen });
+  const scale = params.scale;
+  const format = params.format ?? "png";
+  try {
+    const out = await captureRegion(tab, prep.rect, { scale, format, hideFixedFirst: !prep.fits });
+    // The element must still be where it was measured, or the image is of
+    // whatever moved into its place.
+    const after = (await callEngine(tab.id, "rectOf", { ref: params.ref })).rect;
+    if (Math.abs(after.y - prep.rect.y) > 2 || Math.abs(after.x - prep.rect.x) > 2)
+      throw tagged("CAPTURE_FAILED", "CAPTURE_FAILED: the element moved while it was being captured (the page is still changing); wait, then retry");
+    return { url: tab.url, format, ...out, ...(prep.hidOverlays?.length ? { hidOverlays: prep.hidOverlays } : {}) };
+  } finally {
+    await callEngine(tab.id, "restoreFixed", {}).catch(() => {});
+  }
+}
+
 // Full page, one element (by ref), or a region; otherwise the viewport.
 async function screenshot(tab, params = {}) {
+  await showTab(tab);
+  if (params.ref != null && !params.fullPage && !params.clip) return screenshotElement(tab, params);
   const resized = params.scale != null || params.format != null;
   if (!params.fullPage && params.ref == null && !params.clip && !resized) {
     const m = await callEngine(tab.id, "pageMetrics", {}).catch(() => null);
@@ -346,8 +588,6 @@ async function screenshot(tab, params = {}) {
   } else if (params.fullPage) {
     const m = await callEngine(tab.id, "pageMetrics", {});
     region = { x: 0, y: 0, width: m.innerWidth, height: m.scrollHeight };
-  } else if (params.ref != null) {
-    region = (await callEngine(tab.id, "rectOf", { ref: params.ref })).rect;
   } else {
     region = params.clip;
   }
@@ -360,12 +600,70 @@ async function screenshot(tab, params = {}) {
 }
 
 async function dispatch(method, params) {
+  // A session's own window: opened in the background, so an agent starting
+  // work never pulls the user's window away or lands in the user's tab.
+  // Muted unless the session asked for sound: an agent's page should never
+  // start playing at the person beside it. A session with a viewport gets a
+  // popup-type window, the kind Chrome lets go narrower than 500px.
+  if (method === "engine.openSessionWindow") {
+    const like = await chrome.windows.getLastFocused().catch(() => null);
+    const win = await chrome.windows.create({
+      url: params.url || "about:blank",
+      focused: false,
+      ...(params.viewport
+        ? { type: "popup", width: Math.max(params.viewport.width, 100), height: params.viewport.height + 90 }
+        : like?.width ? { width: like.width, height: like.height } : {}),
+    });
+    const tab = win.tabs?.[0];
+    if (tab && !params.sound) await chrome.tabs.update(tab.id, { muted: true }).catch(() => {});
+    return { tabId: tab?.id, windowId: win.id, type: win.type };
+  }
+  // Bring a session's window to the front. The browser's own API, no OS
+  // permission: needed before input posted by the operating system, which
+  // macOS delivers to the frontmost window only.
+  if (method === "engine.focusWindow") {
+    const t = await tabFor(params);
+    await chrome.tabs.update(t.id, { active: true });
+    await chrome.windows.update(t.windowId, { focused: true });
+    await sleep(250);
+    return { focused: true, windowId: t.windowId, tabId: t.id };
+  }
+  if (method === "engine.setSound") {
+    await chrome.tabs.update(params.tabId, { muted: !params.sound });
+    return { muted: !params.sound };
+  }
+  // Popups a page opens late (after a fetch, from a timer) are blocked unless
+  // the host is allowed — the same per-site switch a person would flip.
+  if (method === "engine.allowPopups") {
+    const t = await tabFor(params);
+    const u = new URL(t.url);
+    const pattern = `${u.protocol}//${u.hostname}/*`;
+    const setting = params.allow === false ? "block" : "allow";
+    await chrome.contentSettings.popups.set({ primaryPattern: pattern, setting });
+    return { popups: setting, pattern };
+  }
+  if (method === "engine.setViewport") return await setViewport(await tabFor(params), params);
+  if (method === "engine.toPopupWindow") {
+    const t = await tabFor(params);
+    const win = await chrome.windows.create({ tabId: t.id, type: "popup", focused: false });
+    return { windowId: win.id };
+  }
+  if (method === "engine.mobile") return await setMobile(await tabFor(params), params);
+  if (method === "engine.closeWindow") {
+    await chrome.windows.remove(params.windowId).catch(() => {});
+    return { closed: true };
+  }
   // engine.navigate runs from the SW (chrome.tabs API) so it works regardless
-  // of whether a content script can be injected into the current tab. Forces
-  // the URL into the stealth Chrome: updates the active tab if there is one,
-  // otherwise opens a new tab. No host gate on the *current* page.
+  // of whether a content script can be injected into the current tab. With a
+  // tabId it drives that tab and nothing else; without one (the legacy
+  // session) it drives the focused tab, or opens one.
   if (method === "engine.navigate") {
     if (params.url) {
+      if (params.tabId != null) {
+        const t = await tabFor(params);
+        await chrome.tabs.update(t.id, { url: params.url });
+        return { navigating: true, to: params.url, tabId: t.id, mode: "session_tab" };
+      }
       const tabs = await chrome.tabs.query({ lastFocusedWindow: true, active: true });
       if (tabs[0]) {
         await chrome.tabs.update(tabs[0].id, { url: params.url, active: true });
@@ -380,7 +678,7 @@ async function dispatch(method, params) {
       const created = await chrome.tabs.create({ url: params.url, active: true });
       return { navigating: true, to: params.url, tabId: created.id, mode: "created_tab" };
     }
-    const tabForNav = await activeTab();
+    const tabForNav = await tabFor(params);
     if (params.action === "reload") {
       await chrome.tabs.reload(tabForNav.id);
       return { navigating: true, to: "reload", tabId: tabForNav.id };
@@ -414,35 +712,50 @@ async function dispatch(method, params) {
       return { navigating: true, to: params.action, tabId: tabForNav.id, via: "browser" };
     }
   }
-  // Tabs. "The active tab" is what every other method acts on, so switching
-  // here moves the agent. Within a window this never raises Chrome; a tab in
-  // another window needs that window focused, which brings it forward.
+  // Tabs. The server decides which of these a caller may touch (its own);
+  // this only does what it is told. "switch" brings a tab to the front of its
+  // own window, and focuses that window only when asked (legacy behaviour).
   if (method === "engine.tabs") {
     let focusedWindow = false;
+    let created;
     if (params.action === "switch" || params.action === "close") {
       const target = await chrome.tabs.get(params.tabId).catch(() => null);
-      if (!target) throw new Error(`NO_SUCH_TAB: no tab ${params.tabId}; list the tabs first`);
+      if (!target) throw tagged("TAB_GONE", `NO_SUCH_TAB: no tab ${params.tabId}; list the tabs first`, { tabId: params.tabId });
       if (params.action === "close") await chrome.tabs.remove(params.tabId);
       else {
         await chrome.tabs.update(params.tabId, { active: true });
-        const current = await activeTab().catch(() => null);
-        if (current?.id !== params.tabId) {
-          await chrome.windows.update(target.windowId, { focused: true });
-          focusedWindow = true;
+        if (params.focusWindow) {
+          const current = await activeTab().catch(() => null);
+          if (current?.id !== params.tabId) {
+            await chrome.windows.update(target.windowId, { focused: true });
+            focusedWindow = true;
+          }
         }
       }
     } else if (params.action === "new") {
-      await chrome.tabs.create({ url: params.url || "about:blank", active: true });
+      created = await chrome.tabs.create({
+        url: params.url || "about:blank",
+        active: true,
+        ...(params.windowId != null ? { windowId: params.windowId } : {}),
+      });
     }
     const active = await activeTab().catch(() => null);
     const all = await chrome.tabs.query({});
     return {
-      tabs: all.map((t) => ({ tabId: t.id, url: t.url, title: t.title, active: t.id === active?.id, windowId: t.windowId })),
+      tabs: all.map((t) => ({ tabId: t.id, url: t.url, title: t.title, active: t.id === active?.id, frontOfWindow: t.active, windowId: t.windowId, ...(t.mutedInfo?.muted ? { muted: true } : {}) })),
       activeTabId: active?.id,
+      ...(created ? { createdTabId: created.id } : {}),
       ...(focusedWindow ? { focusedWindow } : {}),
     };
   }
-  const tab = await activeTab();
+  if (method === "engine.openedFrom") {
+    return { opened: OPENED.filter((o) => o.openerTabId === params.tabId && o.ts >= (params.since || 0)) };
+  }
+  if (method === "engine.waitForNavigation") return await waitForNavigation(params);
+  if (method === "engine.navHistory")
+    return { navigations: NAV_LOG.filter((n) => params.tabId == null || n.tabId === params.tabId).slice(-25) };
+
+  const tab = await tabFor(params);
   if (method === "engine.ping") {
     const pong = await callEngine(tab.id, "ping", params).catch((e) => ({
       error: String(e.message || e),
@@ -452,33 +765,156 @@ async function dispatch(method, params) {
     // yet, so without it a successful click looks identical to a dead one.
     return {
       sw: "ok",
-      tab: { id: tab.id, url: tab.url, title: tab.title, status: tab.status },
+      tab: { id: tab.id, url: tab.url, title: tab.title, status: tab.status, windowId: tab.windowId, navCount: NAV_COUNT.get(tab.id) || 0 },
       engine: pong,
     };
   }
   if (method === "engine.observe") {
     const snap = await callEngine(tab.id, "observe", params);
-    if (snap && snap.needsScreenshot) {
+    if (snap && (snap.needsScreenshot || snap.needsHuman?.reason === "captcha")) {
       try {
+        await showTab(tab);
         snap.screenshot = await captureViewport(tab.windowId);
       } catch (e) {
         snap.screenshotError = String(e.message || e);
       }
-      await callEngine(tab.id, "clearMarks", {}).catch(() => {});
+      if (snap.needsScreenshot) await callEngine(tab.id, "clearMarks", {}).catch(() => {});
       delete snap.needsScreenshot;
     }
     return snap;
   }
-  if (method === "engine.locate") return await callEngine(tab.id, "locate", params);
-  if (method === "engine.act") return await callEngine(tab.id, "act", params);
+  if (method === "engine.act") {
+    // A drag hands the pointer to whatever element captures it; the page's
+    // setPointerCapture refuses a synthetic pointer unless shimmed first.
+    if (params.action === "drag" || params.action === "pointer") await injectMain(tab.id, pointerCaptureShim);
+    return await callEngine(tab.id, "act", params);
+  }
   if (method === "engine.robustClick") return await robustClick(tab.id, params);
-  if (method === "engine.waitForNavigation") return await waitForNavigation(params);
-  if (method === "engine.navHistory") return { navigations: NAV_LOG.slice(-25) };
-  if (method === "engine.scroll") return await callEngine(tab.id, "scrollPage", params);
-  if (method === "engine.waitFor") return await callEngine(tab.id, "waitFor", params);
-  if (method === "engine.waitForStable") return await callEngine(tab.id, "waitForStable", params);
   if (method === "engine.screenshot") return await screenshot(tab, params);
+  if (method === "engine.captureViewport") {
+    await showTab(tab);
+    return { screenshot: await captureViewport(tab.windowId), url: tab.url };
+  }
+  if (method === "engine.eval") return await evalInPage(tab.id, params);
+  if (method === "engine.diagnostics") {
+    const since = params.since || 0;
+    const page = await callEngine(tab.id, "diagnostics", { since }).catch(() => ({ console: [], media: [] }));
+    return { network: (NET.get(tab.id) || []).filter((n) => n.ts >= since), ...page };
+  }
+  // Everything else is a content-engine method of the same name.
+  const ENGINE = {
+    "engine.locate": "locate", "engine.scroll": "scrollPage", "engine.waitFor": "waitFor",
+    "engine.waitForStable": "waitForStable", "engine.settle": "settle", "engine.pageState": "pageState",
+    "engine.inspect": "inspect", "engine.detectWall": "detectWall",
+    "engine.pageMetrics": "pageMetrics", "engine.hoverState": "hoverState",
+  };
+  if (ENGINE[method]) return await callEngine(tab.id, ENGINE[method], params);
+  // Anything else named engine.* goes to the content engine as-is; it answers
+  // "unknown engine method" for names it does not have, so a new engine
+  // method needs no entry here.
+  if (method.startsWith("engine.")) return await callEngine(tab.id, method.slice("engine.".length), params);
   throw new Error(`unknown method: ${method}`);
+}
+
+// Run a function in the page's own JS world. Best effort: a page the
+// extension cannot script (chrome://, the web store) simply goes without.
+async function injectMain(tabId, func) {
+  await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, world: "MAIN", func }).catch(() => {});
+}
+
+// setPointerCapture throws for a pointer the browser does not know — which is
+// every synthetic one — and a scrubber whose pointerdown handler throws never
+// starts dragging. Let the call succeed for synthetic pointers, and mark the
+// element that asked so the engine can send the moves to it, as the browser
+// would for a captured pointer.
+function pointerCaptureShim() {
+  if (window.__abPointerShim) return;
+  window.__abPointerShim = true;
+  const proto = Element.prototype;
+  const set = proto.setPointerCapture;
+  const release = proto.releasePointerCapture;
+  const has = proto.hasPointerCapture;
+  const synthetic = new WeakSet();
+  proto.setPointerCapture = function (id) {
+    try {
+      return set.call(this, id);
+    } catch (e) {
+      if (!document.documentElement.hasAttribute("data-ab-gesture")) throw e;
+      document.querySelectorAll("[data-ab-captured]").forEach((n) => n.removeAttribute("data-ab-captured"));
+      this.setAttribute("data-ab-captured", "");
+      synthetic.add(this);
+    }
+  };
+  proto.releasePointerCapture = function (id) {
+    if (synthetic.has(this)) {
+      synthetic.delete(this);
+      this.removeAttribute("data-ab-captured");
+      return;
+    }
+    return release.call(this, id);
+  };
+  proto.hasPointerCapture = function (id) {
+    return synthetic.has(this) || has.call(this, id);
+  };
+}
+
+// browser_eval: an expression evaluated in the page's own world, its value
+// returned as JSON. The page's Content-Security-Policy applies — a page that
+// forbids eval gets EVAL_BLOCKED_BY_CSP, not a silent nothing.
+async function evalInPage(tabId, params) {
+  const [res] = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    args: [params.expression, params.awaitPromise !== false, Math.min(params.timeoutMs || 5000, 25000)],
+    func: async (expression, awaitPromise, timeoutMs) => {
+      const describe = (n) =>
+        n instanceof Element
+          ? `<${n.tagName.toLowerCase()}${n.id ? "#" + n.id : ""}${n.classList.length ? "." + [...n.classList].slice(0, 3).join(".") : ""}>`
+          : String(n);
+      const seen = new WeakSet();
+      const replacer = (_k, v) => {
+        if (v instanceof Node) return describe(v);
+        if (typeof v === "function") return `[function ${v.name || "anonymous"}]`;
+        if (typeof v === "bigint") return String(v);
+        if (v && typeof v === "object") {
+          if (seen.has(v)) return "[circular]";
+          seen.add(v);
+        }
+        return v;
+      };
+      let value;
+      try {
+        value = (0, eval)(expression);
+        if (awaitPromise && value && typeof value.then === "function")
+          value = await Promise.race([
+            value,
+            new Promise((_, rej) => setTimeout(() => rej(new Error(`the promise did not settle within ${timeoutMs}ms`)), timeoutMs)),
+          ]);
+      } catch (e) {
+        const msg = String((e && e.message) || e);
+        return { error: msg, csp: /unsafe-eval|Content Security Policy|EvalError/i.test(msg) || (e && e.name === "EvalError") };
+      }
+      let json;
+      try {
+        json = JSON.stringify(value === undefined ? null : value, replacer);
+      } catch (e) {
+        return { error: `the value could not be turned into JSON: ${(e && e.message) || e}` };
+      }
+      const max = 20000;
+      return json.length > max ? { json: json.slice(0, max), truncated: true, totalChars: json.length } : { json };
+    },
+  });
+  const r = res?.result;
+  if (!r) throw tagged("EVAL_FAILED", "EVAL_FAILED: the page returned nothing (it may have navigated)");
+  if (r.error)
+    throw tagged(r.csp ? "EVAL_BLOCKED_BY_CSP" : "EVAL_FAILED", `${r.csp ? "EVAL_BLOCKED_BY_CSP" : "EVAL_FAILED"}: ${r.error}`);
+  let value;
+  try {
+    value = r.truncated ? r.json : JSON.parse(r.json);
+  } catch {
+    value = r.json;
+  }
+  return { value, ...(r.truncated ? { truncated: true, totalChars: r.totalChars } : {}) };
 }
 
 // Robust auto-click that runs in the PAGE's own JS world via chrome.scripting
@@ -680,15 +1116,51 @@ function dialogTamer() {
     e.stopImmediatePropagation();
     delete e.returnValue;
   }, true);
+  // A page can ask the browser to save a credential (credentials.store) with
+  // no prompt at all. In this persistent profile that would keep a test
+  // password for good; refuse it and say so in the action's result.
+  try {
+    if (navigator.credentials && typeof navigator.credentials.store === "function") {
+      navigator.credentials.store = (cred) => {
+        window.dispatchEvent(new CustomEvent("ab-credential", {
+          detail: { kind: "credentials.store", type: String(cred?.type ?? ""), id: String(cred?.id ?? ""), ts: Date.now() },
+        }));
+        return Promise.resolve(undefined);
+      };
+    }
+  } catch {}
 }
 
 chrome.webNavigation.onCommitted.addListener((d) => {
+  // A mobile-emulated tab keeps its page-world patches on every load.
+  if (MOBILE.has(d.tabId))
+    chrome.scripting.executeScript({ target: { tabId: d.tabId, frameIds: [d.frameId] }, world: "MAIN", injectImmediately: true, func: mobilePatch, args: [MOBILE.get(d.tabId).ua] }).catch(() => {});
   if (d.frameId !== 0) return;
-  recordNav(d.url); // so redirect-based flows can be inspected after the fact
+  recordNav(d.url, d.tabId); // so redirect-based flows can be inspected after the fact
+  NAV_COUNT.set(d.tabId, (NAV_COUNT.get(d.tabId) || 0) + 1);
   ensureConnected(); // navigation wakes the SW — opportunistically (re)connect
   chrome.scripting
     .executeScript({ target: { tabId: d.tabId }, world: "MAIN", func: dialogTamer })
     .catch(() => {});
+  // Private-network dev servers cannot be written as match patterns; hook
+  // them here instead (a little later than document_start).
+  let host = "";
+  try { host = new URL(d.url).hostname; } catch {}
+  if (PRIVATE_IP.test(host))
+    chrome.scripting
+      .executeScript({ target: { tabId: d.tabId }, world: "MAIN", files: ["src/content/diag-hook.js"] })
+      .catch(() => {});
+});
+// A same-document route change (pushState, a hash route) is a navigation too.
+chrome.webNavigation.onHistoryStateUpdated.addListener((d) => {
+  if (d.frameId !== 0) return;
+  recordNav(d.url, d.tabId);
+  NAV_COUNT.set(d.tabId, (NAV_COUNT.get(d.tabId) || 0) + 1);
+});
+chrome.webNavigation.onReferenceFragmentUpdated.addListener((d) => {
+  if (d.frameId !== 0) return;
+  recordNav(d.url, d.tabId);
+  NAV_COUNT.set(d.tabId, (NAV_COUNT.get(d.tabId) || 0) + 1);
 });
 
 // Backstop: chrome.alarms survives SW suspension and wakes it to reconnect.
@@ -702,23 +1174,38 @@ chrome.runtime.onInstalled.addListener(ensureConnected);
 // Chrome keeps running an unpacked extension's cached service worker after
 // sw.js changes on disk — across browser restarts, and even past a manifest
 // version bump — until someone presses Reload on chrome://extensions. The
-// content engine is read fresh from disk, so after an update the two halves
-// silently disagree (this worker sat on a September build for a month). On
-// every start, check the code actually running against the file on disk and
-// reload once if they differ.
+// worker also keeps the secret and port it imported when it was loaded, so
+// after an update the halves silently disagree (this worker sat on a
+// September build for a month; a test browser kept dialling last run's port).
+// On every start and every reconnect, compare the code running, and every
+// file the extension is made of, with what is on disk; reload once if they differ.
+const EXTENSION_FILES = ["manifest.json", "src/sw.js", "src/generated-secret.js", "src/content/engine.js", "src/content/diag-hook.js"];
+async function diskHash() {
+  let h = 5381;
+  for (const f of EXTENSION_FILES) {
+    const text = await (await fetch(chrome.runtime.getURL(f), { cache: "no-store" })).text().catch(() => "");
+    for (let i = 0; i < text.length; i++) h = ((h * 33) ^ text.charCodeAt(i)) >>> 0;
+  }
+  return h;
+}
 async function reloadIfStale() {
   try {
-    const disk = await (await fetch(chrome.runtime.getURL("src/sw.js"), { cache: "no-store" })).text();
-    const running = [connect, dispatch, callEngine, screenshot, captureRegion, robustClick, reloadIfStale];
-    if (running.every((fn) => disk.includes(String(fn)))) return;
+    const sw = await (await fetch(chrome.runtime.getURL("src/sw.js"), { cache: "no-store" })).text();
+    const running = [connect, dispatch, callEngine, screenshot, screenshotElement, captureRegion, robustClick, evalInPage, applyConfig, setViewport, setMobile, mobilePatch, diskHash, reloadIfStale];
+    const codeStale = !running.every((fn) => sw.includes(String(fn)));
+    const disk = await diskHash();
+    const { loadedFor, reloadedFor } = await chrome.storage.local.get(["loadedFor", "reloadedFor"]);
+    if (!codeStale && loadedFor === disk) return false;
+    // First start of this version of the check: take what is loaded as current.
+    if (!codeStale && loadedFor === undefined) {
+      await chrome.storage.local.set({ loadedFor: disk });
+      return false;
+    }
     // Remember which disk version we reloaded for, in storage that survives
     // the reload, so a reload that doesn't take can never loop.
-    let h = 5381;
-    for (let i = 0; i < disk.length; i++) h = ((h * 33) ^ disk.charCodeAt(i)) >>> 0;
-    const { swReloadedFor } = await chrome.storage.local.get("swReloadedFor");
-    if (swReloadedFor === h) return false;
-    await chrome.storage.local.set({ swReloadedFor: h });
-    console.log("[agent-bridge] running worker differs from src/sw.js on disk — reloading");
+    if (reloadedFor === disk) return false;
+    await chrome.storage.local.set({ loadedFor: disk, reloadedFor: disk });
+    console.log("[agent-bridge] the extension on disk differs from the one running — reloading");
     chrome.runtime.reload();
     return true;
   } catch (e) {

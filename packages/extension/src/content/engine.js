@@ -20,8 +20,33 @@
     "input[name*=pass]",
   ];
 
+  // Something a person would click although the markup does not say so: an
+  // <a> with no href but a handler (Bootstrap's data-toggle, an onclick), or a
+  // div wired the same way. Handlers added with addEventListener are
+  // invisible from here, so the pointer cursor stands in for them on <a>.
+  const HANDLER_ATTRS = ["onclick", "data-toggle", "data-bs-toggle", "ng-click", "v-on:click", "@click", "data-action"];
+  const hasHandlerAttr = (el) => HANDLER_ATTRS.some((a) => el.hasAttribute(a));
+  const pointerCursor = (el) => {
+    try {
+      return getComputedStyle(el).cursor === "pointer";
+    } catch {
+      return false;
+    }
+  };
+  function clickableNonLink(el) {
+    if (el.tagName === "A") return hasHandlerAttr(el) || el.hasAttribute("tabindex") || pointerCursor(el);
+    // A div or span: only with an explicit handler attribute, or focusable and
+    // drawn as clickable — a cursor alone would turn every card into a button.
+    return hasHandlerAttr(el) || (el.tabIndex >= 0 && el.hasAttribute("tabindex") && pointerCursor(el));
+  }
+
   const TAG_ROLE = {
-    A: (el) => (el.hasAttribute("href") ? "link" : "generic"),
+    A: (el) => (el.hasAttribute("href") ? "link" : clickableNonLink(el) ? "button" : "generic"),
+    DIV: (el) => (clickableNonLink(el) ? "button" : null),
+    SPAN: (el) => (clickableNonLink(el) ? "button" : null),
+    VIDEO: () => "video",
+    AUDIO: () => "audio",
+    IFRAME: () => "iframe",
     BUTTON: () => "button",
     INPUT: (el) => {
       const t = (el.getAttribute("type") || "text").toLowerCase();
@@ -73,7 +98,8 @@
     const explicit = el.getAttribute("role");
     if (explicit) return explicit.split(/\s+/)[0];
     const f = TAG_ROLE[el.tagName];
-    if (f) return f(el);
+    const r = f ? f(el) : null;
+    if (r) return r;
     return isEditingHost(el) ? "textbox" : null;
   }
 
@@ -127,6 +153,12 @@
       const frame = doc.defaultView?.frameElement;
       n = frame?.getAttribute("title") || frame?.getAttribute("aria-label") || "";
     }
+    // A video or audio element without a label: its file name.
+    if (!n.trim() && (r === "video" || r === "audio")) {
+      const src = el.currentSrc || el.getAttribute("src") || el.querySelector("source")?.getAttribute("src") || "";
+      n = src.split(/[?#]/)[0].split("/").pop() || r;
+    }
+    if (!n.trim() && r === "iframe") n = el.getAttribute("name") || el.getAttribute("src") || "";
     return clip(n, 100);
   }
 
@@ -204,6 +236,13 @@
     if (el.getAttribute("aria-selected") === "true") s.selected = true;
     if (/^h([1-6])$/i.test(el.tagName)) s.level = +el.tagName[1];
     if (el.getAttribute("aria-invalid") === "true") s.invalid = true;
+    // Toggle buttons (a colour swatch, bold in an editor) and the current
+    // page in a nav: state a test needs to assert, not just pixels.
+    const ap = el.getAttribute("aria-pressed");
+    if (ap) s.pressed = ap === "mixed" ? "mixed" : ap === "true";
+    const cur = el.getAttribute("aria-current");
+    if (cur && cur !== "false") s.current = cur === "true" ? true : cur;
+    if (el.tagName === "VIDEO" || el.tagName === "AUDIO") Object.assign(s, mediaState(el));
     if (el.tagName === "SELECT") {
       // The label a person sees, not just the option's value ("2").
       const opts = [...el.options];
@@ -240,6 +279,21 @@
     "switch",
     "option",
   ]);
+  // Media players are not controls, but an agent testing one needs to see them
+  // and their state (a video that failed to load is otherwise invisible).
+  const MEDIA = new Set(["video", "audio"]);
+  function mediaState(el) {
+    const s = {
+      paused: el.paused,
+      readyState: el.readyState,
+      networkState: el.networkState,
+      currentTime: Math.round(el.currentTime * 100) / 100,
+    };
+    if (Number.isFinite(el.duration)) s.duration = Math.round(el.duration * 100) / 100;
+    if (el.error) s.error = { code: el.error.code, message: clip(el.error.message, 80) };
+    return s;
+  }
+
   const LANDMARK = new Set([
     "navigation",
     "main",
@@ -301,17 +355,27 @@
     let omitted = 0;
     for (const { el, depth, crossOrigin } of walk(document.body, 0)) {
       if (crossOrigin) {
+        // A frame from another origin cannot be looked inside, but it is a
+        // thing on the page — often the very thing in the way (a captcha). It
+        // gets a ref, so it can be screenshotted and named in a result.
+        if (!visible(el)) continue;
+        ref += 1;
+        el.setAttribute("data-ab-ref", String(ref));
+        AB.refs.set(ref, el);
         if (out.length < maxNodes)
-          out.push({ depth, role: "iframe", name: clip(el.src, 60), crossOrigin: true });
+          out.push({
+            ref, depth, role: "iframe", name: clip(el.getAttribute("title") || el.src, 60), crossOrigin: true,
+            ...(isCaptchaFrame(el) ? { captcha: true } : {}),
+          });
         else omitted += 1;
         continue;
       }
       const r = role(el);
-      if (!r || r === "generic") continue;
+      if (!r || r === "generic" || r === "iframe") continue;
       if (!visible(el)) continue;
       const name = accName(el);
       const interactive = INTERACTIVE.has(r);
-      const landmark = LANDMARK.has(r);
+      const landmark = LANDMARK.has(r) || MEDIA.has(r);
       if (!interactive && !landmark) continue;
       if (!interactive && !name) continue;
 
@@ -323,6 +387,14 @@
         continue;
       }
       const st = state(el);
+      // Where a link goes and what an image shows, when asked: kept out of the
+      // default snapshot, where it would double the size of a link-heavy page.
+      if (opts.details) {
+        const href = el.getAttribute("href");
+        if (r === "link" && href) st.href = clip(el.href || href, 120);
+        const src = el.currentSrc || el.getAttribute("src");
+        if (src && (el.tagName === "IMG" || MEDIA.has(r))) st.src = clip(src, 120);
+      }
       out.push({
         ref,
         depth,
@@ -349,6 +421,16 @@
       ...(recentDialogs().length ? { dialogs: recentDialogs() } : {}),
       tree: out,
     };
+  }
+
+  // A ref for any element, given on demand (an occluder, a dismiss button).
+  function refFor(el) {
+    const have = +el.getAttribute("data-ab-ref") || 0;
+    if (have && AB.refs.get(have) === el) return have;
+    const r = Math.max(0, ...AB.refs.keys()) + 1;
+    el.setAttribute("data-ab-ref", String(r));
+    AB.refs.set(r, el);
+    return r;
   }
 
   function drawMarks() {
@@ -418,6 +500,12 @@
     const mode = params.mode || "semantic";
     if (mode === "read") return { url: location.href, title: document.title, ...readText(params) };
     const snap = buildTree(params);
+    const wall = detectWall();
+    if (wall) {
+      snap.outcome = "needs_human";
+      snap.needsHuman = wall;
+    }
+    Object.assign(snap, pageState());
     if (mode === "marks") {
       drawMarks();
       // The overlay has to reach the screen before the SW captures it, or the
@@ -437,6 +525,8 @@
       scrollX, scrollY, innerWidth, innerHeight,
       scrollHeight: Math.max(se.scrollHeight, innerHeight),
       devicePixelRatio,
+      // Where the page sits on the screen, for input from the operating system.
+      screenX, screenY, outerWidth, outerHeight,
     };
   }
 
@@ -574,6 +664,18 @@
         if (want && !name.toLowerCase().includes(want) && !(group && `${group} ${name}`.toLowerCase().includes(want))) continue;
         matches.push({ ref: r, role: role(el), name, ...(group ? { group } : {}) });
       }
+      // Best match first: the exact name, then one that starts with it, then
+      // any that contains it; controls before headings and landmarks. In page
+      // order, "Play" found the heading "Player" before the Play button.
+      if (want) {
+        const rank = (m) => {
+          const n = m.name.trim().toLowerCase();
+          const g = m.group ? `${m.group} ${m.name}`.trim().toLowerCase() : "";
+          const fit = n === want || g === want ? 0 : n.startsWith(want) ? 1 : 2;
+          return fit * 2 + (INTERACTIVE.has(m.role) ? 0 : 1);
+        };
+        matches.sort((a, b) => rank(a) - rank(b));
+      }
       return matches;
     };
     let matches = search();
@@ -618,6 +720,10 @@
       const e = new Error("NOT_ACTIONABLE: not visible"); e.code = "NOT_ACTIONABLE"; throw e;
     }
     if (el.disabled || el.getAttribute("aria-disabled") === "true") {
+      // Disabled inside a notice that a captcha guards: the button waits on a
+      // human, not on the agent.
+      const wall = detectWall();
+      if (wall && AB.refs.get(wall.node.ref)?.contains(el)) throw wallError(wall, "the element is disabled");
       const e = new Error("NOT_ACTIONABLE: disabled"); e.code = "NOT_ACTIONABLE"; throw e;
     }
     // Coordinates relative to the element's own frame, so ask that frame's
@@ -626,8 +732,12 @@
     const cx = b.left + b.width / 2, cy = b.top + b.height / 2;
     const top = el.ownerDocument.elementFromPoint(cx, cy);
     if (top && top !== el && !el.contains(top) && !top.contains(el)) {
-      const e = new Error("NOT_ACTIONABLE: occluded by another element");
-      e.code = "NOT_ACTIONABLE"; throw e;
+      const wall = detectWall();
+      if (wall && (wall.reason === "captcha" || AB.refs.get(wall.node.ref)?.contains(top))) throw wallError(wall, "the element is covered");
+      const e = new Error(`OCCLUDED: covered by ${selectorOf(top)}`);
+      e.code = "OCCLUDED";
+      e.detail = { occludedBy: selectorOf(top), occluder: nodeInfo(top) };
+      throw e;
     }
     return { cx, cy };
   }
@@ -685,7 +795,7 @@
         setter.call(el, previous);
         const fmt = { date: "YYYY-MM-DD", time: "HH:MM (24h)", "datetime-local": "YYYY-MM-DDTHH:MM", month: "YYYY-MM", week: "YYYY-Www", color: "#rrggbb" }[el.type] || "a valid number";
         const e = new Error(`INVALID_VALUE: this ${el.type} field rejected "${want}"; it expects ${fmt}`);
-        e.code = "NOT_ACTIONABLE";
+        e.code = "INVALID_VALUE";
         throw e;
       }
       // Only now tell the page: a rejected value never reaches its handlers.
@@ -775,7 +885,7 @@
     if (!opt) {
       const names = [...el.options].slice(0, 20).map((o) => `"${clip(o.text, 40)}"`).join(", ");
       const e = new Error(`NO_SUCH_OPTION: no option matching "${want}"; the options are ${names}`);
-      e.code = "NOT_ACTIONABLE";
+      e.code = "NO_SUCH_OPTION";
       throw e;
     }
     el.value = opt.value;
@@ -784,7 +894,13 @@
   }
 
   async function act(p = {}) {
-    const el = resolve(p.ref, p.gen); // throws STALE_SNAPSHOT / REF_NOT_FOUND
+    // Whatever an earlier hover left marked ends with the next action, as it
+    // would when the mouse moves on. Before the observer starts, so it is
+    // not counted as this action's effect.
+    if (AB.hovered || document.getElementById("__ab_hover")) clearHover();
+    // A pointer sequence may have no target: then it acts on the page.
+    const el = p.action === "pointer" && p.ref == null ? null : resolve(p.ref, p.gen); // throws STALE_SNAPSHOT / REF_NOT_FOUND
+    if (!el) return { acted: true, action: "pointer", changed: true, signals: {}, ...(await pointerSequence(null, p)), snapshotStale: true };
     // An editing host has no .value; its text is what typing changes.
     const valueOf = () => ("value" in el ? el.value : el.isContentEditable ? el.textContent : undefined);
     const before = { url: location.href, value: valueOf() };
@@ -798,18 +914,26 @@
     if (p.dialogText != null) root.setAttribute("data-ab-dialog-text", String(p.dialogText));
     else root.removeAttribute("data-ab-dialog-text");
     const dialogsBefore = AB.dialogs.length;
+    const credsBefore = (AB.credentials || []).length;
     let mutated = 0;
     let extra = {};
-    const mo = new MutationObserver((recs) => (mutated += recs.length));
+    // Our own markers (hover, gesture, refs) are not the page's doing.
+    const ours = (r) =>
+      (r.type === "attributes" && SELF_ATTRS.has(r.attributeName)) ||
+      [...r.addedNodes, ...r.removedNodes].some((n) => n.id === "__ab_hover");
+    const mo = new MutationObserver((recs) => (mutated += recs.filter((r) => !ours(r)).length));
     // Watch the element's own document too: a change inside an iframe is not
     // a mutation of the top page.
     for (const d of new Set([document, el.ownerDocument]))
       mo.observe(d.documentElement, { subtree: true, childList: true, attributes: true, characterData: true });
+    let hover = null;
     try {
       const { cx, cy } = await ensureActionable(el);
       switch (p.action) {
         case "click": await humanClick(el, cx, cy); break;
-        case "hover": fire(el, "pointerover", { clientX: cx, clientY: cy }); fire(el, "mouseover", {}); break;
+        case "hover": hover = await emulateHover(el, cx, cy); break;
+        case "drag": extra = await drag(el, p); break;
+        case "pointer": extra = await pointerSequence(el, p); break;
         case "focus": el.focus(); break;
         case "type": await humanType(el, p.value ?? "", false); break;
         case "fill": await humanType(el, p.value ?? "", true); break;
@@ -836,12 +960,34 @@
     // mutations, so domMutations alone reads 0 for a fill that worked.
     const valueChanged = before.value !== after.value || el.checked !== checkedBefore;
     const dialogs = AB.dialogs.slice(dialogsBefore);
+    const credentialStoreBlocked = (AB.credentials || []).slice(credsBefore);
+    // A hover that changed no style and ran no handler did nothing a person
+    // would see. Saying "acted" there was a lie an agent then reported.
+    if (hover && !hover.styleChanged && mutated === 0) {
+      clearHover();
+      const e = new Error(
+        "HOVER_NOT_EFFECTIVE: hovering changed nothing on the page" +
+          (hover.unreadableStylesheets ? ` (${hover.unreadableStylesheets} stylesheet(s) from another origin could not be read, so their :hover rules could not be applied)` : "") +
+          "; a real mouse hover cannot be made without CDP",
+      );
+      e.code = "HOVER_NOT_EFFECTIVE";
+      e.detail = { hoverRules: hover.hoverRules, unreadableStylesheets: hover.unreadableStylesheets || 0 };
+      throw e;
+    }
+    const { drag: dragInfo, rects, value: dragValue, valuenow, note, pointer, ...signalsExtra } = extra;
     return {
       acted: true,
       action: p.action,
-      changed: before.url !== after.url || valueChanged || mutated > 0 || !!extra.submitted || dialogs.length > 0,
-      signals: { navigated: before.url !== after.url, domMutations: mutated, valueChanged, ...extra },
+      changed:
+        before.url !== after.url || valueChanged || mutated > 0 || !!extra.submitted || dialogs.length > 0 || !!hover?.styleChanged ||
+        (!!rects && JSON.stringify(rects.before) !== JSON.stringify(rects.after)),
+      signals: { navigated: before.url !== after.url, domMutations: mutated, valueChanged, ...signalsExtra, ...(hover ? { hoverStyleChanged: hover.styleChanged } : {}) },
+      ...(hover ? { hover: { emulated: true, hoverRules: hover.hoverRules, ...(hover.unreadableStylesheets ? { unreadableStylesheets: hover.unreadableStylesheets } : {}) } } : {}),
+      ...(dragInfo ? { drag: dragInfo, rects, ...(dragValue ? { value: dragValue } : {}), ...(valuenow ? { valuenow } : {}), ...(note ? { note } : {}) } : {}),
+      ...(pointer ? { pointer } : {}),
       ...(dialogs.length ? { dialogs } : {}),
+      ...(credentialStoreBlocked.length ? { credentialStoreBlocked } : {}),
+      ...(el.type === "password" && ["type", "fill"].includes(p.action) ? { passwordField: true, host: location.host } : {}),
       snapshotStale: true, // caller should re-observe
     };
   }
@@ -933,6 +1079,590 @@
     return { navigating: true, to: p.url || p.action, historyLength };
   }
 
+  // ---- human walls: a captcha, or a notice that must be accepted, standing
+  //      between the agent and the page. Without this an agent sees disabled
+  //      or covered controls, gives up, and reports "no results".
+  const CAPTCHA_SRC = /mtcaptcha|hcaptcha|recaptcha|turnstile|challenges\.cloudflare|arkoselabs|funcaptcha|geetest|captcha/i;
+  const WALL_TEXT = /consent|cookie|notice to users|terms of (use|service)|verify|verification|are you human|not a robot|robot|captcha|驗證|验证|同意|通知|私隱|隱私|條款/i;
+  const DISMISS = /^\s*(accept( all)?|agree|i agree|i accept|ok|okay|got it|allow( all)?|continue|close|dismiss|同意|接受|確定|确定|我同意|關閉|关闭|知道了)\s*$/i;
+
+  function isCaptchaFrame(el) {
+    const src = el.getAttribute("src") || el.getAttribute("title") || "";
+    if (!CAPTCHA_SRC.test(src)) return false;
+    // reCAPTCHA v3's corner badge is not a wall.
+    if (el.closest(".grecaptcha-badge") || /size=invisible/.test(src)) return false;
+    return visible(el);
+  }
+
+  // A short CSS-ish description of an element, to name it in a result.
+  function selectorOf(el) {
+    if (!el || el.nodeType !== 1) return "";
+    const id = el.id ? `#${el.id}` : "";
+    const cls = [...el.classList].slice(0, 2).map((c) => `.${c}`).join("");
+    return clip(`${el.tagName.toLowerCase()}${id}${cls}`, 80);
+  }
+
+  const fixedAncestor = (el) => {
+    for (let n = el; n && n.nodeType === 1 && n !== n.ownerDocument.body; n = n.parentElement) {
+      const pos = getComputedStyle(n).position;
+      if (pos === "fixed" || pos === "sticky") return n;
+    }
+    return null;
+  };
+
+  // Open dialogs and overlays: marked-up dialogs, and a fixed layer covering
+  // the middle of the screen.
+  function overlayRoots() {
+    const found = new Set();
+    document
+      .querySelectorAll('dialog[open], [aria-modal="true"], [role="dialog"], [role="alertdialog"], .modal.show, .modal.in')
+      .forEach((el) => visible(el) && found.add(el));
+    for (const [x, y] of [[innerWidth / 2, innerHeight / 2], [innerWidth / 2, innerHeight - 24]]) {
+      const hit = document.elementFromPoint(x, y);
+      const f = hit && fixedAncestor(hit);
+      if (f && f.getBoundingClientRect().width > innerWidth * 0.3) found.add(f);
+    }
+    // Innermost first is not wanted here: keep the outermost of nested ones.
+    return [...found].filter((el) => ![...found].some((o) => o !== el && o.contains(el)));
+  }
+
+  function nodeInfo(el) {
+    const v = viewRect(el);
+    return {
+      ref: refFor(el),
+      role: role(el) || el.tagName.toLowerCase(),
+      name: accName(el) || clip(el.innerText || el.getAttribute("src") || "", 80),
+      rect: { x: Math.round(v.left), y: Math.round(v.top), width: Math.round(v.width), height: Math.round(v.height) },
+    };
+  }
+
+  function detectWall() {
+    const frames = [...document.querySelectorAll("iframe")].filter(isCaptchaFrame);
+    const roots = overlayRoots();
+    // A captcha is a wall wherever it is: no agent can pass it.
+    if (frames.length) {
+      const f = frames[0];
+      const within = roots.find((r) => r.contains(f));
+      const heading = within?.querySelector("h1,h2,h3,h4,h5,h6,[role=heading]");
+      return {
+        reason: "captcha",
+        agentCanFix: false,
+        node: nodeInfo(f),
+        ...(within ? { within: selectorOf(within), ...(heading ? { title: clip(heading.textContent, 80) } : {}) } : {}),
+      };
+    }
+    for (const root of roots) {
+      // A notice or banner is short. A fixed layer holding a whole app is
+      // not a wall, whatever words its content happens to contain.
+      const full = root.innerText || "";
+      if (full.length > 5000) continue;
+      const headings = [...root.querySelectorAll("h1,h2,h3,h4,h5,h6,[role=heading],legend,strong")].map((h) => h.textContent).join(" ");
+      const text = `${headings} ${clip(full, 300)}`;
+      const buttons = [...root.querySelectorAll('button, [role=button], input[type=submit], input[type=button], a')].filter(visible);
+      const name = (b) => accName(b) || clip(b.value || b.textContent, 40);
+      const dismiss = buttons.filter((b) => DISMISS.test(name(b)));
+      const enabled = dismiss.filter((b) => !b.disabled && b.getAttribute("aria-disabled") !== "true");
+      // A notice whose only way out is disabled: something else (usually a
+      // check the agent cannot do) must happen first.
+      if (dismiss.length && !enabled.length)
+        return { reason: "consent", agentCanFix: false, node: nodeInfo(root), dismiss: { ...nodeInfo(dismiss[0]), disabled: true } };
+      if (WALL_TEXT.test(text) && enabled.length)
+        return { reason: "consent", agentCanFix: true, node: nodeInfo(root), dismiss: nodeInfo(enabled[0]) };
+    }
+    return null;
+  }
+
+  const wallError = (wall, what) => {
+    const e = new Error(
+      `NEEDS_HUMAN: ${what} — ${wall.reason === "captcha" ? "a captcha" : "a notice"} blocks the page` +
+        (wall.dismiss && wall.agentCanFix ? ` (dismiss it: ref ${wall.dismiss.ref} "${wall.dismiss.name}")` : ""),
+    );
+    e.code = wall.agentCanFix ? "OCCLUDED" : "NEEDS_HUMAN";
+    e.detail = { needsHuman: wall };
+    return e;
+  };
+
+  // ---- element capture: put the element where a screenshot can see all of
+  //      it, and make sure nothing lies on top.
+  async function prepareElementCapture(p = {}) {
+    const el = resolve(p.ref, p.gen);
+    const fits = el.getBoundingClientRect().height <= innerHeight - 16;
+    // Centre, not top: a sticky header sits at the top, and an element
+    // scrolled there ends up under it.
+    el.scrollIntoView({ block: fits ? "center" : "start", inline: "nearest", behavior: "instant" });
+    await nextPaint(250);
+    const doc = el.ownerDocument;
+    const b = el.getBoundingClientRect();
+    const w = doc.defaultView;
+    const xs = [b.left + 3, b.left + b.width / 2, b.right - 3].map((x) => Math.min(Math.max(x, 1), w.innerWidth - 1));
+    const top = Math.min(Math.max(b.top + 3, 1), w.innerHeight - 1);
+    const bottom = Math.min(Math.max(b.bottom - 3, 1), w.innerHeight - 1);
+    const points = fits ? [...xs.map((x) => [x, top]), ...xs.map((x) => [x, bottom]), [xs[1], (top + bottom) / 2]] : xs.map((x) => [x, top]);
+    const overlays = new Set();
+    let blocker = null;
+    for (const [x, y] of points) {
+      const hit = doc.elementFromPoint(x, y);
+      if (!hit || hit === el || el.contains(hit) || hit.contains(el)) continue;
+      const f = fixedAncestor(hit);
+      if (f && !f.contains(el)) overlays.add(f);
+      else if (!f) blocker = blocker || hit;
+    }
+    if (blocker) {
+      const wall = detectWall();
+      if (wall && (wall.reason === "captcha" || AB.refs.get(wall.node.ref)?.contains(blocker))) throw wallError(wall, "the element is covered");
+      const e = new Error(`OCCLUDED: the element is covered by ${selectorOf(blocker)}`);
+      e.code = "OCCLUDED";
+      e.detail = { occludedBy: selectorOf(blocker), occluder: nodeInfo(blocker) };
+      throw e;
+    }
+    // Fixed and sticky bars over the element are hidden for the capture; the
+    // caller restores them (restoreFixed) and the result names them.
+    const hidden = AB.hiddenFixed || (AB.hiddenFixed = []);
+    for (const o of overlays) {
+      hidden.push([o, o.style.getPropertyValue("visibility"), o.style.getPropertyPriority("visibility")]);
+      o.style.setProperty("visibility", "hidden", "important");
+    }
+    if (overlays.size) await nextPaint(150);
+    return { ...rectOf(p), fits, hidOverlays: [...overlays].map(selectorOf) };
+  }
+
+  // ---- settled pages and change detection.
+  function layoutHash() {
+    const se = document.scrollingElement || document.documentElement;
+    const parts = [se.scrollHeight, innerWidth];
+    const add = (el) => {
+      const r = el.getBoundingClientRect();
+      parts.push(r.x | 0, (r.y + scrollY) | 0, r.width | 0, r.height | 0);
+    };
+    if (document.body) {
+      add(document.body);
+      const top = [...document.body.children].slice(0, 40);
+      top.forEach(add);
+      // An app mounted in one root element: its children are the layout.
+      if (top.length <= 3) for (const t of top) [...t.children].slice(0, 40).forEach(add);
+    }
+    let h = 5381;
+    for (const n of parts) h = ((h * 33) ^ n) >>> 0;
+    return h.toString(36);
+  }
+
+  // documentGeneration: changes on every new document, every same-document
+  // URL change, and every large DOM replacement (an SPA swapping its view).
+  AB.docId = AB.docId || Math.random().toString(36).slice(2, 8);
+  AB.majorGen = AB.majorGen || 0;
+  if (!AB.genObserver && document.body) {
+    AB.genObserver = new MutationObserver((recs) => {
+      for (const r of recs)
+        for (const n of r.removedNodes)
+          if (n.nodeType === 1 && n.getElementsByTagName("*").length > 25) return void (AB.majorGen += 1);
+    });
+    AB.genObserver.observe(document.body, { childList: true, subtree: true });
+  }
+  function pageState() {
+    if (AB.lastHref !== location.href) {
+      if (AB.lastHref) AB.majorGen += 1;
+      AB.lastHref = location.href;
+    }
+    const se = document.scrollingElement || document.documentElement;
+    return { documentGeneration: `${AB.docId}.${AB.majorGen}`, layoutHash: layoutHash(), pageHeight: se.scrollHeight, scrollY: Math.round(scrollY), url: location.href };
+  }
+
+  // Wait until nothing is moving: fonts loaded, no finite animation running,
+  // layout unchanged and no request finishing for quietMs. Bounded; says why
+  // when it gives up. A capture of a page mid-animation is how two shots of
+  // "the same page" once differed, and an agent took that for a bug fixed.
+  async function settle(p = {}) {
+    const maxMs = Math.min(p.maxMs ?? 3000, 15000);
+    const quiet = p.quietMs ?? 300;
+    const t0 = performance.now();
+    let lastRes = t0;
+    let po;
+    try {
+      po = new PerformanceObserver(() => (lastRes = performance.now()));
+      po.observe({ type: "resource", buffered: false });
+    } catch {}
+    let hash = layoutHash();
+    let lastChange = t0;
+    const running = () =>
+      document.getAnimations().filter((a) => {
+        if (a.playState !== "running") return false;
+        const end = a.effect?.getComputedTiming?.().endTime;
+        return Number.isFinite(end);
+      });
+    let why = "";
+    try {
+      for (;;) {
+        const now = performance.now();
+        const h = layoutHash();
+        if (h !== hash) {
+          hash = h;
+          lastChange = now;
+        }
+        const anims = running();
+        why =
+          document.readyState !== "complete" ? "the document is still loading"
+          : document.fonts?.status === "loading" ? "fonts are still loading"
+          : anims.length ? `${anims.length} animation${anims.length > 1 ? "s" : ""} still running`
+          : now - lastChange < quiet ? "the layout is still moving"
+          : now - lastRes < quiet ? "requests are still finishing"
+          : "";
+        if (!why) {
+          const infinite = document.getAnimations().filter((a) => a.playState === "running").length;
+          return { settled: true, settleMs: Math.round(now - t0), ...(infinite ? { infiniteAnimations: infinite } : {}) };
+        }
+        if (now - t0 >= maxMs) return { settled: false, settleMs: Math.round(now - t0), reason: why };
+        await sleep(50);
+      }
+    } finally {
+      po?.disconnect();
+    }
+  }
+
+  // ---- hover. CSS :hover follows the real mouse, which a page script cannot
+  //      move. So: copy every :hover rule the page's stylesheets can be read
+  //      for as a [data-ab-hover] rule, and mark the element and its
+  //      ancestors. Then check something actually changed; if not, say so.
+  const HOVER_ATTR = "data-ab-hover";
+  const SELF_ATTRS = new Set([HOVER_ATTR, "data-ab-gesture", "data-ab-captured", "data-ab-ref", "data-ab-dialog", "data-ab-dialog-text"]);
+  function hoverCss(doc) {
+    let unreadable = 0;
+    let rules = 0;
+    const collect = (list, out) => {
+      for (const r of list) {
+        const text = r.cssText;
+        if (!text.includes(":hover")) continue;
+        if (r.type === CSSRule.STYLE_RULE) {
+          out.push(text.replace(/:hover\b/g, `[${HOVER_ATTR}]`));
+          rules += 1;
+        } else if (r.cssRules) {
+          const inner = [];
+          collect(r.cssRules, inner);
+          if (inner.length) out.push(`${text.slice(0, text.indexOf("{"))}{${inner.join("\n")}}`);
+        }
+      }
+    };
+    const out = [];
+    for (const sheet of [...doc.styleSheets, ...(doc.adoptedStyleSheets || [])]) {
+      if (sheet.ownerNode?.id === "__ab_hover") continue;
+      let list;
+      try {
+        list = sheet.cssRules;
+      } catch {
+        unreadable += 1; // another origin's stylesheet, served without CORS
+        continue;
+      }
+      collect(list, out);
+    }
+    return { css: out.join("\n"), rules, unreadable };
+  }
+  const HOVER_PROPS = ["opacity", "visibility", "display", "background-image", "background-color", "color", "transform", "filter", "box-shadow", "border-color", "text-decoration-line", "outline-style"];
+  function styleSnapshot(el) {
+    const nodes = [el, ...[...el.querySelectorAll("*")].slice(0, 200)];
+    return nodes.map((n) => {
+      const cs = getComputedStyle(n);
+      return HOVER_PROPS.map((p) => cs.getPropertyValue(p)).join("|");
+    });
+  }
+  function clearHover() {
+    for (const d of [document, ...(AB.frameDocs || [])]) {
+      try {
+        d.querySelectorAll(`[${HOVER_ATTR}]`).forEach((n) => n.removeAttribute(HOVER_ATTR));
+        d.getElementById("__ab_hover")?.remove();
+      } catch {}
+    }
+    if (AB.hovered?.isConnected) {
+      fire(AB.hovered, "pointerout");
+      fire(AB.hovered, "pointerleave", { bubbles: false });
+      fire(AB.hovered, "mouseout");
+      fire(AB.hovered, "mouseleave", { bubbles: false });
+    }
+    AB.hovered = null;
+  }
+  async function emulateHover(el, cx, cy) {
+    const doc = el.ownerDocument;
+    const before = styleSnapshot(el);
+    const { css, rules, unreadable } = hoverCss(doc);
+    if (css) {
+      const style = doc.createElement("style");
+      style.id = "__ab_hover";
+      style.textContent = css;
+      (doc.head || doc.documentElement).appendChild(style);
+    }
+    for (let n = el; n && n.nodeType === 1; n = n.parentElement) n.setAttribute(HOVER_ATTR, "");
+    AB.hovered = el;
+    const at = { clientX: cx, clientY: cy };
+    fire(el, "pointerover", at); fire(el, "pointerenter", { ...at, bubbles: false });
+    fire(el, "mouseover", at); fire(el, "mouseenter", { ...at, bubbles: false });
+    fire(el, "pointermove", at); fire(el, "mousemove", at);
+    // Long enough for a transition to have visibly started.
+    await sleep(180);
+    const after = styleSnapshot(el);
+    const styleChanged = after.some((v, i) => v !== before[i]);
+    return { styleChanged, hoverRules: rules, ...(unreadable ? { unreadableStylesheets: unreadable } : {}) };
+  }
+
+  // ---- drag and pointer sequences. Synthetic events (isTrusted:false): the
+  //      only kind a page script can make without CDP.
+  function pointIn(el, at) {
+    const b = el.getBoundingClientRect();
+    const v = (spec, size, start) => {
+      if (spec == null) return start + size / 2;
+      const s = String(spec).trim();
+      return start + (s.endsWith("%") ? (parseFloat(s) / 100) * size : parseFloat(s));
+    };
+    return { x: v(at?.x, b.width, b.left), y: v(at?.y, b.height, b.top) };
+  }
+  const captured = (doc) => doc.querySelector("[data-ab-captured]");
+  const box = (el) => {
+    const r = el.getBoundingClientRect();
+    return { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) };
+  };
+  const modifiersOf = (m = {}) => ({ shiftKey: !!m.shift, ctrlKey: !!m.ctrl, altKey: !!m.alt, metaKey: !!m.meta });
+
+  async function drag(el, p) {
+    const doc = el.ownerDocument;
+    const steps = Math.max(1, Math.min(p.steps ?? 10, 100));
+    const start = pointIn(el, p.at);
+    // The target is found here, in the same pass as the source: a second
+    // lookup from the server could re-index the page and renumber refs.
+    let toEl = p.toRef != null ? resolve(p.toRef) : null;
+    if (!toEl && p.toLocator) {
+      const m = locate(p.toLocator).matches[0];
+      if (!m) {
+        const e = new Error(`NO_MATCH: no drop target matching role=${p.toLocator.role ?? "any"} name="${p.toLocator.name ?? ""}"`);
+        e.code = "NO_MATCH";
+        throw e;
+      }
+      toEl = AB.refs.get(m.ref);
+    }
+    const end = toEl ? pointIn(toEl, p.toAt) : p.toPoint ? { x: p.toPoint.x, y: p.toPoint.y } : null;
+    if (!end) {
+      const e = new Error("BAD_REQUEST: drag needs a target (to: name/ref, or a point)"); e.code = "BAD_REQUEST"; throw e;
+    }
+    const valueOf = (n) => ("value" in n ? n.value : undefined);
+    const before = { from: box(el), ...(toEl ? { to: box(toEl) } : {}), value: valueOf(el), valuenow: el.getAttribute("aria-valuenow") };
+
+    // A range input: its value is where the thumb ends up.
+    if (el.tagName === "INPUT" && el.type === "range") {
+      const b = el.getBoundingClientRect();
+      const min = +el.min || 0, max = el.max === "" ? 100 : +el.max, step = el.step === "any" ? 0 : +el.step || 1;
+      let v = min + Math.min(1, Math.max(0, (end.x - b.left) / b.width)) * (max - min);
+      if (step) v = min + Math.round((v - min) / step) * step;
+      nativeSetter(el).call(el, String(v));
+      fire(el, "input");
+      fire(el, "change");
+    } else {
+      const root = doc.documentElement;
+      root.setAttribute("data-ab-gesture", "");
+      const base = { pointerId: 1, pointerType: p.pointerType || "mouse", isPrimary: true, ...modifiersOf(p.modifiers) };
+      const dnd = el.closest('[draggable="true"]') || (el.draggable && el.tagName !== "IMG" && el.tagName !== "A" ? el : null);
+      try {
+        const at = (x, y) => ({ clientX: x, clientY: y });
+        fire(el, "pointerover", at(start.x, start.y)); fire(el, "pointerenter", { ...at(start.x, start.y), bubbles: false });
+        fire(el, "pointerdown", { ...base, ...at(start.x, start.y), button: 0, buttons: 1 });
+        fire(el, "mousedown", { ...at(start.x, start.y), button: 0, buttons: 1, ...modifiersOf(p.modifiers) });
+        if (p.holdMs) await sleep(p.holdMs);
+        let dt = null;
+        let over = null;
+        let accepted = false;
+        if (dnd) {
+          dt = new DataTransfer();
+          dnd.dispatchEvent(new DragEvent("dragstart", { bubbles: true, cancelable: true, composed: true, dataTransfer: dt, ...at(start.x, start.y) }));
+        }
+        let last = el;
+        for (let i = 1; i <= steps; i++) {
+          const x = start.x + ((end.x - start.x) * i) / steps;
+          const y = start.y + ((end.y - start.y) * i) / steps;
+          const hit = captured(doc) || doc.elementFromPoint(x, y) || last;
+          if (dnd) {
+            const target = doc.elementFromPoint(x, y) || last;
+            if (target !== over) {
+              target.dispatchEvent(new DragEvent("dragenter", { bubbles: true, cancelable: true, composed: true, dataTransfer: dt, ...at(x, y) }));
+              over?.dispatchEvent(new DragEvent("dragleave", { bubbles: true, composed: true, dataTransfer: dt, ...at(x, y) }));
+              over = target;
+            }
+            accepted = !target.dispatchEvent(new DragEvent("dragover", { bubbles: true, cancelable: true, composed: true, dataTransfer: dt, ...at(x, y) }));
+            dnd.dispatchEvent(new DragEvent("drag", { bubbles: true, composed: true, dataTransfer: dt, ...at(x, y) }));
+          } else {
+            fire(hit, "pointermove", { ...base, ...at(x, y), buttons: 1 });
+            fire(hit, "mousemove", { ...at(x, y), buttons: 1, ...modifiersOf(p.modifiers) });
+          }
+          last = hit;
+          await sleep(16);
+        }
+        const finalTarget = captured(doc) || doc.elementFromPoint(end.x, end.y) || last;
+        if (dnd) {
+          // A browser drops only on a target that accepted the drag (cancelled dragover).
+          if (accepted) over.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, composed: true, dataTransfer: dt, ...at(end.x, end.y) }));
+          dnd.dispatchEvent(new DragEvent("dragend", { bubbles: true, composed: true, dataTransfer: dt, ...at(end.x, end.y) }));
+        }
+        fire(finalTarget, "pointerup", { ...base, ...at(end.x, end.y), button: 0, buttons: 0 });
+        fire(finalTarget, "mouseup", { ...at(end.x, end.y), button: 0, buttons: 0, ...modifiersOf(p.modifiers) });
+        if (dnd && !accepted) AB.dragNote = "the drop target did not accept the drag (no dragover handler cancelled it), so nothing was dropped";
+      } finally {
+        root.removeAttribute("data-ab-gesture");
+        doc.querySelectorAll("[data-ab-captured]").forEach((n) => n.removeAttribute("data-ab-captured"));
+      }
+    }
+    await sleep(60);
+    const after = { from: box(el), ...(toEl ? { to: box(toEl) } : {}), value: valueOf(el), valuenow: el.getAttribute("aria-valuenow") };
+    const note = AB.dragNote;
+    AB.dragNote = null;
+    return {
+      drag: { start: { x: Math.round(start.x), y: Math.round(start.y) }, end: { x: Math.round(end.x), y: Math.round(end.y) }, steps },
+      rects: { before: { from: before.from, to: before.to }, after: { from: after.from, to: after.to } },
+      ...(before.value !== after.value ? { value: { before: before.value, after: after.value } } : {}),
+      ...(before.valuenow !== after.valuenow ? { valuenow: { before: before.valuenow, after: after.valuenow } } : {}),
+      ...(note ? { note } : {}),
+    };
+  }
+
+  // An explicit sequence of pointer events: down / move / up / wheel.
+  async function pointerSequence(el, p) {
+    const doc = el ? el.ownerDocument : document;
+    const root = doc.documentElement;
+    root.setAttribute("data-ab-gesture", "");
+    let last = el || doc.body;
+    const done = [];
+    try {
+      for (const s of p.sequence || []) {
+        const pt = s.x != null && s.y != null ? { x: s.x, y: s.y } : el ? pointIn(el, s.at) : null;
+        if (!pt) {
+          const e = new Error("BAD_REQUEST: each step needs x and y, or a target and `at`"); e.code = "BAD_REQUEST"; throw e;
+        }
+        const target = captured(doc) || doc.elementFromPoint(pt.x, pt.y) || last;
+        const mods = modifiersOf(s.modifiers);
+        const buttons = s.buttons ?? (s.type === "down" || (s.type === "move" && AB.pointerDown) ? 1 : 0);
+        const init = { pointerId: 1, pointerType: s.pointerType || p.pointerType || "mouse", isPrimary: true, clientX: pt.x, clientY: pt.y, buttons, button: s.type === "move" || s.type === "wheel" ? -1 : 0, ...mods };
+        const mouse = { clientX: pt.x, clientY: pt.y, buttons, button: init.button < 0 ? 0 : init.button, ...mods };
+        if (s.type === "down") {
+          AB.pointerDown = true;
+          fire(target, "pointerdown", init); fire(target, "mousedown", mouse);
+        } else if (s.type === "move") {
+          fire(target, "pointermove", init); fire(target, "mousemove", mouse);
+        } else if (s.type === "up") {
+          AB.pointerDown = false;
+          fire(target, "pointerup", init); fire(target, "mouseup", mouse);
+        } else if (s.type === "wheel") {
+          target.dispatchEvent(new WheelEvent("wheel", { bubbles: true, cancelable: true, composed: true, clientX: pt.x, clientY: pt.y, deltaX: s.deltaX || 0, deltaY: s.deltaY || 0, ...mods }));
+        } else {
+          const e = new Error(`BAD_REQUEST: unknown pointer step type "${s.type}"`); e.code = "BAD_REQUEST"; throw e;
+        }
+        done.push({ type: s.type, x: Math.round(pt.x), y: Math.round(pt.y), target: selectorOf(target) });
+        last = target;
+        await sleep(s.waitMs ?? 16);
+      }
+    } finally {
+      AB.pointerDown = false;
+      root.removeAttribute("data-ab-gesture");
+      doc.querySelectorAll("[data-ab-captured]").forEach((n) => n.removeAttribute("data-ab-captured"));
+    }
+    return { pointer: done };
+  }
+
+  // Where to click for real input: scroll the element into the middle of the
+  // screen, then give its centre in the viewport's own coordinates (the
+  // operating system works from the screen, the page from its viewport).
+  async function pointInView(p = {}) {
+    const el = resolve(p.ref, p.gen);
+    el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+    await nextPaint(250);
+    const b = el.getBoundingClientRect();
+    const x = b.left + b.width / 2;
+    const y = b.top + b.height / 2;
+    return {
+      point: { x, y },
+      inViewport: x >= 0 && y >= 0 && x <= innerWidth && y <= innerHeight,
+      rect: { x: b.x + scrollX, y: b.y + scrollY, width: b.width, height: b.height },
+    };
+  }
+
+  // Whether the page's own hover styling applies to this element right now —
+  // after real input, the honest check that the hover did something.
+  function hoverState(p = {}) {
+    const el = resolve(p.ref, p.gen);
+    return { hovered: el.matches(":hover") };
+  }
+
+  // ---- inspect: what a test needs to assert about one element.
+  function inspect(p = {}) {
+    const el = resolve(p.ref, p.gen);
+    const attrs = {};
+    for (const a of el.attributes) {
+      if (SELF_ATTRS.has(a.name)) continue;
+      if (/^(aria-|data-state|data-selected|data-active)/.test(a.name) || ["id", "class", "href", "src", "alt", "title", "type", "name", "role", "disabled", "hidden", "tabindex", "placeholder"].includes(a.name))
+        attrs[a.name] = clip(a.value, 200);
+    }
+    const cs = getComputedStyle(el);
+    const b = el.getBoundingClientRect();
+    const v = viewRect(el);
+    const cx = b.left + b.width / 2, cy = b.top + b.height / 2;
+    const top = el.ownerDocument.elementFromPoint(cx, cy);
+    const out = {
+      ref: p.ref,
+      tag: el.tagName.toLowerCase(),
+      role: role(el),
+      name: accName(el),
+      attributes: attrs,
+      box: { x: Math.round(v.left + scrollX), y: Math.round(v.top + scrollY), width: Math.round(v.width), height: Math.round(v.height) },
+      inViewport: inViewport(el),
+      style: { display: cs.display, visibility: cs.visibility, opacity: cs.opacity, pointerEvents: cs.pointerEvents },
+      topmostAtCentre: !!top && (top === el || el.contains(top)),
+      ...(!top || top === el || el.contains(top) ? {} : { coveredBy: selectorOf(top) }),
+      text: clip(el.innerText || el.textContent || "", 300),
+    };
+    if ("value" in el && el.tagName !== "BUTTON") out.value = isRedacted(el) ? "[redacted]" : clip(String(el.value), 200);
+    if (el.type === "checkbox" || el.type === "radio") out.checked = el.checked;
+    if (el.tagName === "SELECT") out.selected = [...el.selectedOptions].map((o) => clip(o.text, 60));
+    if (el.tagName === "IMG") Object.assign(out, { currentSrc: el.currentSrc, naturalWidth: el.naturalWidth, naturalHeight: el.naturalHeight, complete: el.complete });
+    if (el.tagName === "VIDEO" || el.tagName === "AUDIO")
+      Object.assign(out, { media: { ...mediaState(el), src: el.currentSrc || el.getAttribute("src") || "", ...(el.tagName === "VIDEO" ? { videoWidth: el.videoWidth, videoHeight: el.videoHeight } : {}), muted: el.muted, loop: el.loop } });
+    if (el.tagName === "A") out.href = el.href;
+    return out;
+  }
+
+  // ---- diagnostics from the page: console and exceptions (from the
+  //      page-world hook on development hosts), media load failures (here).
+  AB.diag = AB.diag || [];
+  const pushDiag = (entry) => {
+    const key = `${entry.ts}|${entry.kind}|${entry.text}`;
+    if (AB.diag.some((d) => d.key === key)) return;
+    AB.diag.push({ ...entry, key });
+    if (AB.diag.length > 200) AB.diag.shift();
+  };
+  if (!AB.diagListening) {
+    AB.diagListening = true;
+    window.addEventListener("ab-diag", (e) => pushDiag(e.detail || {}));
+    // A <video> or <audio> that fails to load fires `error` on itself (or its
+    // <source>); it does not bubble, so listen while it travels down.
+    document.addEventListener(
+      "error",
+      (e) => {
+        const t = e.target;
+        const media = t instanceof HTMLMediaElement ? t : t instanceof HTMLSourceElement ? t.parentElement : null;
+        if (!media) return;
+        pushDiag({
+          ts: Date.now(),
+          kind: "media",
+          level: "error",
+          text: `${media.tagName.toLowerCase()} failed to load${media.error ? ` (MediaError ${media.error.code}${media.error.message ? ": " + media.error.message : ""})` : ""}`,
+          source: clip(t.currentSrc || t.src || t.getAttribute("src") || "", 200),
+        });
+      },
+      true,
+    );
+    window.addEventListener("ab-credential", (e) => {
+      AB.credentials = AB.credentials || [];
+      AB.credentials.push(e.detail);
+    });
+    window.dispatchEvent(new CustomEvent("ab-diag-flush"));
+  }
+  function diagnostics(p = {}) {
+    const since = p.since || 0;
+    const list = AB.diag.filter((d) => d.ts >= since).map(({ key: _k, replay: _r, ...d }) => d);
+    return { console: list.filter((d) => d.kind !== "media"), media: list.filter((d) => d.kind === "media") };
+  }
+
   // Re-injection must REPLACE the previous listener, never stack on it.
   // After a back/forward-cache restore the earlier instance is still
   // registered but its message channel is dead; if it stays, it answers first
@@ -948,7 +1678,7 @@
       try {
         const m = msg.method;
         if (m === "ping")
-          sendResponse({ pong: true, url: location.href, title: document.title, ts: Date.now() });
+          sendResponse({ pong: true, url: location.href, title: document.title, ts: Date.now(), documentGeneration: pageState().documentGeneration });
         else if (m === "observe") sendResponse(await observe(msg.params));
         else if (m === "pageMetrics") sendResponse(pageMetrics());
         else if (m === "scrollToY") sendResponse(await scrollToY(msg.params));
@@ -963,12 +1693,20 @@
         else if (m === "act") sendResponse(await act(msg.params));
         else if (m === "waitForStable") sendResponse(await waitForStable(msg.params));
         else if (m === "navigate") sendResponse(await navigate(msg.params));
+        else if (m === "settle") sendResponse(await settle(msg.params));
+        else if (m === "pageState") sendResponse(pageState());
+        else if (m === "prepareElementCapture") sendResponse(await prepareElementCapture(msg.params));
+        else if (m === "inspect") sendResponse(inspect(msg.params));
+        else if (m === "hoverState") sendResponse(hoverState(msg.params));
+        else if (m === "pointInView") sendResponse(await pointInView(msg.params));
+        else if (m === "detectWall") sendResponse({ needsHuman: detectWall() });
+        else if (m === "diagnostics") sendResponse(diagnostics(msg.params));
         else if (m === "clearMarks") {
           clearMarks();
           sendResponse({ ok: true });
         } else sendResponse({ error: `unknown engine method: ${m}` });
       } catch (e) {
-        sendResponse({ error: String((e && e.message) || e), code: e && e.code });
+        sendResponse({ error: String((e && e.message) || e), code: e && e.code, ...(e && e.detail ? { detail: e.detail } : {}) });
       }
     })();
     return true;

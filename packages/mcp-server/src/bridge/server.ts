@@ -18,7 +18,8 @@ interface Pending {
  */
 const READ_ONLY = new Set([
   "engine.ping", "engine.observe", "engine.locate", "engine.waitForStable",
-  "engine.screenshot", "engine.navHistory", "engine.waitFor",
+  "engine.screenshot", "engine.navHistory", "engine.waitFor", "engine.settle",
+  "engine.pageState", "engine.inspect", "engine.diagnostics", "engine.tabs.list",
 ]);
 const DROPPED = "BRIDGE_DROPPED";
 
@@ -34,6 +35,8 @@ export class Bridge {
   private wss?: WebSocketServer;
   private client?: WebSocket;
   private pending = new Map<string, Pending>();
+  /** What the connected extension said it is. */
+  extension?: { version?: string };
 
   constructor(
     private cfg: AppConfig,
@@ -65,7 +68,7 @@ export class Bridge {
       }
       let authed = false;
       ws.once("message", (buf) => {
-        let msg: { type?: string; secret?: string };
+        let msg: { type?: string; secret?: string; extension?: { version?: string } };
         try {
           msg = JSON.parse(buf.toString());
         } catch {
@@ -79,8 +82,11 @@ export class Bridge {
         }
         authed = true;
         this.client = ws;
+        this.extension = msg.extension;
         this.audit.log("bridge.connected", { ip });
-        ws.send(JSON.stringify({ type: "auth_ok" }));
+        // What the extension needs from the config: where console capture may
+        // run. It has no other way to read config/default.json.
+        ws.send(JSON.stringify({ type: "auth_ok", config: { diagnosticsHosts: this.cfg.diagnostics.hosts } }));
         ws.on("message", (b) => this.onMessage(b.toString()));
 
         // Keep the MV3 service worker alive.
@@ -120,7 +126,7 @@ export class Bridge {
   }
 
   private onMessage(raw: string): void {
-    let msg: { id?: string; ok?: boolean; result?: unknown; error?: string };
+    let msg: { id?: string; ok?: boolean; result?: unknown; error?: string; code?: string; detail?: Record<string, unknown> };
     try {
       msg = JSON.parse(raw);
     } catch {
@@ -132,7 +138,13 @@ export class Bridge {
     this.pending.delete(msg.id);
     clearTimeout(p.timer);
     if (msg.ok) p.resolve(msg.result);
-    else p.reject(new Error(msg.error ?? "engine error"));
+    else {
+      // Keep the engine's code and detail: callers branch on them.
+      const err = new Error(msg.error ?? "engine error") as Error & { code?: string; detail?: Record<string, unknown> };
+      if (msg.code) err.code = msg.code;
+      if (msg.detail) err.detail = msg.detail;
+      p.reject(err);
+    }
   }
 
   connected(): boolean {
@@ -183,19 +195,19 @@ export class Bridge {
     if (this.halted()) {
       this.audit.log("bridge.halted", { method });
       return Promise.reject(
-        new Error("HALTED: kill switch active — the user stopped all browser actions"),
+        Object.assign(new Error("HALTED: kill switch active — the user stopped all browser actions"), { code: "HALTED" }),
       );
     }
     if (!this.connected()) {
       return Promise.reject(
-        new Error("bridge not connected: launch the agent Chrome (npm run launch)"),
+        Object.assign(new Error("bridge not connected: the agent browser is not running or its extension is not attached"), { code: "BRIDGE_DOWN" }),
       );
     }
     const id = randomUUID();
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`bridge request timeout: ${method}`));
+        reject(Object.assign(new Error(`bridge request timeout: ${method}`), { code: "BRIDGE_DOWN" }));
       }, timeoutMs);
       const ws = this.client!;
       this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer, ws });

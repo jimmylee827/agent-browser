@@ -1,0 +1,17 @@
+<!doctype html><meta charset="utf-8"><title>Sticky</title>
+<style>
+  body { margin: 0; font: 16px system-ui; }
+  header { position: sticky; top: 0; height: 80px; background: #c00; color: #fff; z-index: 10; display: flex; align-items: center; padding: 0 16px; }
+  .filler { height: 600px; background: linear-gradient(#fff, #ddd); }
+  section { height: 480px; margin: 0 40px; background: #dfd; border: 4px solid #070; }
+  section h2 { margin: 0; padding: 8px; background: #070; color: #fff; }
+  .wrap { position: relative; margin: 40px; }
+  .covered { height: 80px; background: #ffd; }
+  .blocker { position: absolute; inset: 0; background: rgba(0,0,0,.85); color: #fff; }
+</style>
+<header><strong>Shop</strong>&nbsp;<span aria-label="Cart">🛒 Cart</span></header>
+<div class="filler"></div>
+<section aria-labelledby="sf"><h2 id="sf">Size finder</h2><p>Pick a size.</p></section>
+<div class="filler"></div>
+<div class="wrap"><button class="covered" id="covered">Covered button</button><div class="blocker">An overlay that is not fixed</div></div>
+<div class="filler"></div>

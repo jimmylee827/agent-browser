@@ -1,0 +1,9 @@
+<!doctype html><meta charset="utf-8"><title>Failures</title>
+<h1>Player</h1>
+<video id="v" width="320" height="180"></video>
+<!-- As players do: the source is set when Play is pressed. The play() promise
+     is not caught, as in many apps, so its rejection is reported too. -->
+<button onclick="const v = document.getElementById('v'); v.src = '/status/401'; v.play()">Play</button>
+<button onclick="throw new Error('boom from the page')">Throw</button>
+<script src="/status/404.js"></script>
+<script>console.error("app failed to init");</script>

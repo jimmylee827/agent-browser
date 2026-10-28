@@ -34,8 +34,15 @@ else
   echo "  v8 heap : Chrome default"
   JS_FLAGS_ARG=()
 fi
+# Google Chrome ignores --load-extension (since 137): the extension is loaded
+# once by hand into the profile, and stays.
 echo "  ext     : load once manually via chrome://extensions -> $EXT_DIR"
 
+# --autoplay-policy=no-user-gesture-required: media may play with sound without
+# a click first, as on a site a person visits often. An agent's synthetic
+# click carries no user gesture, so without it play() was refused; agent
+# windows open muted, so nothing is heard. Not an automation switch.
+#
 # --disable-backgrounding-occluded-windows: keep painting the window while it
 # sits behind others. Without it macOS Chrome stops rendering a covered window,
 # and every screenshot fails with "image readback failed" until something
@@ -45,7 +52,8 @@ exec "$CHROME" \
   --user-data-dir="$PROFILE_DIR" \
   ${JS_FLAGS_ARG[@]+"${JS_FLAGS_ARG[@]}"} \
   --disable-backgrounding-occluded-windows \
+  --autoplay-policy=no-user-gesture-required \
   --no-first-run \
   --no-default-browser-check \
-  --disable-features=Translate,DisableLoadExtensionCommandLineSwitch \
+  --disable-features=Translate \
   "$@"

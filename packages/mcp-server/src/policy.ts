@@ -49,3 +49,9 @@ export class Policy {
     };
   }
 }
+
+/** The blocked domain a URL falls under for browser_eval, or undefined. */
+export function evalBlockedBy(url: string, blockedDomains: string[]): string | undefined {
+  const host = hostOf(url);
+  return host ? blockedDomains.find((d) => host === d || host.endsWith("." + d)) : undefined;
+}

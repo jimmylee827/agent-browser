@@ -19,12 +19,15 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { spawn, execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, openSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig } from "./config.js";
-import { registerTools, HALT_ADVICE } from "./tools/index.js";
+import { registerTools } from "./tools/index.js";
+import { HALT_ADVICE } from "./errors.js";
+import { buildId, buildStatus, RUNNING } from "./build.js";
 
 const cfg = loadConfig();
 const here = dirname(fileURLToPath(import.meta.url));
@@ -32,6 +35,13 @@ const LABEL = "com.agent-browser.mcp-server";
 const PLIST = resolve(homedir(), "Library/LaunchAgents", `${LABEL}.plist`);
 const BASE = `http://${cfg.bridge.host}:${cfg.bridge.controlPort}`;
 const STATUS_TOOLS = new Set(["agent_browser_status", "browser_status"]);
+
+// This launcher is one MCP client connection — one agent conversation. Its id
+// is what keeps this agent's tabs apart from every other agent's. It also says
+// which build its tool list came from, since it computed that list at startup
+// and a rebuild since then does not reach it.
+const CLIENT_ID = randomUUID();
+const HEADERS = { "x-ab-client": CLIENT_ID, "x-ab-launcher-build": buildId(RUNNING) };
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const text = (data: unknown, isError = false) => ({
@@ -106,7 +116,7 @@ async function forward(name: string, args: Record<string, unknown> | undefined) 
   // A fresh client per call: the daemon's HTTP transport is stateless, a local
   // handshake costs milliseconds, and nothing goes stale across a daemon restart.
   const c = new Client({ name: "agent-browser-launcher", version: "0.0.1" });
-  await c.connect(new StreamableHTTPClientTransport(new URL(`${BASE}/mcp`)));
+  await c.connect(new StreamableHTTPClientTransport(new URL(`${BASE}/mcp`), { requestInit: { headers: HEADERS } }));
   try {
     // Full-page captures and a cold browser launch both take a while.
     return await c.callTool({ name, arguments: args }, undefined, { timeout: 180_000 });
@@ -129,21 +139,55 @@ async function main() {
           serverRunning: false,
           bridgeConnected: false,
           ready: false,
+          build: { launcher: buildId(RUNNING), onDisk: buildStatus().onDisk },
+          degraded: [],
           hint: "the browser is off; agent_browser_ensure_running (or any browser tool) starts it",
         });
-      if (halted()) return text({ error: "HALTED: kill switch active", recovery: HALT_ADVICE }, true);
+      if (halted())
+        return text({ code: "HALTED", error: "HALTED: kill switch active", recovery: HALT_ADVICE, agentCanFix: false, degraded: [`${name} not performed: kill switch on`] }, true);
       const started = await startDaemon();
       if ("error" in started)
-        return text({ error: started.error, recovery: "run `npm run mcp:install` in the agent-browser repo and read its output" }, true);
+        return text(
+          {
+            code: "BRIDGE_DOWN",
+            error: started.error,
+            recovery: "run `npm run mcp:install` in the agent-browser repo and read its output",
+            agentCanFix: true,
+            degraded: [`${name} not performed: the browser server did not start`],
+          },
+          true,
+        );
       process.stderr.write(`[agent-browser launcher] started the server via ${started.via}\n`);
     }
     try {
       return (await forward(name, args)) as ReturnType<typeof text>;
     } catch (e) {
       // Never retry here: the call may have reached the daemon and acted.
-      return text({ error: `could not reach the browser server: ${(e as Error).message}`, recovery: "check agent_browser_status before retrying — the action may have run" }, true);
+      return text(
+        {
+          code: "BRIDGE_DOWN",
+          error: `could not reach the browser server: ${(e as Error).message}`,
+          recovery: "check agent_browser_status before retrying — the action may have run",
+          agentCanFix: true,
+          degraded: [`${name} may not have been performed: the server connection failed`],
+        },
+        true,
+      );
     }
   });
+
+  // When the client goes away, close the windows this agent opened. Best
+  // effort: a launcher killed outright leaves them, and the daemon unbinds
+  // them after two idle hours.
+  let released = false;
+  const release = async () => {
+    if (released) return;
+    released = true;
+    await fetch(`${BASE}/session/release?client=${CLIENT_ID}`, { method: "POST", signal: AbortSignal.timeout(1500) }).catch(() => {});
+  };
+  process.stdin.on("end", () => void release().finally(() => process.exit(0)));
+  for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"] as const)
+    process.on(sig, () => void release().finally(() => process.exit(0)));
 
   await server.connect(new StdioServerTransport());
 }

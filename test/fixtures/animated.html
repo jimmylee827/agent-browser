@@ -1,0 +1,10 @@
+<!doctype html><meta charset="utf-8"><title>Animated</title>
+<style>
+  body { margin: 0; font: 16px system-ui; }
+  .band { height: 120px; background: #222; color: #fff; animation: enter 250ms ease-out both; }
+  .card { margin: 20px; height: 300px; background: #eef; transition: height 250ms; }
+  @keyframes enter { from { transform: translateY(-120px); opacity: 0; } to { transform: none; opacity: 1; } }
+</style>
+<div class="band"><h1>Animated entry</h1></div>
+<div class="card" id="card"><p>Content</p></div>
+<script>setTimeout(() => (document.getElementById("card").style.height = "420px"), 50);</script>

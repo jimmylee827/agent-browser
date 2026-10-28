@@ -1,0 +1,16 @@
+<!doctype html><meta charset="utf-8"><title>Captcha wall</title>
+<style>
+  .backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.5); display: flex; align-items: center; justify-content: center; }
+  .modal { background: #fff; width: 520px; padding: 20px; }
+</style>
+<h1>Trade mark search</h1>
+<label>Trade Mark Text <input id="tm"></label>
+<button>Search</button>
+<div class="backdrop">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="t">
+    <h4 id="t">Notice to Users</h4>
+    <p>Please read and accept the notice.</p>
+    <iframe title="captcha" src="{{OTHER}}/captcha-frame.html?mtcaptcha=1" width="320" height="90"></iframe>
+    <p><button disabled>Accept</button></p>
+  </div>
+</div>

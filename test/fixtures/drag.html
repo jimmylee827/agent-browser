@@ -1,0 +1,46 @@
+<!doctype html><meta charset="utf-8"><title>Drag</title>
+<style>
+  body { font: 14px system-ui; margin: 20px; }
+  #track { position: relative; width: 400px; height: 24px; background: #ddd; margin: 20px 0; }
+  #thumb { position: absolute; top: 0; left: 0; width: 24px; height: 24px; background: #06c; }
+  #scrub { width: 400px; height: 40px; background: #333; margin: 20px 0; touch-action: none; }
+  #list li { padding: 8px; margin: 4px; background: #eef; width: 200px; }
+</style>
+<label>Volume <input type="range" id="vol" min="0" max="100" value="10"></label>
+<div id="track"><div id="thumb" role="slider" aria-label="Custom slider" aria-valuenow="0" tabindex="0"></div></div>
+<div id="scrub" role="slider" aria-label="Timeline" aria-valuenow="0" tabindex="0"></div>
+<ul id="list">
+  <li draggable="true">First</li><li draggable="true">Second</li><li draggable="true">Third</li>
+</ul>
+<script>
+  // A custom slider: mousedown on the thumb, mousemove on the document.
+  const thumb = document.getElementById("thumb"), track = document.getElementById("track");
+  let dragging = false;
+  thumb.addEventListener("mousedown", () => (dragging = true));
+  document.addEventListener("mousemove", (e) => {
+    if (!dragging) return;
+    const r = track.getBoundingClientRect();
+    const x = Math.max(0, Math.min(r.width - 24, e.clientX - r.left - 12));
+    thumb.style.left = x + "px";
+    thumb.setAttribute("aria-valuenow", String(Math.round((x / (r.width - 24)) * 100)));
+  });
+  document.addEventListener("mouseup", () => (dragging = false));
+  // A scrubber that captures the pointer, as video players do.
+  const scrub = document.getElementById("scrub");
+  window.playhead = 0;
+  scrub.addEventListener("pointerdown", (e) => { scrub.setPointerCapture(e.pointerId); scrub.dataset.down = "1"; });
+  scrub.addEventListener("pointermove", (e) => {
+    if (!scrub.dataset.down) return;
+    const r = scrub.getBoundingClientRect();
+    window.playhead = Math.round(Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) * 100);
+    scrub.setAttribute("aria-valuenow", String(window.playhead));
+  });
+  scrub.addEventListener("pointerup", (e) => { delete scrub.dataset.down; scrub.releasePointerCapture(e.pointerId); });
+  // An HTML5 drag-and-drop list.
+  let src = null;
+  for (const li of document.querySelectorAll("#list li")) {
+    li.addEventListener("dragstart", (e) => { src = li; e.dataTransfer.setData("text/plain", li.textContent); });
+    li.addEventListener("dragover", (e) => e.preventDefault());
+    li.addEventListener("drop", (e) => { e.preventDefault(); if (src && src !== li) li.after(src); });
+  }
+</script>

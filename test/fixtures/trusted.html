@@ -1,0 +1,13 @@
+<!doctype html><meta charset="utf-8"><title>Trusted input</title>
+<style>body{font:16px system-ui;margin:24px}button{font-size:18px;padding:8px 16px;margin:6px}</style>
+<button id="record">Record gesture</button>
+<button id="fs">Fullscreen</button>
+<script>
+window.seen = null;
+record.onclick = (e) => { window.seen = { trusted: e.isTrusted, active: navigator.userActivation.isActive }; };
+fs.onclick = (e) => {
+  document.documentElement.requestFullscreen()
+    .then(() => { window.seen = { trusted: e.isTrusted, fullscreen: true }; document.exitFullscreen(); })
+    .catch((err) => { window.seen = { trusted: e.isTrusted, fullscreen: false, error: err.name }; });
+};
+</script>

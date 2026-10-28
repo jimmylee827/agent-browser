@@ -10,9 +10,11 @@ description: |
   - Any multi-step web flow: search-then-click, form-fill-then-submit, navigate-and-extract
   - "Find the link / button / field that says X and ..."
 
+  Sessions: without `session`, every call acts in this agent's OWN background window, never a tab a person or another agent is using. A subagent sharing the connection passes its own `session` name; agents that must share one tab both pass `session: "shared:<name>"` (reload/visit then affect both). Cookies and logins are shared by all sessions (one profile).
+
   Primary tools (use these — no `ref` / `snapshotGeneration` to track):
   - `agent_browser_visit({ url } | { history: "back" }, text?, snapshot?)` — navigate (or go back/forward/reload) + wait + return accessibility tree; `text: true` adds the page's visible text, `snapshot: "none"` drops the tree
-  - `agent_browser_act({ name, role?, action, value?, snapshot?, onDialog? })` — find element by name + perform action + return new accessibility tree
+  - `agent_browser_act({ name, role?, action, value?, to?, snapshot?, onDialog? })` — find element by name + perform action (incl. hover, drag) + return new accessibility tree
   - `browser_observe({ mode: "read", offset? })` — the page's text, paged (prices, scores, articles, JSON, iframe content)
   - `browser_screenshot({ fullPage? | name? | ref? | clip? })` — viewport, whole page, one element, or a region
   - `browser_tabs({ action })` — list, switch, open or close tabs
@@ -22,6 +24,8 @@ description: |
   Status / lifecycle:
   - `agent_browser_status()` — is the browser ready? (no side effects)
   - `agent_browser_ensure_running()` — idempotent launch (auto-fires on first visit, rarely needed manually)
+
+  Testing and debugging: `browser_inspect` (one element's attributes/state), `browser_eval` (a JS expression's value), `browser_diagnostics` (failed requests, console errors), `browser_pointer` (raw pointer sequences).
 
   Advanced primitives (`[advanced]` in their tool descriptions) — rarely needed: `browser_locate`, `browser_navigate`, `browser_act`, `browser_robust_click`, `browser_wait_for_navigation`.
 user-invocable: false
@@ -38,6 +42,27 @@ result = agent_browser_act({ name: "Sign in", action: "click" }) # DO
 ```
 
 That's the whole pattern. No refs, no generations, no manual re-observation. Each `act` call internally does: locate by name → act → wait for the page to settle → re-observe → return.
+
+## Rules that prevent damage
+
+- **Your window is yours.** Without `session`, the first visit opens your own
+  window in the background and every later call acts there. Before that first
+  visit there is nothing to act on (`NO_SESSION_TAB`) — call
+  `agent_browser_visit` first. Never pass `session: "default"` unless you mean
+  "whatever tab is focused", which a person may be using.
+- **A shared tab is shared.** With `session: "shared:<name>"`, a result's
+  `warning` and `sharedSession.lastActor` say when another agent acted since
+  your last call. Look again before trusting what you saw. Take `lock: true`
+  for a sequence that must not be interleaved.
+- **Logins are shared.** One browser profile: a login made by any session is
+  there for all. Use test accounts you can leave there.
+- **Carry `degraded` into your report.** Every result has `degraded: []`; any
+  entry there is a step that was not done as asked. A page you could not reach
+  is not "no results".
+- **`outcome: "needs_human"` means stop.** A captcha or a notice that cannot be
+  accepted is in the way. Tell the user; do not keep trying, and do not report
+  the page as empty. A consent banner you can dismiss says `agentCanFix: true`
+  and gives the dismiss button's ref.
 
 ## Patterns by intent
 
@@ -62,7 +87,7 @@ text automatically. A long tree is capped at 220 nodes and says how many it
 ### "Click a link or button by name"
 ```text
 agent_browser_act({ name: "Pricing", action: "click" })
-# Substring + case-insensitive match. Pass `role: "link"` / `role: "button"` if ambiguous.
+# Case-insensitive; an exact name beats a prefix, a prefix beats a substring. Pass `role` if still ambiguous.
 ```
 
 ### "Search for something"
@@ -88,9 +113,10 @@ agent_browser_visit({ history: "back" })      # also "forward", "reload"
 ```
 
 ### "A link opened a new tab"
-The act result says `switchedTab: { from, to }` and the agent is now on the new
-tab. `browser_tabs({ action: "switch", tabId: from })` goes back;
-`browser_tabs({ action: "close", tabId: to })` closes it.
+The act result says `switchedTab: { from, to }` and your session is now on the
+new tab. `browser_tabs({ action: "switch", tabId: from })` goes back;
+`browser_tabs({ action: "close", tabId: to })` closes it. `browser_tabs` lists
+every tab with `yours` and the session holding it; you can close only your own.
 
 ### "Scroll, or wait for something"
 ```text
@@ -114,8 +140,9 @@ care — it is a decision on the user's behalf.
 ### "Editors and iframes"
 Same-origin iframes are part of the page: their fields are in the tree, their
 text is in read mode (under `[frame: …]`), and a rich-text editor's body is a
-`textbox` you can `type` into. Cross-origin iframes appear only as a boundary
-node.
+`textbox` you can `type` into. A cross-origin iframe is a single node with a ref
+(you can screenshot it, not look inside); one that is a captcha says
+`captcha: true`.
 
 ### "Take a screenshot"
 ```text
@@ -132,6 +159,67 @@ role. A miss names the closest candidates. Full pages default to JPEG at 1x
 change that. Each result gives `bytes` per image. The
 result's `viewport.scrollY` converts what you see on screen into page
 coordinates for `clip`.
+
+A capture waits for the page to settle first. `settled: false` (with
+`settleReason`) means it was still moving — two such captures can differ with
+nothing fixed or broken. Compare `documentGeneration` and `layoutHash` across
+captures before concluding a page changed. An element is scrolled to the middle
+and any sticky bar over it hidden (`hidOverlays`); if something else covers it,
+the call fails `OCCLUDED` and names it (`occludedBy`). Each capture is saved to
+disk; `evidence.file` is a path you can cite.
+
+### "Drag a slider, a scrubber, a list item"
+```text
+agent_browser_act({ name: "Volume", action: "drag", to: { name: "Volume" }, toAt: { x: "75%" } })
+agent_browser_act({ name: "Timeline", action: "drag", at: { x: "0%" }, to: { name: "Timeline" }, toAt: { x: "50%" } })
+agent_browser_act({ name: "First", role: "listitem", action: "drag", to: { name: "Third", role: "listitem" } })
+```
+The result gives `rects.before/after` and the value or `aria-valuenow` before
+and after. For anything else (press-and-hold, a path, a wheel), use
+`browser_pointer({ sequence: [{type:"down", x, y}, {type:"move", …}, {type:"up", …}] })`.
+
+### "Something only works for a real person" (sound, fullscreen, a native dialog)
+```text
+agent_browser_act({ name: "Play", trusted: true })     # a real click from the OS
+```
+A synthetic click is `isTrusted:false`, and Chrome withholds a real gesture's
+privileges from it. `trusted: true` posts the click from the operating system:
+the page sees a person's input. The agent window comes forward for the instant
+of the gesture, then focus returns. Needs the input helper
+(`npm run input-helper:install` and one Accessibility grant); without it the
+call fails `TRUSTED_UNAVAILABLE` — say so rather than claiming it worked.
+
+### "Phone or narrow-screen layout"
+```text
+agent_browser_visit({ url, viewport: { width: 375, height: 812, deviceScaleFactor: 3 } })
+agent_browser_visit({ url, mobile: true })   # a phone's UA, touch, no hover
+```
+A real viewport, not a scaled picture: media queries answer correctly, and it
+stays for the session's later visits.
+
+### "Hover"
+`action: "hover"` applies the page's own `:hover` styles and fires the hover
+events. If nothing changes, it fails `HOVER_NOT_EFFECTIVE` — do not describe a
+hover state you did not see.
+
+### "Check app state (testing a page)"
+```text
+browser_inspect({ name: "White", role: "button" })   # attributes incl. aria-pressed, value, box, topmostAtCentre
+browser_inspect({ role: "video" })                    # readyState, networkState, error, currentTime, duration, paused
+browser_eval({ expression: "window.store.getState().player.playhead" })   # any JS value, as JSON
+```
+The tree also shows `pressed`, `current`, and media nodes with their state;
+`details: true` on visit/observe adds hrefs and srcs. `browser_eval` is refused
+on identity, payment and banking domains (`EVAL_BLOCKED`) and where the page's
+CSP forbids eval — use `browser_inspect` there.
+
+### "Why did it fail?"
+visit and act results carry `diagnostics` when something went wrong in the page
+during the call ("1 failed request (/media/file 401), 1 console error").
+`browser_diagnostics()` gives the details: failed requests on any host, console
+errors, exceptions and rejections on development hosts (localhost, private IPs,
+`*.local`, `*.test`). Things that need a real user gesture — `play()` with sound,
+fullscreen — are refused by Chrome, and the refusal shows up here.
 
 ### "The browser is off"
 
@@ -198,11 +286,12 @@ Recent history is checked first, so a redirect that already landed still counts.
 | `fill` | replace existing text with `value` | yes |
 | `clear` | empty the input | no |
 | `press` | press a key (e.g. `value: "Enter"`) | yes |
-| `hover` | hover only, no click | no |
+| `hover` | hover only, no click; fails if nothing changes | no |
 | `focus` | move keyboard focus to element | no |
 | `check` / `uncheck` | for checkboxes/radios | no |
 | `submit` | submit the form containing the element | no |
 | `select` | pick a dropdown option, by its text or value (a miss lists the options) | yes |
+| `drag` | drag to `to` (an element, or `{x, y}` in viewport px); `at`/`toAt` pick the points | no |
 
 A radio or checkbox also matches by its group: `name: "Pizza Size Small"` picks
 the "Small" in the "Pizza Size" fieldset (`state.group`). A dropdown's state
@@ -232,10 +321,23 @@ Feed `snapshotAfter.tree[]` to your next decision — you never have to call `ob
 
 ## When an action can't find the target
 
-If `agent_browser_act` returns:
+Every failure carries a `code` to branch on, plus `agentCanFix`, `fixSteps`
+and `humanAction`:
+
+| `code` | Meaning |
+|---|---|
+| `NO_MATCH` | nothing by that name; `recovery` names similar elements |
+| `STALE_SNAPSHOT` / `REF_NOT_FOUND` | the page changed; observe again |
+| `OCCLUDED` | something covers the element; `occludedBy` names it |
+| `NEEDS_HUMAN` | a captcha or notice blocks it; stop and tell the user |
+| `HOVER_NOT_EFFECTIVE` | the hover changed nothing |
+| `NO_SESSION_TAB` / `TAB_GONE` | no page yet, or your tab was closed; visit again |
+| `TAB_OWNED_BY_OTHER` / `SESSION_LOCKED` | another session's tab, or leased |
+| `BRIDGE_DOWN` / `EXTENSION_STALE` / `STALE_BUILD` | the browser side needs attention; see `fixSteps` |
+
 ```json
-{ "error": "no element matching role=button name=\"Foo\" on https://...",
-  "recovery": "call agent_browser_visit to refresh the page snapshot, OR widen the name ..." }
+{ "code": "NO_MATCH", "error": "no element matching role=button name=\"Foo\" on https://...",
+  "recovery": "similar elements: … — retry with one of those", "degraded": ["agent_browser_act not done: NO_MATCH"] }
 ```
 
 When something similar exists, the recovery names it (`similar elements:
@@ -277,4 +379,5 @@ here; over-labelling ordinary clicks makes the agent useless.
 
 - Don't run Selenium / Playwright / CDP / `chrome.debugger` style automation alongside. The whole point is stealth (no automation fingerprint). The MCP tools are the only correct path.
 - Don't kill / launch the agent Chrome manually. Use `agent_browser_ensure_running` if needed.
+- Don't drive another agent's or the user's tab: no `session: "default"`, no `tabId` you did not open, unless asked.
 - Don't expect `isTrusted:true` events from synthetic input. A small minority of hardened sites gate on it; if one rejects the click, the tool surfaces the error rather than degrading stealth.
