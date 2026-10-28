@@ -22,11 +22,29 @@ import { evalBlockedBy } from "./policy.js";
 import { decide, freshState, type LadderState, type Observation } from "./ladder.js";
 import { agentChromeRunning, launchBrowser } from "./host-helper-client.js";
 import type { NetEntry } from "./network.js";
+import { allowedOn, findSecret, getValue } from "./secrets.js";
 
 export interface CaptureRule {
   urlPattern: string;
   method?: string;
   status?: string;
+}
+
+export const STEP_ACTIONS = ["click", "fill", "type", "select", "check", "uncheck", "press", "wait", "dismiss-consent"] as const;
+
+/** One thing a job does on its page after each load. */
+export interface JobStep {
+  action: (typeof STEP_ACTIONS)[number];
+  name?: string;
+  role?: string;
+  /** fill/type/select: the text; press: the key; wait: text to wait for (or use `text`). */
+  value?: string;
+  text?: string;
+  /** fill/type: the name of a secret the user approved (`npm run ab -- secrets set`), typed instead of `value`. */
+  secret?: string;
+  /** Skip, rather than fail, when the element is not there (a banner that does not always show). */
+  optional?: boolean;
+  timeoutMs?: number;
 }
 
 export interface JobSpec {
@@ -39,6 +57,7 @@ export interface JobSpec {
   health?: { text?: string; response?: { urlPattern: string } };
   ladder?: Partial<LadderSettings>;
   keepVisible?: boolean;
+  steps?: JobStep[];
   enabled: boolean;
   createdAt: number;
   createdBy: string;
@@ -59,6 +78,11 @@ export interface JobState extends LadderState {
   windowState?: string;
   /** The extension version the page was loaded under. */
   extVersion?: string;
+  /** pageLoadedAt of the load the steps last ran after. */
+  stepsRanFor?: number;
+  lastStepError?: string;
+  /** A step it would not do (no approved secret, the wrong host): stays until a person resumes the job. */
+  refused?: string;
 }
 
 interface Job {
@@ -107,6 +131,24 @@ export function validateSpec(input: Partial<JobSpec>, cfg: AppConfig, existing: 
   for (const c of capture) if (!c.urlPattern || !compiles(c.urlPattern)) throw bad(`capture.urlPattern is not a regular expression: ${c.urlPattern}`);
   if (input.health?.text && !compiles(input.health.text)) throw bad(`health.text is not a regular expression: ${input.health.text}`);
   if (input.health?.response?.urlPattern && !compiles(input.health.response.urlPattern)) throw bad("health.response.urlPattern is not a regular expression");
+  const steps = (input.steps ?? []).map((st) => ({ ...st }));
+  if (steps.length > 10) throw bad("steps: at most 10");
+  for (const [i, st] of steps.entries()) {
+    const at = `steps[${i}]`;
+    if (!STEP_ACTIONS.includes(st.action)) throw bad(`${at}.action: one of ${STEP_ACTIONS.join(", ")}`);
+    if (["click", "fill", "type", "select", "check", "uncheck"].includes(st.action) && !st.name && !st.role) throw bad(`${at}: say which element (name, and role if needed)`);
+    if (["fill", "type"].includes(st.action) && st.value === undefined && !st.secret) throw bad(`${at}: ${st.action} needs value, or secret`);
+    if (st.action === "press" && !st.value) throw bad(`${at}: press needs value (a key, e.g. Enter)`);
+    if (st.action === "wait" && !st.text && !st.value) throw bad(`${at}: wait needs text`);
+    if (st.secret) {
+      const meta = findSecret(cfg, st.secret);
+      if (!meta) throw bad(`${at}.secret: no secret called ${st.secret}; the user sets one with npm run ab -- secrets set ${st.secret} --kind … --host ${url.hostname}`);
+      if (!allowedOn(meta, url.hostname))
+        throw new AbError("POLICY_BLOCKED", `${at}.secret: ${st.secret} is approved for ${meta.hosts.join(", ")}, not ${url.hostname}`, {
+          recovery: "ask the user; only they can approve a secret for another host",
+        });
+    }
+  }
   const refresh = input.refresh === "reload" ? "reload" : "none";
   const settings = { ...cfg.jobs.defaults, ...(input.ladder ?? {}) };
   if (refresh === "reload") {
@@ -126,6 +168,7 @@ export function validateSpec(input: Partial<JobSpec>, cfg: AppConfig, existing: 
     ...(input.health ? { health: input.health } : {}),
     ...(input.ladder ? { ladder: input.ladder } : {}),
     keepVisible: !!input.keepVisible,
+    ...(steps.length ? { steps } : {}),
     enabled: true,
     createdAt: now,
     createdBy: by,
@@ -350,7 +393,7 @@ export class JobRunner {
     const j = this.find(id);
     if (j.spec.enabled) return this.view(j);
     j.spec.enabled = true;
-    j.state = { ...j.state, ...freshState(Date.now()), status: "starting", records: j.state.records };
+    j.state = { ...j.state, ...freshState(Date.now()), status: "starting", records: j.state.records, refused: undefined, stepsRanFor: undefined };
     this.save();
     this.log(j, "resumed", { by });
     this.schedule(j, 0);
@@ -488,6 +531,10 @@ export class JobRunner {
       return this.save();
     }
     j.state.bridgeDownSince = undefined;
+    if (j.state.refused) {
+      j.state.status = "needs-attention";
+      return this.save();
+    }
     const s = this.ctx.sessions.jobSession(j.spec.id);
 
     const first = j.state.status === "starting" && j.state.tabId === undefined;
@@ -515,6 +562,19 @@ export class JobRunner {
     if (ext) j.state.extVersion = ext;
 
     const seen = await this.drain(j);
+    // The job's steps, once per page load, when the page has had time to start.
+    if (tabAlive && j.spec.steps?.length && j.state.pageLoadedAt !== undefined && j.state.stepsRanFor !== j.state.pageLoadedAt && now - j.state.pageLoadedAt >= this.settings(j).pageGraceMs) {
+      j.state.stepsRanFor = j.state.pageLoadedAt;
+      const r = await this.runSteps(j);
+      if (r.failedAt) seen.faults.push(r.failedAt);
+      if (r.refused) {
+        j.state.refused = r.refused;
+        j.state.status = "needs-attention";
+        j.state.lastReason = r.refused;
+        this.save();
+        return;
+      }
+    }
     let healthText: boolean | null = null;
     if (tabAlive && j.spec.health?.text) {
       const r = await this.ctx.bridge
@@ -551,6 +611,92 @@ export class JobRunner {
       await this.openTab(j, s);
       this.save();
     }
+  }
+
+  /**
+   * Do the job's steps on its page. Never a value the user did not approve
+   * into a password, one-time-code or card field: that stops the job and
+   * says so. An approved secret is typed only on its own hosts, and its value
+   * goes nowhere but the field (not the log, not the audit, not the record).
+   */
+  private async runSteps(j: Job): Promise<{ failedAt?: number; refused?: string }> {
+    const tabId = j.state.tabId;
+    const req = <T,>(m: string, p: Record<string, unknown> = {}) => this.ctx.bridge.request<T>(m, { ...p, tabId });
+    for (const [i, st] of (j.spec.steps ?? []).entries()) {
+      if (existsSync(resolve(this.cfg.stateDir, "HALT"))) return {};
+      const label = `${st.action}${st.name ? ` "${st.name}"` : ""}${st.secret ? ` with secret ${st.secret}` : ""}`;
+      const fail = (why: string) => {
+        j.state.lastStepError = `step ${i + 1} (${label}): ${why}`;
+        this.log(j, "step_failed", { step: i + 1, action: st.action, why });
+        return { failedAt: Date.now() };
+      };
+      try {
+        if (st.action === "wait") {
+          const r = await req<{ timedOut?: boolean }>("engine.waitFor", { text: st.text ?? st.value, timeout: Math.min(st.timeoutMs ?? 10_000, 25_000) });
+          if (r.timedOut && !st.optional) return fail("the text did not appear");
+          continue;
+        }
+        if (st.action === "dismiss-consent") {
+          const w = await req<{ needsHuman?: { reason?: string; dismiss?: { ref: number; name: string } } }>("engine.detectWall");
+          const d = w.needsHuman?.reason === "consent" ? w.needsHuman.dismiss : undefined;
+          if (!d) continue; // no banner this time
+          if (process.env.AB_DRY_RUN !== "1") await req("engine.act", { ref: d.ref, action: "click", onDialog: "accept" });
+          this.log(j, "step", { step: i + 1, action: st.action, clicked: d.name });
+          continue;
+        }
+        const loc = await req<{ snapshotGeneration?: number; matches?: { ref: number; name: string }[] }>("engine.locate", { name: st.name, role: st.role });
+        const m = loc.matches?.[0];
+        if (!m) {
+          if (st.optional) continue;
+          return fail("no such element on the page");
+        }
+        let value = st.value;
+        if (["fill", "type", "select", "press"].includes(st.action)) {
+          const info = await req<{ sensitive?: boolean }>("engine.inspect", { ref: m.ref, gen: loc.snapshotGeneration });
+          if (info.sensitive && !st.secret) {
+            this.log(j, "step_refused", { step: i + 1, action: st.action, why: "a password, code or card field, and no approved secret" });
+            return { refused: `step ${i + 1} (${label}) would type into a password, one-time-code or card field without a secret the user approved` };
+          }
+          if (st.secret) {
+            const meta = findSecret(this.cfg, st.secret);
+            const page = await req<{ tab?: { url?: string } }>("engine.ping");
+            const host = (() => {
+              try {
+                return new URL(page.tab?.url ?? "").hostname;
+              } catch {
+                return "";
+              }
+            })();
+            if (!meta) {
+              this.log(j, "step_refused", { step: i + 1, why: `secret ${st.secret} was removed` });
+              return { refused: `secret ${st.secret} no longer exists` };
+            }
+            if (!allowedOn(meta, host)) {
+              // A redirect to another host (a look-alike login page) gets nothing.
+              this.log(j, "step_refused", { step: i + 1, why: `secret ${st.secret} is not approved for ${host}` });
+              return { refused: `step ${i + 1}: the page is on ${host || "an unknown host"}, and ${st.secret} is approved only for ${meta.hosts.join(", ")}` };
+            }
+            value = getValue(this.cfg, st.secret);
+            // Before it is typed: the request that sends it is then redacted however its fields are named.
+            await this.ctx.bridge.request("net.secret", { value });
+          }
+        }
+        if (process.env.AB_DRY_RUN !== "1") {
+          try {
+            await req("engine.act", { ref: m.ref, gen: loc.snapshotGeneration, action: st.action, value, onDialog: "accept" });
+          } catch (e) {
+            // The step navigated: the page went away mid-call, which is success.
+            if (!/PORT_CLOSED_AFTER_ACTION|back\/forward cache|message channel (is )?closed|Receiving end does not exist/i.test(String((e as Error).message))) throw e;
+          }
+        }
+        this.log(j, "step", { step: i + 1, action: st.action, name: m.name, ...(st.secret ? { secret: st.secret } : {}) });
+      } catch (e) {
+        if (st.optional) continue;
+        return fail(String((e as Error).message ?? e).slice(0, 200));
+      }
+    }
+    j.state.lastStepError = undefined;
+    return {};
   }
 
   /**

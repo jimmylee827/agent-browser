@@ -9,6 +9,7 @@ import { rejectBrowserOrigin } from "./http-guard.js";
 import { secondPassRedact, toHar, toNdjson, type NetEntry } from "./network.js";
 import { writeEvidenceFile } from "./evidence.js";
 import type { JobRunner } from "./jobs.js";
+import { listSecrets, removeSecret, setSecret, usesKeychain } from "./secrets.js";
 import { codeOf } from "./errors.js";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -221,6 +222,28 @@ export function startControl(
         return send(res, file ? 200 : 500, file ? { file, format, entries: entries.length, matched: r.matched } : { error: "could not write the export" });
       }
       if (url.pathname === "/tabs") return send(res, 200, await bridge.request("engine.tabs", { action: "list" }));
+      // Secrets a person approves for jobs to type (`npm run ab -- secrets`).
+      // Values go in and never come out: GET lists names, kinds and hosts.
+      const sm = url.pathname.match(/^\/secrets(?:\/([a-z0-9._-]+))?$/);
+      if (sm) {
+        try {
+          if (!sm[1] && req.method === "GET") return send(res, 200, { secrets: listSecrets(cfg), store: usesKeychain() ? "macOS Keychain" : `${cfg.stateDir}/secret-values.json (0600)` });
+          if (!sm[1] && req.method === "POST") {
+            const b = JSON.parse((await readBody(req)) || "{}");
+            const meta = setSecret(cfg, { name: b.name, kind: b.kind, hosts: b.hosts, value: b.value, by: "cli" });
+            audit.log("secret.set", { name: meta.name, kind: meta.kind, hosts: meta.hosts });
+            return send(res, 200, { secret: meta });
+          }
+          if (sm[1] && req.method === "DELETE") {
+            const removed = removeSecret(cfg, sm[1]);
+            audit.log("secret.removed", { name: sm[1] });
+            return send(res, removed ? 200 : 404, { removed: sm[1], existed: removed });
+          }
+          return send(res, 405, { error: `${req.method} ${url.pathname} is not a secrets operation` });
+        } catch (e) {
+          return send(res, codeOf(e) === "BAD_REQUEST" ? 400 : 502, { error: (e as Error).message, code: codeOf(e) });
+        }
+      }
       // Background jobs, for `npm run ab -- jobs`.
       const jm = url.pathname.match(/^\/jobs(?:\/([a-z0-9-]+))?(?:\/(stop|resume|records|log))?$/);
       if (jm && jobs) {
@@ -243,7 +266,7 @@ export function startControl(
           return send(res, 405, { error: `${req.method} ${url.pathname} is not a jobs operation` });
         } catch (e) {
           const code = codeOf(e);
-          return send(res, code === "JOB_NOT_FOUND" ? 404 : code === "BAD_REQUEST" || code === "NETWORK_BLOCKED" || code === "JOB_LIMIT" ? 400 : 502, {
+          return send(res, code === "JOB_NOT_FOUND" ? 404 : ["BAD_REQUEST", "NETWORK_BLOCKED", "JOB_LIMIT", "POLICY_BLOCKED"].includes(code) ? 400 : 502, {
             error: (e as Error).message,
             code,
           });
@@ -264,7 +287,7 @@ export function startControl(
         routes: [
           "/status", "/ping", "/observe", "/locate", "/wait", "/navigate", "/visit", "/tabs",
           "/network?tabId=", "/network/export?tabId=&format=har|ndjson", "/network/clear?tabId=",
-          "GET|POST /jobs", "GET|DELETE /jobs/:id", "POST /jobs/:id/stop|resume", "GET /jobs/:id/records|log?after=",
+          "GET|POST /secrets", "DELETE /secrets/:name", "GET|POST /jobs", "GET|DELETE /jobs/:id", "POST /jobs/:id/stop|resume", "GET /jobs/:id/records|log?after=",
           "POST /act", "POST /robust-click", "POST /mcp", "POST /session/release?client=",
         ],
       });

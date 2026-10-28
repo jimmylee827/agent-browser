@@ -1796,6 +1796,22 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         .describe("start: how to tell the page is fine — text: a pattern on screen; response: a request that succeeds"),
       maxLoadsPerHour: z.number().int().min(1).max(60).optional().describe("start: page loads it may cause per hour (default from the config)"),
       keepVisible: z.boolean().optional().describe("start: un-minimise its window if someone minimises it (a hidden page polls slowly)"),
+      steps: z
+        .array(
+          z.object({
+            action: z.enum(["click", "fill", "type", "select", "check", "uncheck", "press", "wait", "dismiss-consent"]),
+            name: z.string().optional(),
+            role: z.string().optional(),
+            value: z.string().optional(),
+            text: z.string().optional(),
+            secret: z.string().optional().describe("fill/type: a secret the user approved for this host (npm run ab -- secrets list), typed instead of value"),
+            optional: z.boolean().optional().describe("skip when the element is not there"),
+            timeoutMs: z.number().int().optional(),
+          }),
+        )
+        .max(10)
+        .optional()
+        .describe("start: what to do on the page after each load, e.g. [{action:\"dismiss-consent\"},{action:\"click\",name:\"Today\"}]. A password, code or card field takes only a `secret` the user approved; anything else there stops the job."),
       after: z.string().optional().describe("read: the `next` cursor from the last read"),
       limit: z.number().int().min(1).max(500).optional(),
       urlPattern: z.string().optional().describe("read: only records whose URL matches"),
@@ -1828,6 +1844,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
               intervalMs: args.intervalMs,
               health: args.health,
               keepVisible: args.keepVisible,
+              steps: args.steps,
               ...(args.maxLoadsPerHour ? { ladder: { maxLoadsPerHour: args.maxLoadsPerHour } } : {}),
             },
             by,

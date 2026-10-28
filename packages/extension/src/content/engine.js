@@ -1680,6 +1680,8 @@
       text: clip(el.innerText || el.textContent || "", 300),
     };
     if ("value" in el && el.tagName !== "BUTTON") out.value = isRedacted(el) ? "[redacted]" : clip(String(el.value), 200);
+    // A password, one-time-code or card field: what a job may fill only with a secret the user approved.
+    if (isRedacted(el)) out.sensitive = true;
     if (el.type === "checkbox" || el.type === "radio") out.checked = el.checked;
     if (el.tagName === "SELECT") out.selected = [...el.selectedOptions].map((o) => clip(o.text, 60));
     if (el.tagName === "IMG") Object.assign(out, { currentSrc: el.currentSrc, naturalWidth: el.naturalWidth, naturalHeight: el.naturalHeight, complete: el.complete });

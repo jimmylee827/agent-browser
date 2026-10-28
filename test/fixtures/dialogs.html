@@ -1,0 +1,17 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Dialogs</title>
+<h1>Dialogs</h1>
+<button id="c">Delete</button>
+<button id="p">Rename</button>
+<button id="s">Save login</button>
+<p id="out">nothing yet</p>
+<script>
+  const out = (t) => (document.getElementById("out").textContent = t);
+  document.getElementById("c").onclick = () => out(`confirm: ${confirm("Delete it?")}`);
+  document.getElementById("p").onclick = () => out(`prompt: ${prompt("New name?", "untitled")}`);
+  document.getElementById("s").onclick = async () => {
+    const r = await navigator.credentials.store(new PasswordCredential({ id: "alice", password: "pw-123456" })).catch((e) => e.name);
+    out(`store: ${r === undefined ? "nothing" : r}`);
+  };
+</script>

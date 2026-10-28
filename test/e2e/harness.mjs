@@ -11,8 +11,8 @@
 // the way the agent profile is: a person loads the unpacked extension once
 // (`npm run test:e2e:setup`). It lives at a fixed path, refreshed before each
 // run with that run's secret and port, so the one load keeps working.
-import { spawn } from "node:child_process";
-import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync, mkdirSync, symlinkSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { appendFileSync, cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync, mkdirSync, symlinkSync } from "node:fs";
 import { createServer } from "node:http";
 import { createServer as netServer } from "node:net";
 import { homedir, tmpdir } from "node:os";
@@ -82,6 +82,9 @@ const escapeHtml = (t) => String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "
 // what authorization arrived), a POST echo, slow and big answers, a poll whose
 // health a test switches (/api/mode?set=up|down|blank), and SSE.
 export const api = { mode: "up", polls: 0 };
+// The login a job's steps fill in: this password, and the current code of this authenticator seed.
+export const LOGIN = { password: "e2e-pass-Zq81!", seed: "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" };
+const { totp } = await import(resolve(dirname(fileURLToPath(import.meta.url)), "../../packages/mcp-server/dist/secrets.js"));
 const json = (res, code, body, headers = {}) => {
   res.writeHead(code, { "Content-Type": "application/json", "Cache-Control": "no-store", ...headers });
   res.end(JSON.stringify(body));
@@ -90,6 +93,20 @@ function apiRoute(req, res, url) {
   const p = url.pathname;
   if (p === "/api/items")
     return json(res, 200, { items: [{ id: 1, name: "jacket", price: 480 }, { id: 2, name: "tee", price: 120 }], sawAuthorization: !!req.headers.authorization, token: "srv-secret-token" }, { "Set-Cookie": "sid=server-session; Path=/" });
+  if (p === "/api/login") {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      let b = {};
+      try {
+        b = JSON.parse(body);
+      } catch {}
+      // This step's code or the last one's: a code typed at a step boundary still counts.
+      const ok = b.pw === LOGIN.password && [totp(LOGIN.seed), totp(LOGIN.seed, Date.now() - 30_000)].includes(b.code);
+      json(res, ok ? 200 : 401, { ok });
+    });
+    return true;
+  }
   if (p === "/api/echo") {
     let body = "";
     req.on("data", (c) => (body += c));
@@ -203,6 +220,8 @@ export async function startHarness({ log = false, waitMs = 45_000, setup = false
     // The person's own override, kept out of the tests.
     AB_LOCAL_CONFIG: join(tmp, "local.json"),
     AB_DISABLE_STDIO_MCP: "1",
+    // Secrets go to a Keychain service of the tests' own, emptied in stop().
+    AB_SECRETS_SERVICE: "agent-browser-test",
   };
   const out = log ? "inherit" : "ignore";
   let daemon = spawn(process.execPath, [join(server, "dist/index.js")], { env, stdio: ["ignore", out, out] });
@@ -275,7 +294,28 @@ export async function startHarness({ log = false, waitMs = 45_000, setup = false
     return false;
   }
 
+  /**
+   * What an update does: the extension's files change, it notices on its next
+   * connection and reloads itself, and every open tab must be re-armed.
+   */
+  async function reloadExtension() {
+    appendFileSync(join(ext, "src/sw.js"), `\n// e2e: touched ${Date.now()}\n`);
+    const ok = await restartDaemon();
+    // It connects, sees the change, reloads, and connects again.
+    await sleep(4000);
+    const t = Date.now();
+    while (Date.now() - t < 30_000) {
+      try {
+        if ((await (await fetch(`${base}/status`)).json()).bridgeConnected) return ok;
+      } catch {}
+      await sleep(300);
+    }
+    return false;
+  }
+
   async function stop() {
+    if (process.platform === "darwin")
+      for (let i = 0; i < 20; i++) if (spawnSync("security", ["delete-generic-password", "-s", "agent-browser-test"], { stdio: "ignore" }).status !== 0) break;
     for (const c of clients) await c.close().catch(() => {});
     chrome.kill("SIGTERM");
     daemon.kill("SIGTERM");
@@ -292,6 +332,7 @@ export async function startHarness({ log = false, waitMs = 45_000, setup = false
     state,
     base,
     restartDaemon,
+    reloadExtension,
     /** This instance's config/local.json: the server re-reads it when it changes. */
     localConfig: env.AB_LOCAL_CONFIG,
     /** The build stamp the server would find on disk. */

@@ -12,15 +12,20 @@
 //   npm run ab -- jobs list | status ID [--check]
 //   npm run ab -- jobs start --id ID --url URL --capture RE [--capture RE…] [--every 15m]
 //                            [--health-text RE] [--health-response RE] [--max-loads N] [--keep-visible]
+//                            [--step dismiss-consent --step click:Today --step fill:Password:@shop-login]
 //   npm run ab -- jobs start --spec job.json
 //   npm run ab -- jobs stop|resume|remove ID
 //   npm run ab -- jobs tail ID [--follow] [--log] [--url RE]
+//   npm run ab -- secrets set NAME --kind password|totp|card-number|card-expiry|card-cvc|text --host HOST [--host …] [--stdin]
+//   npm run ab -- secrets list | remove NAME
+//            A value a job may type, on those hosts only. It goes to the macOS Keychain; it is never shown again.
 //
 // Exit codes: 0 ok, 1 error, 2 the browser is not connected or the kill switch is on,
 // 3 (jobs status --check) a job needs attention.
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseStep } from "./step-spec.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const readJson = (f) => {
@@ -191,6 +196,13 @@ commands.jobs = async () => {
           : {}),
         ...(flags["max-loads"] ? { ladder: { maxLoadsPerHour: Number(flags["max-loads"]) } } : {}),
         ...(flags["keep-visible"] ? { keepVisible: true } : {}),
+        ...(flags.step ? { steps: [].concat(flags.step).filter((x) => x !== true).map((x) => {
+          try {
+            return parseStep(x);
+          } catch (e) {
+            die(e.message);
+          }
+        }) } : {}),
       };
     }
     const r = await call("/jobs", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(spec) });
@@ -220,6 +232,63 @@ commands.jobs = async () => {
     }
   }
   die(`unknown: jobs ${sub}`);
+};
+
+/** A value typed at the terminal without showing it, or read from stdin. */
+async function readSecret(prompt) {
+  if (flags.stdin || !process.stdin.isTTY) {
+    let all = "";
+    for await (const c of process.stdin) all += c;
+    return all.replace(/\r?\n$/, "");
+  }
+  process.stderr.write(prompt);
+  process.stdin.setRawMode(true);
+  process.stdin.resume();
+  let value = "";
+  try {
+    for await (const chunk of process.stdin) {
+      for (const ch of chunk.toString("utf8")) {
+        if (ch === "\r" || ch === "\n") return value;
+        if (ch === "\u0003") die("cancelled");
+        if (ch === "\u007f" || ch === "\b") value = value.slice(0, -1);
+        else value += ch;
+      }
+    }
+  } finally {
+    process.stdin.setRawMode(false);
+    process.stdin.pause();
+    process.stderr.write("\n");
+  }
+  return value;
+}
+
+commands.secrets = async () => {
+  const sub = positional[0] ?? "list";
+  const name = positional[1];
+  if (sub === "list") {
+    const r = await call("/secrets");
+    return out(r, (d) => {
+      console.log(`stored in: ${d.store}`);
+      if (!d.secrets.length) return console.log("no secrets");
+      for (const x of d.secrets) console.log(`${x.name.padEnd(24)} ${x.kind.padEnd(12)} on ${x.hosts.join(", ")}`);
+    });
+  }
+  if (sub === "set") {
+    if (!name) die("secrets set needs a name");
+    if (!flags.kind || flags.kind === true) die("--kind password|totp|card-number|card-expiry|card-cvc|text");
+    const hosts = [].concat(flags.host ?? []).filter((h) => h !== true);
+    if (!hosts.length) die("--host: where it may be typed, e.g. --host login.shop.com");
+    const value = await readSecret(flags.kind === "totp" ? "authenticator seed (base32, or the otpauth:// link): " : `${flags.kind} for ${name}: `);
+    if (!value) die("empty value");
+    const r = await call("/secrets", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, kind: flags.kind, hosts, value }) });
+    return out(r, (d) => console.log(`saved ${d.secret.name} (${d.secret.kind}), usable on ${d.secret.hosts.join(", ")}`));
+  }
+  if (sub === "remove") {
+    if (!name) die("secrets remove needs a name");
+    const r = await call(`/secrets/${encodeURIComponent(name)}`, { method: "DELETE" });
+    return out(r, (d) => console.log(`removed ${d.removed}`));
+  }
+  die(`unknown: secrets ${sub}`);
 };
 
 if (!cmd || cmd === "help" || flags.help || !commands[cmd]) {

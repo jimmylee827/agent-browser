@@ -1,0 +1,38 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Dashboard</title>
+<style>.bar { position: fixed; left: 0; right: 0; bottom: 0; background: #333; color: #fff; padding: 16px; }</style>
+<h1>Dashboard</h1>
+<p>A page a job has to work: a cookie banner, a tab to pick, a button that loads the data, and a login.</p>
+<div role="tablist">
+  <button role="tab" id="week" aria-selected="true">This week</button>
+  <button role="tab" id="today" aria-selected="false">Today</button>
+</div>
+<button id="refresh">Refresh</button>
+<p id="data">No data</p>
+<form id="login">
+  <label>Password <input type="password" name="pw" autocomplete="current-password"></label>
+  <label>Code <input name="code" autocomplete="one-time-code" inputmode="numeric"></label>
+  <button>Log in</button>
+</form>
+<p id="who">Logged out</p>
+<div class="bar" id="bar"><strong>We use cookies</strong> to improve your experience.
+  <button onclick="document.getElementById('bar').remove()">Accept all</button></div>
+<script>
+  let tab = "week";
+  for (const id of ["week", "today"])
+    document.getElementById(id).addEventListener("click", () => {
+      tab = id;
+      for (const t of document.querySelectorAll("[role=tab]")) t.setAttribute("aria-selected", String(t.id === id));
+    });
+  document.getElementById("refresh").addEventListener("click", async () => {
+    const d = await (await fetch(`/api/poll?tab=${tab}`)).json();
+    document.getElementById("data").textContent = d.readings?.length ? `Reading: ${d.readings[0].value} °C (${tab})` : "No data";
+  });
+  document.getElementById("login").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    const r = await fetch("/api/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pw: f.get("pw"), code: f.get("code") }) });
+    document.getElementById("who").textContent = (await r.json()).ok ? "Logged in" : "Wrong password or code";
+  });
+</script>

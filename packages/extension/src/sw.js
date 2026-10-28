@@ -538,6 +538,12 @@ async function netDispatch(method, params) {
     return { entries: mergeStreams(records, { orphanFrames: true }), ids: records.map((r) => r.id) };
   }
   if (method === "net.ack") return { written: await netstore.markWritten(params.ids || []) };
+  // A value a job is about to type (an approved secret): redacted from every
+  // record for the next ten minutes, under any field name. Never stored.
+  if (method === "net.secret") {
+    rememberSecret(params.value);
+    return { ok: true };
+  }
   if (method === "net.stats") return { ...(await netstore.stats()), jobTabs: Object.fromEntries(await jobTabs()) };
   const tab = await tabFor(params);
   if (method === "net.query") return await netQuery(tab, params);
