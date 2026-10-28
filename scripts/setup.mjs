@@ -195,6 +195,13 @@ if (!CHECK) {
 // ------------------------------------------------------------- verification
 
 const final = await status();
+// A second clone on this machine would take the same ports and win the
+// extension's one connection. Say so instead of fighting it.
+if (!CHECK && final?.repoRoot && resolve(final.repoRoot) !== root) {
+  record("This install", "fail", `another agent-browser is already running from ${final.repoRoot}`);
+  console.error(`\nStop that one first (\`npm run mcp:stop\` there), or use this install instead of a second clone.\n`);
+  process.exit(1);
+}
 connected = connected || !!final?.bridgeConnected;
 const ext = final?.extension;
 const versionOnDisk = JSON.parse(readFileSync(resolve(EXTENSION, "manifest.json"), "utf8")).version;

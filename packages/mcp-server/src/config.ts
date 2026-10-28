@@ -12,6 +12,8 @@ export function expandHome(p: string): string {
 }
 
 export interface AppConfig {
+  /** Where this install lives, so two clones can tell each other apart. */
+  repoRoot: string;
   /** The unpacked extension Chrome loads (for version checks). */
   extensionDir: string;
   profileDir: string;
@@ -88,6 +90,7 @@ export function loadConfig(): AppConfig {
   if (env.AB_PROFILE_DIR) cfg.profileDir = env.AB_PROFILE_DIR;
   if (env.AB_BRIDGE_PORT) cfg.bridge.port = Number(env.AB_BRIDGE_PORT);
   if (env.AB_CONTROL_PORT) cfg.bridge.controlPort = Number(env.AB_CONTROL_PORT);
+  cfg.repoRoot = repoRoot;
   cfg.extensionDir = env.AB_EXTENSION_DIR ?? resolve(repoRoot, "packages/extension");
   cfg.profileDir = expandHome(cfg.profileDir);
   cfg.stateDir = expandHome(cfg.stateDir);

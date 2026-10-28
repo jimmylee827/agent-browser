@@ -96,6 +96,10 @@ Requirements: Node 20 or newer, and Google Chrome or Chromium. macOS gets the
 full set; on Linux the server and browser work, the login item and real input
 are macOS-only.
 
+One install per machine: the server owns fixed localhost ports, so a second
+clone would fight the first. Setup notices and stops with the path of the one
+already running.
+
 Setup registers the launcher with Claude Code when the `claude` CLI is present.
 For any other client, register this (not the daemon's HTTP address):
 

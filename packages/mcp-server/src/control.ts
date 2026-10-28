@@ -93,6 +93,7 @@ export function startControl(
         return send(res, 200, {
           bridgeConnected: bridge.connected(),
           build: buildStatus(),
+          repoRoot: cfg.repoRoot,
           extension: running || onDisk ? { running: running ?? null, onDisk, stale: !!running && !!onDisk && running !== onDisk } : undefined,
         });
       }
