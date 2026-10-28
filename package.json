@@ -34,6 +34,8 @@
     "host-helper:install": "node host-helper/install.mjs",
     "host-helper:uninstall": "node host-helper/install.mjs --uninstall",
     "host-helper:status": "curl -s http://127.0.0.1:8789/health || echo '(host helper not reachable)'",
+    "setup": "node scripts/setup.mjs",
+    "doctor": "node scripts/setup.mjs --check",
     "test": "node --test 'test/unit/*.test.mjs'",
     "test:e2e": "node --test --test-concurrency=1 'test/e2e/*.test.mjs'",
     "test:e2e:setup": "node test/e2e/setup.mjs",

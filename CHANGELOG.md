@@ -7,6 +7,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- `npm run setup`: one idempotent command that checks the machine, builds,
+  writes the bridge secret, installs the login item, launches Chrome, registers
+  the launcher with Claude Code, and verifies the chain — then opens
+  `chrome://extensions` and waits for the one step a person must do. Flags:
+  `--check`, `--with-input`, `--no-daemon`, `--fresh`
+- `npm run doctor`: the same checks, changing nothing; non-zero exit when not
+  ready
+- `/status` reports the extension's version against the one on disk, so
+  `npm run mcp:status` answers "is the extension in Chrome the current one?"
 - `config/local.json`, a person's own settings kept out of the repository: a
   `policy.trustedDomains` there overrides the default and is re-read when it
   changes, so an edit the agent proposes and the person approves takes effect

@@ -5,6 +5,8 @@ import type { Audit } from "./audit.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { buildStatus } from "./build.js";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 
 /** Who is calling: one id per MCP client connection (one launcher process). */
 export interface ClientInfo {
@@ -81,7 +83,18 @@ export function startControl(
 
     try {
       if (url.pathname === "/status") {
-        return send(res, 200, { bridgeConnected: bridge.connected(), build: buildStatus() });
+        // The extension's version is what tells a person whether the one in
+        // Chrome is the one on disk, so status is useful outside an MCP call.
+        let onDisk = "";
+        try {
+          onDisk = JSON.parse(readFileSync(resolve(cfg.extensionDir, "manifest.json"), "utf8")).version;
+        } catch {}
+        const running = bridge.extension?.version;
+        return send(res, 200, {
+          bridgeConnected: bridge.connected(),
+          build: buildStatus(),
+          extension: running || onDisk ? { running: running ?? null, onDisk, stale: !!running && !!onDisk && running !== onDisk } : undefined,
+        });
       }
       if (url.pathname === "/session/release" && req.method === "POST" && mcp) {
         const id = url.searchParams.get("client") ?? "";

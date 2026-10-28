@@ -61,22 +61,45 @@ Most of it an agent can do itself; one step only a person can.
    result's `degraded` entries into the final report) — never report a page
    that was not reached as empty.
 
-## Setup
+## Install
+
+Two commands, and one click that Chrome insists a person makes.
 
 ```bash
-npm install && npm run build
-node scripts/sync-ext-secret.mjs     # generate + inject the bridge secret
-npm run launch                       # opens Chrome on the agent profile
+npm install
+npm run setup
 ```
 
-Then, once: `chrome://extensions` → Developer mode → **Load unpacked** →
-select `packages/extension`.
+`npm run setup` checks the machine, builds, writes the bridge secret, installs
+the server as a login item, launches Chrome on the agent profile, and verifies
+the whole chain. It is safe to run again at any time; it only changes what is
+missing or out of date.
 
-Install the server as a background daemon, and register the launcher with
-your client:
+The one manual step is loading the extension into Chrome — no Chrome release
+lets a script do it. Setup opens the right page and waits; in that window:
+
+1. `chrome://extensions`
+2. Developer mode (top right)
+3. **Load unpacked** → the path setup prints
+
+Then `npm run setup` again, or `npm run doctor`, until it says **Ready**.
+
+| Command | |
+| --- | --- |
+| `npm run setup` | install and verify everything |
+| `npm run doctor` | check only, change nothing (non-zero exit when not ready) |
+| `npm run setup -- --with-input` | also set up real OS input (macOS: one Accessibility grant) |
+| `npm run setup -- --no-daemon` | do not install the login item |
+| `npm run setup -- --fresh` | reinstall dependencies first |
+
+Requirements: Node 20 or newer, and Google Chrome or Chromium. macOS gets the
+full set; on Linux the server and browser work, the login item and real input
+are macOS-only.
+
+Setup registers the launcher with Claude Code when the `claude` CLI is present.
+For any other client, register this (not the daemon's HTTP address):
 
 ```bash
-npm run mcp:install     # launchd agent, starts at login, restarts on crash
 claude mcp add agent-browser --scope user -- "$(which node)" "$PWD/packages/mcp-server/dist/launcher.js"
 ```
 
