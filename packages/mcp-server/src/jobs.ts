@@ -20,7 +20,7 @@ import type { Session, SessionManager } from "./sessions.js";
 import { AbError, codeOf } from "./errors.js";
 import { evalBlockedBy } from "./policy.js";
 import { decide, freshState, type LadderState, type Observation } from "./ladder.js";
-import { agentChromeRunning, launchBrowser } from "./host-helper-client.js";
+import { agentChromeRunning, wakeBrowser } from "./host-helper-client.js";
 import type { NetEntry } from "./network.js";
 import { allowedOn, findSecret, getValue } from "./secrets.js";
 
@@ -717,7 +717,7 @@ export class JobRunner {
     this.lastLaunchAt = now;
     this.file.launches.push(now);
     this.save();
-    const via = await launchBrowser();
+    const via = await wakeBrowser(this.cfg.profileDir, this.cfg.extensionDir);
     this.ctx.audit.log("jobs.recover_browser", { reason: running ? "chrome running with no agent window" : "chrome not running", via, attempt: this.file.launches.length });
   }
 }

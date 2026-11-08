@@ -36,6 +36,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `config/local.json` is re-read on change and sent to the extension; the
   `network` and `jobs` sections join `policy` in being editable live.
 
+### Fixed
+- **One visit, one window.** Waking a Chrome that was already running used to
+  launch it again, and a launch of a running Chrome opens another window: every
+  time the bridge blinked, a blank window was left behind, and calls arriving
+  together each launched (three parallel visits, six windows). Now a running
+  Chrome with the extension loaded only gets a window opened in it, one wake
+  serves every caller waiting on it, and the blank window a wake opens is the
+  one a session moves into — claimed once, so parallel sessions never share a
+  tab. Extension 0.0.9.
+
 ### Security
 - The control port refuses requests from web pages (an `Origin` header, a
   cross-site `Sec-Fetch-Site`, or a Host other than loopback). Before, any page

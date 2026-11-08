@@ -959,12 +959,36 @@ async function dispatch(method, params) {
   if (method.startsWith("net.")) return await netDispatch(method, params);
   if (method === "engine.openSessionWindow") {
     const like = await chrome.windows.getLastFocused().catch(() => null);
+    const shape = params.viewport
+      ? { type: "popup", width: Math.max(params.viewport.width, 100), height: params.viewport.height + 90 }
+      : like?.width
+        ? { width: like.width, height: like.height }
+        : {};
+    // A browser that was just launched opens a blank window of its own. Taking
+    // that one over is what keeps one visit to one window; without it every
+    // launch left a blank window behind that no session owned and nothing closed.
+    const spare = params.adoptTabId != null ? await chrome.tabs.get(params.adoptTabId).catch(() => null) : null;
+    if (spare) {
+      if (params.viewport && spare.windowId) {
+        // Only a popup window may go below 500px wide; moving the tab there
+        // leaves the normal window it came from empty, and Chrome drops that.
+        const win = await chrome.windows.create({ tabId: spare.id, type: "popup", focused: false, ...shape });
+        const tab = win.tabs?.[0];
+        if (tab && !params.sound) await chrome.tabs.update(tab.id, { muted: true }).catch(() => {});
+        if (params.url) await chrome.tabs.update(spare.id, { url: params.url }).catch(() => {});
+        return { tabId: tab?.id, windowId: win.id, type: win.type, adopted: true };
+      }
+      await chrome.windows.update(spare.windowId, shape).catch(() => {});
+      await chrome.tabs.update(spare.id, { active: true }).catch(() => {});
+      if (params.url) await chrome.tabs.update(spare.id, { url: params.url }).catch(() => {});
+      if (!params.sound) await chrome.tabs.update(spare.id, { muted: true }).catch(() => {});
+      const win = await chrome.windows.get(spare.windowId).catch(() => null);
+      return { tabId: spare.id, windowId: spare.windowId, type: win?.type, adopted: true };
+    }
     const win = await chrome.windows.create({
       url: params.url || "about:blank",
       focused: false,
-      ...(params.viewport
-        ? { type: "popup", width: Math.max(params.viewport.width, 100), height: params.viewport.height + 90 }
-        : like?.width ? { width: like.width, height: like.height } : {}),
+      ...shape,
     });
     const tab = win.tabs?.[0];
     if (tab && !params.sound) await chrome.tabs.update(tab.id, { muted: true }).catch(() => {});

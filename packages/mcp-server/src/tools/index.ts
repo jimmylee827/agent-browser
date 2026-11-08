@@ -6,7 +6,13 @@ import { resolveKey, short, type Session, type SessionManager } from "../session
 import type { Audit } from "../audit.js";
 import type { AppConfig } from "../config.js";
 import type { ClientInfo } from "../control.js";
-import { agentChromeRunning as agentChromeRunningOn, hostHelper, launchBrowser } from "../host-helper-client.js";
+import {
+  agentChromeRunning as agentChromeRunningOn,
+  hostHelper,
+  noteSpareWindow,
+  takeSpareWindow,
+  wakeBrowser,
+} from "../host-helper-client.js";
 import { AbError, CATALOGUE, codeOf, HALT_ADVICE, POLICY_ADVICE } from "../errors.js";
 import { buildId, buildStatus, RUNNING } from "../build.js";
 import { recordEvidence, writeEvidenceFile } from "../evidence.js";
@@ -307,8 +313,26 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
   const agentChromeRunning = () => agentChromeRunningOn(ctx.cfg.profileDir);
 
   /**
+   * The wake this call performed, if any. Only the caller that woke the
+   * browser may move into the blank window the wake opened — otherwise every
+   * parallel call would adopt the same tab and several sessions would share
+   * one page. (registerTools runs once per request, so this is per-call.)
+   */
+  let myWakeId: number | undefined;
+
+  /** Open the session's own window, moving into the wake's blank one when there is one. */
+  async function openSessionWindow(s: { mobile?: boolean; viewport?: unknown; sound?: boolean }, url?: string) {
+    return ctx.bridge.request<{ tabId: number; windowId: number; type: string }>("engine.openSessionWindow", {
+      url: s.mobile ? "about:blank" : url,
+      viewport: s.viewport,
+      sound: s.sound,
+      adoptTabId: myWakeId === undefined ? undefined : takeSpareWindow(myWakeId),
+    });
+  }
+
+  /**
    * Bring the browser up if the bridge isn't connected. Shared by every tool
-   * that needs a live browser so the launch path and its advice exist once.
+   * that needs a live browser so the wake path and its advice exist once.
    */
   async function ensureBrowser(timeoutMs: number): Promise<{ already: boolean; launchedVia?: string; waitedMs?: number }> {
     if (ctx.bridge.connected()) return { already: true };
@@ -318,11 +342,20 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
     // to wait for, and the wait only delayed every cold start by 8s.
     if (agentChromeRunning() && (await ctx.bridge.waitForConnection(8_000))) return { already: true };
     if (existsSync(resolve(ctx.cfg.stateDir, "HALT"))) throw new AbError("HALTED", "HALTED: kill switch active");
-    const launchedVia = await launchBrowser();
-    ctx.audit.log("browser.launch", { via: launchedVia });
+    const { via, wakeId, performed } = await wakeBrowser(ctx.cfg.profileDir, ctx.cfg.extensionDir);
+    // Callers that joined a wake already under way did not wake anything.
+    if (performed) ctx.audit.log(via === "launch" ? "browser.launch" : "browser.new_window", {});
     const t0 = Date.now();
-    if (await ctx.bridge.waitForConnection(timeoutMs)) return { already: false, launchedVia, waitedMs: Date.now() - t0 };
-    throw new AbError("BRIDGE_DOWN", `agent browser did not connect within ${timeoutMs}ms (launched via ${launchedVia})`, {
+    if (await ctx.bridge.waitForConnection(timeoutMs)) {
+      myWakeId = wakeId;
+      // The window the wake opened is a spare: one session moves into it.
+      const list = await ctx.bridge
+        .request<{ tabs: { tabId: number; url: string; windowId: number }[] }>("engine.tabs", { action: "list" })
+        .catch(() => null);
+      if (list) await noteSpareWindow(list.tabs, wakeId, (tabId) => !!ctx.sessions.ownerOfTab(tabId));
+      return { already: false, launchedVia: via, waitedMs: Date.now() - t0 };
+    }
+    throw new AbError("BRIDGE_DOWN", `agent browser did not connect within ${timeoutMs}ms (woke it via ${via})`, {
       recovery:
         "if Chrome opened, the extension needs loading once (a human step: chrome://extensions → Load unpacked → packages/extension); " +
         "if it did not, run `npm run launch` in the agent-browser repo and read its output",
@@ -599,11 +632,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
       const old = s.tabId !== undefined ? s.windowId : undefined;
       // A phone's headers must be on the very first request: open blank, set
       // them, then load.
-      const w = await ctx.bridge.request<{ tabId: number; windowId: number; type: string }>("engine.openSessionWindow", {
-        url: s.mobile ? "about:blank" : nav.url,
-        viewport: s.viewport,
-        sound: s.sound,
-      });
+      const w = await openSessionWindow(s, nav.url);
       ctx.sessions.bind(s, w.tabId, w.windowId);
       s.windowType = w.type;
       call.tabId = w.tabId;
@@ -1251,7 +1280,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
       if (DRY_RUN) return { dryRun: true, wouldNavigate: args.url ?? args.action };
       return inSession(call, sc, async () => {
         if (!sc.s.legacy && sc.s.tabId === undefined) {
-          const w = await ctx.bridge.request<{ tabId: number; windowId: number }>("engine.openSessionWindow", { url: args.url });
+          const w = await openSessionWindow(sc.s, args.url);
           ctx.sessions.bind(sc.s, w.tabId, w.windowId);
           call.tabId = w.tabId;
           ctx.audit.log("tool.browser_navigate", { url: args.url, tabId: w.tabId, opened: true });
@@ -1483,7 +1512,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
       const all = (await list()).tabs;
       if (action === "new") {
         if (s.windowId === undefined) {
-          const w = await ctx.bridge.request<{ tabId: number; windowId: number }>("engine.openSessionWindow", { url });
+          const w = await openSessionWindow(s, url);
           ctx.sessions.bind(s, w.tabId, w.windowId);
           ctx.audit.log("tool.browser_tabs", { action, tabId: w.tabId, opened: true });
           return { ...annotate(await list()), yourTab: w.tabId };
