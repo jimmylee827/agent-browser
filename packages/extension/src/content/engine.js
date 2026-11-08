@@ -36,15 +36,65 @@
   };
   function clickableNonLink(el) {
     if (el.tagName === "A") return hasHandlerAttr(el) || el.hasAttribute("tabindex") || pointerCursor(el);
-    // A div or span: only with an explicit handler attribute, or focusable and
-    // drawn as clickable — a cursor alone would turn every card into a button.
-    return hasHandlerAttr(el) || (el.tabIndex >= 0 && el.hasAttribute("tabindex") && pointerCursor(el));
+    if (hasHandlerAttr(el) || (el.tabIndex >= 0 && el.hasAttribute("tabindex") && pointerCursor(el))) return true;
+    return inferredButton(el);
+  }
+
+  // A <div>, <span>, <li> or <i> that is a button only in script — a router's
+  // "Advanced" tab, a pager's "2", a "Click here to continue" box. Two signs,
+  // either enough, but only on something the size of a control: a short label,
+  // no real control inside it, not inside one, not a quarter of the screen.
+  // (A cursor or a handler alone would turn every card and every wrapper a
+  // page listens on into a "button".)
+  //   - the pointer cursor is its own, not inherited from a parent — the mark a
+  //     designer puts on what may be clicked;
+  //   - the page gave it a click handler from script (main/page.js noticed).
+  // One answer per element per snapshot; an inner element that only repeats
+  // its clickable parent's label is left out, so "Advanced" is listed once.
+  const CONTROL_INSIDE = 'a[href], button, input, select, textarea, [role="button"], [role="link"], [contenteditable=""], [contenteditable="true"]';
+  const CONTROL_AROUND = 'a[href], button, [role="button"], [role="link"]';
+  function inferredButton(el) {
+    const memo = AB.clickMemo;
+    if (memo?.has(el)) return memo.get(el);
+    const yes = inferButton(el);
+    memo?.set(el, yes);
+    return yes;
+  }
+  function inferButton(el) {
+    if (el.childElementCount > 8) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0 || r.width * r.height > (innerWidth * innerHeight) / 4) return false;
+    const text = (el.textContent || "").trim();
+    if (text.length > 80) return false;
+    if (el.querySelector(CONTROL_INSIDE) || el.parentElement?.closest(CONTROL_AROUND)) return false;
+    const ownCursor = pointerCursor(el) && !(el.parentElement && pointerCursor(el.parentElement));
+    if (!((ownCursor && text.length <= 60) || pageSaysClickable(el))) return false;
+    for (let a = el.parentElement, i = 0; a && i < 3; a = a.parentElement, i++)
+      if (SCRIPT_BUTTON_TAGS.has(a.tagName) && clickableNonLink(a) && (a.textContent || "").trim() === text) return false;
+    return true;
+  }
+  const SCRIPT_BUTTON_TAGS = new Set(["A", "DIV", "SPAN", "LI", "I"]);
+
+  // Ask the page world (main/page.js) whether the page gave this element a
+  // click handler. The question is an event on this document's secret
+  // channel; the answer is whether it came back cancelled. Only for the top
+  // document, whose channel this engine holds; frames go by cursor alone.
+  function pageSaysClickable(el) {
+    const ch = relayState()?.channel;
+    if (!ch || el.ownerDocument !== document) return false;
+    try {
+      return !el.dispatchEvent(new CustomEvent(ch + ":ck", { cancelable: true, detail: "self" }));
+    } catch {
+      return false;
+    }
   }
 
   const TAG_ROLE = {
     A: (el) => (el.hasAttribute("href") ? "link" : clickableNonLink(el) ? "button" : "generic"),
     DIV: (el) => (clickableNonLink(el) ? "button" : null),
     SPAN: (el) => (clickableNonLink(el) ? "button" : null),
+    LI: (el) => (clickableNonLink(el) ? "button" : null),
+    I: (el) => (clickableNonLink(el) ? "button" : null),
     VIDEO: () => "video",
     AUDIO: () => "audio",
     IFRAME: () => "iframe",
@@ -166,6 +216,10 @@
       const sib = [el.nextElementSibling, el.previousElementSibling].find((s) => s?.tagName === "LABEL");
       n = sib?.textContent || "";
     }
+    // A field whose label is simply the text in front of it, tied to nothing:
+    // "SSID: [SHARP_staff]" on a router, "<td>Name</td><td><input></td>" in a
+    // table form. Without this, a status page was a column of unnamed boxes.
+    if (!n.trim() && FORM_CONTROL.has(el.tagName)) n = nearbyLabel(el);
     // title is a tooltip: the last resort, after the visible text. Taking it
     // first named Wikipedia's links after their targets ("Special:Statistics").
     if (!n.trim()) n = el.getAttribute("title") || "";
@@ -181,6 +235,41 @@
     }
     if (!n.trim() && r === "iframe") n = el.getAttribute("name") || el.getAttribute("src") || "";
     return clip(n, 100);
+  }
+
+  // The text just before a field, read the way a person reads a form: back
+  // through the field's siblings, then its parents' (a label in one cell, the
+  // box in the next; a label beside the wrapper the box sits in). The boxes of
+  // one split field are looked past ("IP Address: [172].[16].[11].[254]" names
+  // all four), and the search stops at another field — its label is not ours —
+  // or at the form, table or list the row belongs to.
+  const SEPARATOR = /^[\s.:\-–/]*$/;
+  const ROW_END = new Set(["TR", "LI", "FORM", "TABLE", "TBODY", "THEAD", "UL", "OL", "FIELDSET", "BODY"]);
+  function nearbyLabel(el) {
+    const sameField = (s) => {
+      const boxes = FORM_CONTROL.has(s.tagName) ? [s] : [...s.querySelectorAll("input, select, textarea")];
+      return boxes.length > 0 && boxes.every((b) => b.tagName === el.tagName && b.type === el.type);
+    };
+    let node = el;
+    for (let depth = 0; depth < 4 && node; depth++) {
+      for (let s = node.previousSibling; s; s = s.previousSibling) {
+        let t = "";
+        if (s.nodeType === 3) t = s.textContent.trim();
+        else if (s.nodeType === 1) {
+          if (FORM_CONTROL.has(s.tagName) || s.querySelector("input, select, textarea")) {
+            if (sameField(s)) continue;
+            return "";
+          }
+          if (!s.getClientRects().length) continue;
+          t = (s.innerText || "").trim();
+        }
+        if (!t || SEPARATOR.test(t)) continue;
+        return t.length > 60 ? "" : t.replace(/\s*[:：]\s*$/, "");
+      }
+      node = node.parentElement;
+      if (!node || ROW_END.has(node.tagName)) break;
+    }
+    return "";
   }
 
   // The group a radio or checkbox belongs to — its fieldset legend or its
@@ -245,9 +334,15 @@
     });
   }
 
+  const isReadOnly = (el) =>
+    ((el.tagName === "INPUT" || el.tagName === "TEXTAREA") && el.readOnly) || el.getAttribute("aria-readonly") === "true";
+
   function state(el) {
     const s = {};
     if (el.disabled || el.getAttribute("aria-disabled") === "true") s.disabled = true;
+    // A box that only shows a value (a router's status page is made of them):
+    // it can be read, not typed into.
+    if (isReadOnly(el)) s.readonly = true;
     if (el.required) s.required = true;
     const ac = el.getAttribute("aria-checked");
     if (el.type === "checkbox" || el.type === "radio") s.checked = !!el.checked;
@@ -300,6 +395,8 @@
     "switch",
     "option",
   ]);
+  // Controls that hold a value, as opposed to ones that do something.
+  const FIELD_ROLES = new Set(["textbox", "searchbox", "combobox", "checkbox", "radio", "slider", "switch"]);
   // Media players are not controls, but an agent testing one needs to see them
   // and their state (a video that failed to load is otherwise invisible).
   const MEDIA = new Set(["video", "audio"]);
@@ -361,6 +458,7 @@
     AB.refs = new Map();
     AB.refOf = new WeakMap();
     AB.frameDocs = new Set();
+    AB.clickMemo = new WeakMap();
 
     // Every qualifying element gets a ref, so locate/act can reach the whole
     // page; only the tree handed back is capped at maxNodes. Capping the refs
@@ -368,6 +466,10 @@
     const out = [];
     let ref = 0;
     let omitted = 0;
+    // The heading each field sits under, so a page with nine "SSID" boxes can
+    // say which band each belongs to (and "5GHz Wireless SSID" can find one).
+    AB.sectionOf = new WeakMap();
+    let section = "";
     for (const { el, depth, crossOrigin } of walk(document.body, 0)) {
       if (crossOrigin) {
         // A frame from another origin cannot be looked inside, but it is a
@@ -392,6 +494,8 @@
       const landmark = LANDMARK.has(r) || MEDIA.has(r);
       if (!interactive && !landmark) continue;
       if (!interactive && !name) continue;
+      if (r === "heading") section = clip(name, 60);
+      else if (FIELD_ROLES.has(r) && section) AB.sectionOf.set(el, section);
 
       ref += 1;
       setRef(el, ref);
@@ -417,6 +521,15 @@
         ...(inViewport(el) ? {} : { offscreen: true }),
         ...(Object.keys(st).length ? { state: st } : {}),
       });
+    }
+    // A section only where the name alone is ambiguous: on an ordinary form
+    // it would repeat the page's heading on every field.
+    const seen = new Map();
+    for (const n of out) if (FIELD_ROLES.has(n.role)) seen.set(n.name, (seen.get(n.name) || 0) + 1);
+    for (const n of out) {
+      if (!FIELD_ROLES.has(n.role) || seen.get(n.name) < 2) continue;
+      const sec = AB.sectionOf.get(AB.refs.get(n.ref));
+      if (sec) n.section = sec;
     }
     return {
       url: location.href,
@@ -487,6 +600,53 @@
       setTimeout(r, ms);
     });
 
+  // innerText, with what the fields hold. innerText leaves every box out, so a
+  // router's status page read "SSID:" with nothing after it and its DHCP pool
+  // as "… - …". Only the parts of the page that contain a field are walked by
+  // hand (blocks on their own lines, cells tab-separated); everything else is
+  // the browser's own innerText.
+  const FIELDS = "input, select, textarea";
+  const BLOCK_DISPLAY = /^(block|flex|grid|list-item|table|table-row|table-caption|flow-root)$/;
+  function textWithValues(el) {
+    if (!el.querySelector(FIELDS)) return el.innerText || "";
+    let out = "";
+    for (const n of el.childNodes) {
+      if (n.nodeType === 3) {
+        out += n.textContent.replace(/\s+/g, " ");
+        continue;
+      }
+      if (n.nodeType !== 1 || /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(n.tagName)) continue;
+      if (n.tagName === "BR") {
+        out += "\n";
+        continue;
+      }
+      const cs = getComputedStyle(n);
+      if (cs.display === "none" || cs.visibility === "hidden") continue;
+      if (FORM_CONTROL.has(n.tagName)) {
+        out += fieldText(n);
+        continue;
+      }
+      const inner = textWithValues(n);
+      if (BLOCK_DISPLAY.test(cs.display)) out += `\n${inner}\n`;
+      else if (cs.display === "table-cell") out += `${inner}\t`;
+      // A label drawn as a box of its own width ("Status:" then the value) is
+      // separated on screen by space, not by a character: say it with one.
+      else if (/^inline-(block|flex|grid)$/.test(cs.display)) out += `${inner} `;
+      else out += inner;
+    }
+    // The boxes of an IP address are separated by "." text in the markup, often with spaces around it.
+    return out.replace(/\n[ \t]+/g, "\n").replace(/(\d) ?\. ?(?=\d)/g, "$1.");
+  }
+  function fieldText(f) {
+    if (f.tagName === "SELECT") return f.selectedOptions[0] ? ` ${f.selectedOptions[0].text.trim()} ` : "";
+    const t = (f.type || "text").toLowerCase();
+    if (t === "hidden" || t === "file") return "";
+    if (t === "checkbox" || t === "radio") return f.checked ? "[x] " : "[ ] ";
+    if (t === "button" || t === "submit" || t === "reset" || t === "image") return f.value ? ` ${f.value} ` : "";
+    if (!f.value) return "";
+    return isRedacted(f) ? "[redacted]" : f.value;
+  }
+
   // The page's visible text, with line breaks kept (collapsing every newline
   // to a space ran headings into their paragraphs) and paged by offset so a
   // long article is never cut off silently.
@@ -502,7 +662,7 @@
         if (t && visible(f)) frames.push(`\n[frame: ${clip(f.title || f.name || f.src || "untitled", 60)}]\n${t}`);
       } catch {} // cross-origin
     }
-    const all = ((document.body?.innerText || "") + frames.join("\n"))
+    const all = ((document.body ? textWithValues(document.body) : "") + frames.join("\n"))
       .replace(/ /g, " ")
       .replace(/(\S)[ \t]{2,}/g, "$1 ")
       .replace(/[ \t]+\n/g, "\n")
@@ -707,8 +867,11 @@
         // Small"), which tells it from another "Small" on the page.
         const name = accName(el);
         const group = el.type === "radio" || el.type === "checkbox" ? groupName(el) : "";
-        if (want && !name.toLowerCase().includes(want) && !(group && `${group} ${name}`.toLowerCase().includes(want))) continue;
-        matches.push({ ref: r, role: role(el), name, ...(group ? { group } : {}) });
+        // A field also answers to "<section> <name>" ("5GHz Wireless SSID").
+        const section = AB.sectionOf?.get(el) || "";
+        const long = [group, section].filter(Boolean).map((p) => `${p} ${name}`.toLowerCase());
+        if (want && !name.toLowerCase().includes(want) && !long.some((l) => l.includes(want))) continue;
+        matches.push({ ref: r, role: role(el), name, ...(group ? { group } : {}), ...(section ? { section } : {}) });
       }
       // Best match first: the exact name, then one that starts with it, then
       // any that contains it; controls before headings and landmarks. In page
@@ -716,8 +879,8 @@
       if (want) {
         const rank = (m) => {
           const n = m.name.trim().toLowerCase();
-          const g = m.group ? `${m.group} ${m.name}`.trim().toLowerCase() : "";
-          const fit = n === want || g === want ? 0 : n.startsWith(want) ? 1 : 2;
+          const longer = [m.group, m.section].filter(Boolean).map((p) => `${p} ${m.name}`.trim().toLowerCase());
+          const fit = n === want || longer.includes(want) ? 0 : n.startsWith(want) ? 1 : 2;
           return fit * 2 + (INTERACTIVE.has(m.role) ? 0 : 1);
         };
         matches.sort((a, b) => rank(a) - rank(b));
@@ -734,7 +897,36 @@
     }
     if (!matches.length && params.role && (STRUCTURAL[params.role] || !INTERACTIVE.has(params.role)))
       matches = locateStructural(params.role, want);
-    return { snapshotGeneration: AB.gen, matches };
+    return { snapshotGeneration: AB.gen, matches, ...(!matches.length && want ? { textOnPage: textHits(want) } : {}) };
+  }
+
+  // Where the name asked for is on the page as plain text, when nothing that
+  // can be acted on carries it. A NO_MATCH that said "widen the name" while
+  // "Advanced" sat on screen sent the agent the wrong way: the label is there,
+  // it is just not a control. Exact text first; where it is, to click the point.
+  function textHits(want) {
+    const found = [];
+    const tw = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    for (let t = tw.nextNode(); t && found.length < 30; t = tw.nextNode()) {
+      const s = t.textContent.trim().toLowerCase();
+      if (!s.includes(want)) continue;
+      const el = t.parentElement;
+      if (!el || !visible(el)) continue;
+      found.push({ el, text: t.textContent.trim(), exact: s === want });
+    }
+    found.sort((a, b) => b.exact - a.exact);
+    return found.slice(0, 3).map(({ el, text }) => {
+      const b = viewRect(el);
+      const cls = typeof el.className === "string" ? el.className.trim() : "";
+      return {
+        tag: el.tagName.toLowerCase(),
+        ...(cls ? { class: clip(cls, 40) } : {}),
+        text: clip(text, 60),
+        cursor: getComputedStyle(el).cursor,
+        at: { x: Math.round(b.left + b.width / 2), y: Math.round(b.top + b.height / 2) },
+        ...(inViewport(el) ? {} : { offscreen: true }),
+      };
+    });
   }
 
   // ---- action engine (DOM-only, human-like). isTrusted:false is an accepted
@@ -946,7 +1138,23 @@
     if (AB.hovered || AB.hoverSheets?.size) clearHover();
     // A pointer sequence may have no target: then it acts on the page.
     const el = p.action === "pointer" && p.ref == null ? null : resolve(p.ref, p.gen); // throws STALE_SNAPSHOT / REF_NOT_FOUND
-    if (!el) return { acted: true, action: "pointer", changed: true, signals: {}, ...(await pointerSequence(null, p)), snapshotStale: true };
+    // No target: the page is watched as a whole. This said changed:true
+    // unconditionally, so a sequence that did nothing read as one that worked.
+    if (!el) {
+      const urlBefore = location.href;
+      let mutated = 0;
+      const mo = new MutationObserver((recs) => (mutated += recs.length));
+      mo.observe(document.documentElement, { subtree: true, childList: true, attributes: true, characterData: true });
+      let extra;
+      try {
+        extra = await pointerSequence(null, p);
+      } finally {
+        await sleep(60);
+        mo.disconnect();
+      }
+      const navigated = location.href !== urlBefore;
+      return { acted: true, action: "pointer", changed: navigated || mutated > 0, signals: { navigated, domMutations: mutated }, ...extra, snapshotStale: true };
+    }
     // An editing host has no .value; its text is what typing changes.
     const valueOf = () => ("value" in el ? el.value : el.isContentEditable ? el.textContent : undefined);
     const before = { url: location.href, value: valueOf() };
@@ -969,6 +1177,12 @@
     for (const d of new Set([document, el.ownerDocument]))
       mo.observe(d.documentElement, { subtree: true, childList: true, attributes: true, characterData: true });
     let hover = null;
+    if ((p.action === "type" || p.action === "fill" || p.action === "clear") && isReadOnly(el)) {
+      mo.disconnect();
+      const e = new Error("NOT_ACTIONABLE: the field is read-only — it shows a value, it does not take one");
+      e.code = "NOT_ACTIONABLE";
+      throw e;
+    }
     try {
       const { cx, cy } = await ensureActionable(el);
       switch (p.action) {
@@ -1592,6 +1806,8 @@
     const doc = el ? el.ownerDocument : document;
     const unwatch = watchCapture(doc);
     let last = el || doc.body;
+    let downOn = null;
+    let clickedOn = null;
     const done = [];
     try {
       for (const s of p.sequence || []) {
@@ -1606,18 +1822,27 @@
         const mouse = { clientX: pt.x, clientY: pt.y, buttons, button: init.button < 0 ? 0 : init.button, ...mods };
         if (s.type === "down") {
           AB.pointerDown = true;
+          downOn = target;
           fire(target, "pointerdown", init); fire(target, "mousedown", mouse);
         } else if (s.type === "move") {
           fire(target, "pointermove", init); fire(target, "mousemove", mouse);
         } else if (s.type === "up") {
           AB.pointerDown = false;
           fire(target, "pointerup", init); fire(target, "mouseup", mouse);
+          // And the click the browser follows a press and release with, on the
+          // nearest element both landed in — what a handler bound to "click"
+          // waits for. Without it a down/up on a script-bound button did nothing.
+          clickedOn = downOn && commonAncestor(downOn, target);
+          if (clickedOn) fire(clickedOn, "click", mouse);
+          downOn = null;
         } else if (s.type === "wheel") {
           target.dispatchEvent(new WheelEvent("wheel", { bubbles: true, cancelable: true, composed: true, clientX: pt.x, clientY: pt.y, deltaX: s.deltaX || 0, deltaY: s.deltaY || 0, ...mods }));
         } else {
           const e = new Error(`BAD_REQUEST: unknown pointer step type "${s.type}"`); e.code = "BAD_REQUEST"; throw e;
         }
         done.push({ type: s.type, x: Math.round(pt.x), y: Math.round(pt.y), target: selectorOf(target) });
+        if (clickedOn) done.push({ type: "click", x: Math.round(pt.x), y: Math.round(pt.y), target: selectorOf(clickedOn) });
+        clickedOn = null;
         last = target;
         await sleep(s.waitMs ?? 16);
       }
@@ -1626,6 +1851,12 @@
       unwatch();
     }
     return { pointer: done };
+  }
+
+  /** The nearest element containing both (the target of the click a press and release make). */
+  function commonAncestor(a, b) {
+    for (let n = a; n; n = n.parentElement) if (n.contains(b)) return n;
+    return null;
   }
 
   // Where to click for real input: scroll the element into the middle of the

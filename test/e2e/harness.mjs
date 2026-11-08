@@ -14,6 +14,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { appendFileSync, cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync, mkdirSync, symlinkSync } from "node:fs";
 import { createServer } from "node:http";
+import { createServer as createHttpsServer } from "node:https";
 import { createServer as netServer } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { dirname, extname, join, resolve } from "node:path";
@@ -181,6 +182,23 @@ function fixtureServer(port, other) {
   return new Promise((ok) => srv.listen(port, "127.0.0.1", () => ok(srv)));
 }
 
+/** An HTTPS server whose certificate nobody issued: null when openssl is missing. */
+function selfSignedServer(dir, port) {
+  const key = join(dir, "tls-key.pem");
+  const cert = join(dir, "tls-cert.pem");
+  const made = spawnSync(
+    "openssl",
+    ["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-keyout", key, "-out", cert, "-days", "2", "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1"],
+    { stdio: "ignore" },
+  );
+  if (made.status !== 0) return null;
+  const srv = createHttpsServer({ key: readFileSync(key), cert: readFileSync(cert) }, (_req, res) => {
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end("<!doctype html><title>Behind the warning</title><h1>Behind the warning</h1>");
+  });
+  return new Promise((ok) => srv.listen(port, "127.0.0.1", () => ok(srv)));
+}
+
 /**
  * Start the isolated instance. `waitMs` is how long to wait for the
  * extension to connect — long in setup, while a person loads it.
@@ -204,6 +222,12 @@ export async function startHarness({ log = false, waitMs = 45_000, setup = false
   writeFileSync(join(ext, "src/generated-secret.js"), `export const BRIDGE_SECRET = ${JSON.stringify(secret)};\nexport const BRIDGE_PORT = ${bridgePort};\n`);
 
   const servers = [await fixtureServer(webA, webB), await fixtureServer(webB, webA)];
+  // An HTTPS origin with a certificate of its own making, as a router or a dev
+  // server has: Chrome stops at its warning page. And a port nothing listens
+  // on, for a page that cannot load at all.
+  const [webTls, deadPort] = await Promise.all([freePort(), freePort()]);
+  const tls = selfSignedServer(tmp, webTls);
+  if (tls) servers.push(await tls);
   // The server runs from a copy of the build, so a test can change what is
   // "on disk" (the build stamp) without touching the real one.
   const server = join(tmp, "server");
@@ -329,6 +353,10 @@ export async function startHarness({ log = false, waitMs = 45_000, setup = false
     client,
     stop,
     url: (path, which = "A") => `http://127.0.0.1:${which === "A" ? webA : webB}/${path}`,
+    /** A page behind a certificate Chrome does not trust; null without openssl. */
+    untrustedUrl: tls ? `https://127.0.0.1:${webTls}/` : null,
+    /** An address where nothing answers. */
+    deadUrl: `http://127.0.0.1:${deadPort}/`,
     state,
     base,
     restartDaemon,

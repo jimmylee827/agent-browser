@@ -1153,7 +1153,10 @@ async function dispatch(method, params) {
     // yet, so without it a successful click looks identical to a dead one.
     return {
       sw: "ok",
-      tab: { id: tab.id, url: tab.url, title: tab.title, status: tab.status, windowId: tab.windowId, navCount: NAV_COUNT.get(tab.id) || 0 },
+      tab: {
+        id: tab.id, url: tab.url, title: tab.title, status: tab.status, windowId: tab.windowId, navCount: NAV_COUNT.get(tab.id) || 0,
+        ...(LOAD_ERROR.has(tab.id) ? { loadError: LOAD_ERROR.get(tab.id) } : {}),
+      },
       engine: pong,
     };
   }
@@ -1463,6 +1466,26 @@ chrome.webNavigation.onCommitted.addListener((d) => {
       .executeScript({ target: { tabId: d.tabId }, world: "MAIN", files: ["src/content/diag-hook.js"] })
       .catch(() => {});
 });
+// A navigation that ended on one of Chrome's own pages — a certificate
+// warning, "this site can't be reached". No content script runs there, so all
+// the agent used to get was "Receiving end does not exist".
+//
+// Kept until a page commits in the tab, or the tab heads somewhere else.
+// Chrome retries a refused or unreachable page by itself (after 1s, then 5s,
+// …), and each retry starts a navigation to the same address that ends
+// ERR_ABORTED: forgetting the error on every navigation lost it within a second.
+const LOAD_ERROR = new Map();
+chrome.webNavigation.onBeforeNavigate.addListener((d) => {
+  if (d.frameId === 0 && LOAD_ERROR.get(d.tabId)?.url !== d.url) LOAD_ERROR.delete(d.tabId);
+});
+chrome.webNavigation.onCommitted.addListener((d) => {
+  if (d.frameId === 0) LOAD_ERROR.delete(d.tabId);
+});
+chrome.webNavigation.onErrorOccurred.addListener((d) => {
+  if (d.frameId !== 0 || /ERR_ABORTED/.test(d.error)) return;
+  LOAD_ERROR.set(d.tabId, { error: d.error, url: d.url, ts: Date.now() });
+});
+chrome.tabs.onRemoved.addListener((id) => LOAD_ERROR.delete(id));
 // A same-document route change (pushState, a hash route) is a navigation too.
 chrome.webNavigation.onHistoryStateUpdated.addListener((d) => {
   if (d.frameId !== 0) return;

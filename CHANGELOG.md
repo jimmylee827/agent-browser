@@ -36,6 +36,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `config/local.json` is re-read on change and sent to the extension; the
   `network` and `jobs` sections join `policy` in being editable live.
 
+### Fixed (admin pages, from a session on a TP-Link router)
+- **Buttons that exist only in script are buttons.** A `<div>`, `<span>`, `<li>`
+  or `<i>` with a handler attached from script (jQuery's `.on("click")`,
+  `addEventListener`, `el.onclick = …`) showed nothing in the markup and was
+  invisible: the router's Advanced tab, its pager, its "Click here to
+  continue". The page-world kit now notes which elements get click handlers
+  (disguised like the rest of it; the engine asks per element on the
+  document's secret channel), and an element with a pointer cursor of its own
+  counts too — both only on something the size of a control, and listed once.
+- **Fields are named by the text beside them** ("SSID: [box]", a label in the
+  table cell before, the four boxes of an IP address), read-only boxes say
+  `state.readonly` and refuse typing, and a name that repeats carries the
+  heading it sits under (`section`), which name matching accepts ("5GHz
+  Wireless SSID").
+- **Read mode shows what fields hold.** innerText leaves boxes out, so a status
+  page read "SSID:" with nothing after it and a DHCP pool as "… - …".
+- **`browser_pointer` clicks.** An up after a down now ends with the click a
+  browser fires; a sequence with no target reports `changed` from what it
+  measured instead of always `true`.
+- **Chrome's own pages are named.** A certificate warning is `CERT_INVALID` (the
+  person's call, with a screenshot), a page that cannot load is `LOAD_FAILED`
+  with `loadError` — for every tool, not "Receiving end does not exist" — and an
+  act there is never reported as a click that navigated. A screenshot of such a
+  page falls back to a plain viewport capture.
+- **`NO_MATCH` says when the words are on the page as plain text** (`textOnPage`:
+  tag, cursor, where), instead of advising to widen the name.
+- Extension 0.0.10.
+
 ### Fixed
 - **One visit, one window.** Waking a Chrome that was already running used to
   launch it again, and a launch of a running Chrome opens another window: every

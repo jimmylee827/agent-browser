@@ -137,6 +137,19 @@ whatever the snapshot size. The default is OK; pass `onDialog: "dismiss"` for
 Cancel, and `dialogText` for a prompt's answer. Answer a "Delete this?" box with
 care — it is a decision on the user's behalf.
 
+### "Admin pages: routers, switches, NAS, printers"
+Their buttons are often `<div>`, `<span>` or `<li>` with a handler attached from
+script; they appear in the tree as `button`s by their text (the pointer cursor
+or the handler gives them away), so `agent_browser_act({ name: "Advanced" })`
+works. Status values sit in read-only boxes: each is named by the label beside
+it (`"SSID"`), says `state.readonly`, and — where the same name repeats — the
+heading it sits under (`section: "5GHz Wireless"`); `"5GHz Wireless SSID"`
+finds that one. Read mode shows what every box holds (`SSID: Office_5G`,
+`IP Address: 172.16.11.254`). A self-signed certificate stops at Chrome's
+warning (`CERT_INVALID`): ask the user to click through, then continue. Many of
+these devices encrypt their API traffic, so `browser_network` shows only
+ciphertext there — read the page instead.
+
 ### "Editors and iframes"
 Same-origin iframes are part of the page: their fields are in the tree, their
 text is in read mode (under `[frame: …]`), and a rich-text editor's body is a
@@ -177,6 +190,8 @@ agent_browser_act({ name: "First", role: "listitem", action: "drag", to: { name:
 The result gives `rects.before/after` and the value or `aria-valuenow` before
 and after. For anything else (press-and-hold, a path, a wheel), use
 `browser_pointer({ sequence: [{type:"down", x, y}, {type:"move", …}, {type:"up", …}] })`.
+As in a browser, an `up` after a `down` ends with a `click` on the element both
+landed in, so a down and an up at one point click it.
 
 ### "Something only works for a real person" (sound, fullscreen, a native dialog)
 ```text
@@ -389,10 +404,13 @@ and `humanAction`:
 
 | `code` | Meaning |
 |---|---|
-| `NO_MATCH` | nothing by that name; `recovery` names similar elements |
+| `NO_MATCH` | nothing by that name; `recovery` names similar elements — or, when the words are on the page as plain text, `textOnPage` says where (tag, cursor, `at` x/y) and how to click that point |
 | `STALE_SNAPSHOT` / `REF_NOT_FOUND` | the page changed; observe again |
 | `OCCLUDED` | something covers the element; `occludedBy` names it |
 | `NEEDS_HUMAN` | a captcha or notice blocks it; stop and tell the user |
+| `CERT_INVALID` | Chrome is showing its certificate warning (a router, a dev server); stop and ask the user to click through — a screenshot comes with it |
+| `LOAD_FAILED` | the page did not load (`loadError`: no such host, nothing listening); a private address may need another network or a VPN |
+| `NOT_ACTIONABLE` | hidden, disabled, or a read-only box (`state.readonly`) |
 | `HOVER_NOT_EFFECTIVE` | the hover changed nothing |
 | `NO_SESSION_TAB` / `TAB_GONE` | no page yet, or your tab was closed; visit again |
 | `TAB_OWNED_BY_OTHER` / `SESSION_LOCKED` | another session's tab, or leased |

@@ -1,0 +1,69 @@
+<!doctype html><meta charset="utf-8"><title>Router</title>
+<!--
+  The patterns of a consumer router's admin page (a TP-Link EB610 was the
+  model): controls that are buttons only in script, status values in
+  read-only boxes with a label beside them, an IP address split into four
+  boxes, a table-laid form, a pager of bare numbers. Every handler is attached
+  from script, after main/page.js is in place — as on the real page.
+-->
+<style>
+  body { font: 14px sans-serif; margin: 16px; }
+  ul.tabs { list-style: none; display: flex; gap: 16px; padding: 0; }
+  ul.tabs li span { cursor: pointer; }
+  .flat-button { cursor: pointer; display: inline-block; padding: 6px 12px; border: 1px solid #888; }
+  .widget-container { margin: 4px 0; }
+  .widget-fieldlabel { display: inline-block; width: 120px; }
+  .pager span { cursor: pointer; padding: 0 6px; }
+</style>
+<div id="page">
+  <ul class="tabs">
+    <li id="quick"><span class="text-plain">Quick Setup</span></li>
+    <li id="basic" class="selected"><span class="text">Basic</span></li>
+    <li id="advanced"><span class="text">Advanced</span></li>
+  </ul>
+  <div class="click-container flat-button"><span class="T_clickContinue">Click here to continue</span><span class="click-icon"></span></div>
+  <span id="help">Help</span>
+  <p>Firmware Version: 0.4.0</p>
+
+  <h5>2.4GHz Wireless</h5>
+  <div class="widget-container"><label class="widget-fieldlabel">Status:</label><span class="widget-wrap"><input readonly value="Enabled"></span></div>
+  <div class="widget-container"><label class="widget-fieldlabel">SSID:</label><span class="widget-wrap"><input readonly value="Office_24"></span></div>
+  <h5>5GHz Wireless</h5>
+  <div class="widget-container"><label class="widget-fieldlabel">Status:</label><span class="widget-wrap"><input readonly value="Disabled"></span></div>
+  <div class="widget-container"><label class="widget-fieldlabel">SSID:</label><span class="widget-wrap"><input readonly value="Office_5G"></span></div>
+
+  <h5>LAN</h5>
+  <div class="widget-container"><label class="widget-fieldlabel">IP Address:</label><span class="widget-wrap">
+    <input size="3" value="172">
+    .
+    <input size="3" value="16">
+    .
+    <input size="3" value="11">
+    .
+    <input size="3" value="254">
+  </span></div>
+  <table>
+    <tr><td>Lease Time:</td><td><input id="lease" value="1440"> minutes</td></tr>
+    <tr><td>Domain:</td><td><input id="domain" value=""></td></tr>
+  </table>
+
+  <div class="pager"><span class="click-page">1</span><span>2</span><span>3</span></div>
+  <p id="out">page 1</p>
+</div>
+<script>
+  const out = document.getElementById("out");
+  const say = (t) => (out.textContent = t);
+  // Bound the way a jQuery page binds them: on the element, from script.
+  document.getElementById("advanced").addEventListener("click", () => say("advanced tab"));
+  document.getElementById("basic").addEventListener("click", () => say("basic tab"));
+  // No pointer cursor at all: only the handler says it is a button.
+  document.getElementById("quick").addEventListener("click", () => say("quick setup"));
+  document.querySelector(".click-container").addEventListener("click", () => say("continued"));
+  document.getElementById("help").onclick = () => say("help opened");
+  // One handler for the whole pager, on its container.
+  document.querySelector(".pager").addEventListener("click", (e) => {
+    if (e.target.tagName === "SPAN") say("page " + e.target.textContent);
+  });
+  // A page-wide listener (closing menus): the whole page is not a button.
+  document.getElementById("page").addEventListener("click", () => {});
+</script>

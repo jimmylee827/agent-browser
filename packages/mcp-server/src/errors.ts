@@ -18,6 +18,8 @@ export type Code =
   | "SESSION_LOCKED"
   | "BRIDGE_DOWN"
   | "NAV_TIMEOUT"
+  | "CERT_INVALID"
+  | "LOAD_FAILED"
   | "HALTED"
   | "POLICY_BLOCKED"
   | "INVALID_VALUE"
@@ -84,6 +86,25 @@ export const CATALOGUE: Record<Code, Entry> = {
     humanAction: "if Chrome is open but never connects: load the extension once via chrome://extensions → Load unpacked → packages/extension",
   },
   NAV_TIMEOUT: { agentCanFix: true, fixSteps: ["retry once", "if it repeats, check agent_browser_status"], humanAction: null },
+  // Chrome's own warning page: nothing of the agent's runs there, and getting
+  // past it is a security decision that belongs to the person.
+  CERT_INVALID: {
+    agentCanFix: false,
+    fixSteps: [
+      "stop, and tell the user the site's certificate is not trusted (see loadError and the screenshot)",
+      "after they click through, call browser_observe or agent_browser_visit again and continue",
+    ],
+    humanAction:
+      "if you trust this site (your own router, a dev server): in the agent's browser window click Advanced, then Proceed. The profile remembers the choice for that address",
+  },
+  LOAD_FAILED: {
+    agentCanFix: true,
+    fixSteps: [
+      "check the address (see loadError: the name may not resolve, the port may be closed)",
+      "a private address may only be reachable from another network or over a VPN: say so rather than retrying",
+    ],
+    humanAction: null,
+  },
   HALTED: { agentCanFix: false, fixSteps: [HALT_ADVICE], humanAction: "turn the kill switch off (npm run resume) when you want the agent to continue" },
   POLICY_BLOCKED: {
     agentCanFix: false,

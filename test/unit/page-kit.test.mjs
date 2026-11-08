@@ -21,7 +21,28 @@ class CredentialsContainer {
 }
 globalThis.CredentialsContainer = CredentialsContainer;
 const creds = new CredentialsContainer();
-const shown = { alert: nativeToString.call(alert), confirm: nativeToString.call(confirm), store: nativeToString.call(CredentialsContainer.prototype.store), fetch: nativeToString.call(fetch) };
+// Elements, enough of them to carry click handlers.
+class Element extends EventTarget {}
+class HTMLElement extends Element {
+  #onclick = null;
+  get onclick() {
+    return this.#onclick;
+  }
+  set onclick(f) {
+    this.#onclick = f;
+  }
+}
+globalThis.Element = Element;
+globalThis.HTMLElement = HTMLElement;
+const onclickSetter = () => Object.getOwnPropertyDescriptor(HTMLElement.prototype, "onclick").set;
+const shown = {
+  alert: nativeToString.call(alert),
+  confirm: nativeToString.call(confirm),
+  store: nativeToString.call(CredentialsContainer.prototype.store),
+  fetch: nativeToString.call(fetch),
+  addEventListener: nativeToString.call(EventTarget.prototype.addEventListener),
+  onclickSet: nativeToString.call(onclickSetter()),
+};
 
 const load = (file) =>
   runInThisContext(readFileSync(new URL(`../../packages/extension/src/${file}`, import.meta.url), "utf8"), {
@@ -77,6 +98,29 @@ test("every patched function reads as the original, with both scripts loaded", (
   assert.equal(String(fetch), shown.fetch);
   assert.equal(Function.prototype.toString.toString(), nativeToString.call(nativeToString));
   assert.equal(alert.name, "alert");
+  assert.equal(String(EventTarget.prototype.addEventListener), shown.addEventListener);
+  assert.equal(EventTarget.prototype.addEventListener.name, "addEventListener");
+  assert.equal(String(onclickSetter()), shown.onclickSet);
+});
+
+test("watching for click handlers changes nothing the page can see", () => {
+  const el = new HTMLElement();
+  let clicks = 0;
+  el.addEventListener("click", () => clicks++);
+  el.dispatchEvent(new Event("click"));
+  assert.equal(clicks, 1, "a listener added through the watch still runs");
+  const f = () => {};
+  el.onclick = f;
+  assert.equal(el.onclick, f, "onclick still stores the handler");
+  // A wrong call fails as before, with nothing of the extension in its stack.
+  let err;
+  try {
+    EventTarget.prototype.addEventListener.call({}, "click", () => {});
+  } catch (e) {
+    err = e;
+  }
+  assert.ok(err, "an illegal call still throws");
+  assert.ok(!String(err.stack).includes("chrome-extension://"));
 });
 
 test("nothing is left on window, and no fixed-name event is sent", () => {

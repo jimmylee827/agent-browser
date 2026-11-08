@@ -7,7 +7,10 @@
 //   - navigator.credentials.store saves nothing (this profile keeps everything);
 //   - setPointerCapture accepts a synthetic pointer, so a slider or scrubber a
 //     drag grabs follows it — and announces the capture the way the browser
-//     does, with gotpointercapture, which is how the engine learns of it.
+//     does, with gotpointercapture, which is how the engine learns of it;
+//   - which elements a script gave a click handler (addEventListener, jQuery's
+//     .on("click"), el.onclick = …) is noted, so a <div> or <span> that is a
+//     button only in script can be found as one. The engine asks per element.
 //
 // Every replaced function is a Proxy of the original and reads as native code
 // (the same disguise as net-hook.js, layered so either may load first). Nothing
@@ -70,6 +73,73 @@
     return p;
   };
 
+  // ---- click handlers added from script
+  // A router's "Advanced" tab, a pager's "2", a "Continue" box: <li>, <span>
+  // and <div> elements whose handler a script attached. The markup says
+  // nothing (no role, no href, no onclick attribute), so the engine cannot see
+  // them; the page's own calls can. Only the element is kept, in a WeakSet the
+  // page cannot reach; a handler removed later still counts — erring towards
+  // "clickable" costs one extra entry in a snapshot.
+  const clicky = new WS();
+  // Plain comparisons: an array method or a Set is something a page can replace and watch.
+  const isClickType = (t) => t === "click" || t === "mousedown" || t === "mouseup" || t === "pointerdown" || t === "pointerup";
+  const ElementC = W.Element;
+  const isEl = (t) => {
+    try {
+      return t instanceof ElementC;
+    } catch {
+      return false;
+    }
+  };
+  const note = (self) => {
+    try {
+      if (isEl(self)) apply(wsAdd, clicky, [self]);
+    } catch {}
+  };
+  const ETP = W.EventTarget?.prototype;
+  if (ETP && ETP.addEventListener) {
+    ETP.addEventListener = disguise(ETP.addEventListener, {
+      apply(target, self, args) {
+        // A string check only: converting anything else would run the page's
+        // own toString a second time, which a page could notice.
+        if (typeof args[0] === "string" && args[1] && isClickType(args[0])) note(self);
+        try {
+          return apply(target, self, args);
+        } catch (e) {
+          throw scrub(e);
+        }
+      },
+    });
+  }
+  try {
+    const HP = W.HTMLElement?.prototype;
+    const d = HP && Object.getOwnPropertyDescriptor(HP, "onclick");
+    if (d && d.set && d.configurable) {
+      Object.defineProperty(HP, "onclick", {
+        get: d.get,
+        set: disguise(d.set, {
+          apply(target, self, args) {
+            if (typeof args[0] === "function") note(self);
+            try {
+              return apply(target, self, args);
+            } catch (e) {
+              throw scrub(e);
+            }
+          },
+        }),
+        enumerable: d.enumerable,
+        configurable: true,
+      });
+    }
+  } catch {}
+  /** "self": does this element have a click handler? Say yes by cancelling the question. */
+  function answerClicky(e) {
+    e.stopImmediatePropagation();
+    try {
+      if (e.detail === "self" && apply(wsHas, clicky, [e.target])) e.preventDefault();
+    } catch {}
+  }
+
   // ---- channel (see net-hook.js for why not postMessage)
   let channel = null;
   const pending = [];
@@ -104,6 +174,12 @@
         if ("dialogText" in m) choice.dialogText = m.dialogText ?? undefined;
       } catch {}
     });
+    // The engine's question about one element, on this document's secret
+    // name. Answered at the window in the capture phase, before anything of
+    // the page's, and stopped there: the page never sees it.
+    try {
+      on(W, channel + ":ck", answerClicky, true);
+    } catch {}
     for (const r of pending.splice(0)) send(r);
   };
   on(doc, HELLO, onHello);

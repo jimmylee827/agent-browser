@@ -183,9 +183,11 @@ leave in that profile; a page's attempt to save a credential
 Every result carries `degraded: string[]` — what could not be done — so a
 caller can carry it into its report. Every failure carries a `code`
 (`NEEDS_HUMAN`, `OCCLUDED`, `NO_MATCH`, `STALE_SNAPSHOT`, `TAB_GONE`,
-`HOVER_NOT_EFFECTIVE`, …), `agentCanFix`, `fixSteps` and `humanAction`, beside
-the `error` and `recovery` prose. A captcha or a notice in the way comes back as
-`outcome: "needs_human"` with the blocking element and a screenshot.
+`HOVER_NOT_EFFECTIVE`, `CERT_INVALID`, `LOAD_FAILED`, …), `agentCanFix`,
+`fixSteps` and `humanAction`, beside the `error` and `recovery` prose. A captcha
+or a notice in the way comes back as `outcome: "needs_human"` with the blocking
+element and a screenshot; Chrome's certificate warning comes back as
+`CERT_INVALID`, also with a screenshot, since clicking through is the user's call.
 
 ## Tools
 
@@ -195,14 +197,14 @@ the `error` and `recovery` prose. A captcha or a notice in the way comes back as
 | ---- | ------------ |
 | `agent_browser_visit({url} \| {history}, text?, snapshot?, details?)` | Navigate your session's tab — or go back / forward / reload — wait for the page to settle, return an accessibility tree. `text: true` adds the visible text; `snapshot: "none"` drops the tree; `details: true` adds hrefs and srcs. Failed requests and console errors since the call began are summarised in `diagnostics`, the API calls the page made in `network`. |
 | `agent_browser_act({name, role?, action, value?, to?, snapshot?, onDialog?})` | Find an element by accessible name, act on it, wait, return the new tree. A failed action is an error; one that changed nothing says `noEffect`. `drag` takes `to` (an element or a point) and `at`/`toAt` as percentages. `waitForResponse: {urlPattern}` also returns the response the action made the page fetch. |
-| `browser_observe({mode: "read", offset?})` | The page's visible text, paged, including same-origin iframes. |
+| `browser_observe({mode: "read", offset?})` | The page's visible text, paged, including same-origin iframes, with what each form field holds in place. |
 | `browser_screenshot({fullPage? \| name? \| ref? \| clip?})` | Viewport, whole page (stitched), one element, or a region — after the page settles (`settled`, `settleReason`), with `documentGeneration` and `layoutHash` to tell two captures of a changed page apart. An element is centred and any fixed bar over it hidden; something else covering it is an `OCCLUDED` error. Saved to disk as `evidence`. |
 | `browser_inspect({name \| ref})` | One element's state: attributes (`src`, `href`, every `aria-*`), value, checked, media state, box, visibility, topmost-at-centre. |
 | `browser_eval({expression})` | A JS expression in the page, its value as JSON — app state, `video.readyState`. Refused on `eval.blockedDomains`. |
 | `browser_network({urlPattern?, status?, type?, includeBodies?, action?})` | What the page sent and received: fetch/XHR bodies (JSON parsed), WebSocket and EventSource messages, headers and timing. `action: "export"` writes a HAR or NDJSON file. See [Network capture](#network-capture). |
 | `browser_diagnostics({since?})` | Failed requests (every host); console errors, exceptions and rejections (development hosts). |
 | `browser_jobs({action})` | Background jobs: keep a page open, record it, work it with steps, heal it. See [Background jobs](#background-jobs). |
-| `browser_pointer({sequence})` | A down / move / up / wheel sequence, for gestures `drag` does not cover. |
+| `browser_pointer({sequence})` | A down / move / up / wheel sequence, for gestures `drag` does not cover. An up after a down clicks, as in a browser. |
 | `browser_tabs({action})` | List, switch, open or close tabs. |
 | `browser_scroll({to \| y})` | Scroll; reports `atBottom` and how much an infinite feed grew. |
 | `browser_wait({text? \| name? \| role?, gone?} \| {response})` | Wait for text or an element to appear or go; for a response (`{urlPattern}`, up to 5 minutes, returned parsed); with none, for the page to go quiet. |

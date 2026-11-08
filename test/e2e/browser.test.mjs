@@ -175,6 +175,83 @@ test("an <a> with a click handler and no href is found and clicked by its text",
   assert.match(text.data.text, /opened trade marks/);
 });
 
+test("buttons that exist only in script are found by their text, once each, and clicked", { skip }, async () => {
+  const R = await as("router");
+  const v = await R("agent_browser_visit", { url: h.url("router.html") });
+  const buttons = tree(v.data).filter((n) => n.role === "button").map((n) => n.name);
+  // A cursor of its own (Basic, Advanced, Continue, the pager), a handler and
+  // no cursor (Quick Setup), a handler set as el.onclick (Help).
+  for (const want of ["Quick Setup", "Basic", "Advanced", "Click here to continue", "Help", "1", "2", "3"])
+    assert.ok(buttons.includes(want), `"${want}" should be a button; got ${JSON.stringify(buttons)}`);
+  assert.equal(buttons.filter((b) => b === "Advanced").length, 1, "the <li> and the <span> inside it are one button");
+  assert.ok(!buttons.some((b) => b.length > 80), "the page-wide click listener does not make the page a button");
+  for (const [name, said] of [["Advanced", "advanced tab"], ["Quick Setup", "quick setup"], ["Click here to continue", "continued"], ["Help", "help opened"], ["2", "page 2"]]) {
+    const r = await R("agent_browser_act", { name, role: "button", snapshot: "none" });
+    assert.equal(r.isError, false, `${name}: ${JSON.stringify(r.data)}`);
+    assert.match((await R("browser_observe", { mode: "read" })).data.text, new RegExp(said));
+  }
+});
+
+test("fields are named by the text beside them; read-only boxes say so; read mode shows what they hold", { skip }, async () => {
+  const R = await as("router");
+  await R("agent_browser_visit", { url: h.url("router.html"), snapshot: "none" });
+  const boxes = tree((await R("browser_observe", {})).data).filter((n) => n.role === "textbox");
+  assert.deepEqual(
+    boxes.filter((n) => n.name === "SSID").map((n) => [n.section, n.state?.value, n.state?.readonly]),
+    [["2.4GHz Wireless", "Office_24", true], ["5GHz Wireless", "Office_5G", true]],
+  );
+  assert.equal(boxes.filter((n) => n.name === "IP Address").length, 4, "all four boxes of a split address");
+  assert.ok(boxes.some((n) => n.name === "Lease Time" && n.state?.value === "1440" && !n.state?.readonly), "a label in the cell before");
+  assert.equal((await R("browser_locate", { name: "5GHz Wireless SSID" })).data.matches[0]?.section, "5GHz Wireless");
+  const fill = await R("agent_browser_act", { name: "5GHz Wireless SSID", action: "fill", value: "x", snapshot: "none" });
+  assert.equal(fill.data.code, "NOT_ACTIONABLE", "a read-only box is not typed into");
+  const text = (await R("browser_observe", { mode: "read" })).data.text;
+  assert.match(text, /SSID: Office_24/);
+  assert.match(text, /Status: Disabled/);
+  assert.match(text, /IP Address: 172\.16\.11\.254/);
+  assert.match(text, /Lease Time:\s+1440 minutes/);
+});
+
+test("text that is no control is pointed at, not met with \"widen the name\"", { skip }, async () => {
+  const R = await as("router");
+  await R("agent_browser_visit", { url: h.url("router.html"), snapshot: "none" });
+  const r = await R("agent_browser_act", { name: "Firmware Version", snapshot: "none" });
+  assert.equal(r.data.code, "NO_MATCH");
+  assert.equal(r.data.textOnPage?.[0]?.tag, "p");
+  assert.match(r.data.recovery, /on the page as text/);
+});
+
+test("a pointer press and release clicks, and a gesture that does nothing says so", { skip }, async () => {
+  const P = await as("pointer");
+  await P("agent_browser_visit", { url: h.url("router.html"), snapshot: "none" });
+  const at = (await P("browser_eval", { expression: "(()=>{const r=document.querySelector('.click-container').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()" })).data.value;
+  const r = await P("browser_pointer", { sequence: [{ type: "down", ...at }, { type: "up", ...at }] });
+  assert.equal(r.data.changed, true);
+  assert.ok(r.data.pointer.some((s) => s.type === "click"), "the click is in the record");
+  assert.match((await P("browser_observe", { mode: "read" })).data.text, /continued/);
+  const idle = await P("browser_pointer", { sequence: [{ type: "move", x: 1100, y: 850 }] });
+  assert.equal(idle.data.changed, false);
+  assert.match(idle.data.warning ?? "", /nothing on the page changed/);
+});
+
+test("a certificate Chrome does not trust is the person's call, with a picture; a dead address is said plainly", { skip }, async (t) => {
+  if (!h.untrustedUrl) return t.skip("openssl is not installed, so there is no untrusted origin to visit");
+  const C = await as("cert");
+  const v = await C("agent_browser_visit", { url: h.untrustedUrl });
+  assert.equal(v.data.code, "CERT_INVALID", JSON.stringify(v.data));
+  assert.match(v.data.loadError?.error ?? "", /ERR_CERT/);
+  assert.equal(v.data.agentCanFix, false);
+  assert.ok(v.images.length, "a picture of the warning comes with it");
+  assert.equal((await C("browser_observe", { mode: "read" })).data.code, "CERT_INVALID", "later calls say the same");
+  assert.equal((await C("agent_browser_act", { name: "Advanced", snapshot: "none" })).data.code, "CERT_INVALID", "never a click reported as done");
+  const shot = await C("browser_screenshot", {});
+  assert.equal(shot.isError, false);
+  assert.ok(shot.images.length);
+  const d = await C("agent_browser_visit", { url: h.deadUrl });
+  assert.equal(d.data.code, "LOAD_FAILED", JSON.stringify(d.data));
+  assert.match(d.data.loadError?.error ?? "", /ERR_CONNECTION_REFUSED/);
+});
+
 test("pressed state, image src and attributes can be read", { skip }, async () => {
   const A = await as("toggles");
   await A("agent_browser_visit", { url: h.url("toggles.html"), snapshot: "none" });

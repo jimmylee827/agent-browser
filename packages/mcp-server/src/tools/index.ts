@@ -39,6 +39,9 @@ const DRY_RUN = process.env.AB_DRY_RUN === "1";
  */
 const PORT_DIED = /PORT_CLOSED_AFTER_ACTION|back\/forward cache|message channel (is )?closed|Receiving end does not exist/i;
 
+/** No content script in the tab: Chrome's own pages (and chrome://) have none. */
+const ENGINE_ABSENT = /Receiving end does not exist|Could not establish connection|Cannot access contents|NAV_TIMEOUT|did not commit/i;
+
 interface Ctx {
   bridge: Bridge;
   policy: Policy;
@@ -158,7 +161,15 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
   };
 
   /** Every failure: a code to branch on, steps, and who has to act. */
-  const failure = async (call: Call, e: unknown): Promise<ToolResult> => {
+  const failure = async (call: Call, e0: unknown): Promise<ToolResult> => {
+    let e = e0;
+    // The engine did not answer because the tab shows one of Chrome's own
+    // pages (a certificate warning, "can't be reached"): say that, whichever
+    // tool ran into it, instead of "Receiving end does not exist".
+    if (call.tabId !== undefined && ENGINE_ABSENT.test(String((e as Error)?.message ?? e))) {
+      const p = (await ctx.bridge.request("engine.ping", { tabId: call.tabId }).catch(() => null)) as Ping | null;
+      if (p?.tab?.loadError) e = loadFailure(p.tab.loadError);
+    }
     const code = codeOf(e);
     const entry = CATALOGUE[code];
     const message = String((e as Error)?.message ?? e);
@@ -166,7 +177,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
     // The session's tab is gone for good; forget it, so the next visit opens a new one.
     if (code === "TAB_GONE" && call.session && !call.session.legacy) ctx.sessions.unbind(call.session);
     // A human has to see what blocks the page: show them, and the agent.
-    if (code === "NEEDS_HUMAN" && !call.images.length) {
+    if ((code === "NEEDS_HUMAN" || code === "CERT_INVALID") && !call.images.length) {
       const shot = (await ctx.bridge.request("engine.captureViewport", call.tabId !== undefined ? { tabId: call.tabId } : {}).catch(() => null)) as { screenshot?: string } | null;
       const img = imageContent(shot?.screenshot);
       if (img) call.images.push(img);
@@ -257,8 +268,9 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
     return { s, req };
   }
 
+  type LoadError = { error: string; url: string; ts: number };
   type Ping = {
-    tab?: { id?: number; url?: string; title?: string; status?: string; windowId?: number; navCount?: number };
+    tab?: { id?: number; url?: string; title?: string; status?: string; windowId?: number; navCount?: number; loadError?: LoadError };
     engine?: { error?: string; title?: string; documentGeneration?: string };
   };
 
@@ -391,7 +403,21 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
   };
 
   type Match = { ref: number; role: string; name: string };
-  type Located = { snapshotGeneration?: number; matches?: Match[] };
+  type TextHit = { tag: string; class?: string; text: string; cursor: string; at: { x: number; y: number }; offscreen?: boolean };
+  type Located = { snapshotGeneration?: number; matches?: Match[]; textOnPage?: TextHit[] };
+
+  /** The name is on the page, but as text nothing marks as a control: say where, and how to click it anyway. */
+  const textAdvice = (name: string, hits: TextHit[]): string => {
+    const h = hits[0];
+    const where = `<${h.tag}${h.class ? ` class="${h.class}"` : ""}>`;
+    const click = `browser_pointer({sequence:[{type:"down",x:${h.at.x},y:${h.at.y}},{type:"up",x:${h.at.x},y:${h.at.y}}]})`;
+    return (
+      `"${name}" is on the page as text (${where}, cursor ${h.cursor}) but nothing there is marked as a control. ` +
+      (h.offscreen
+        ? "It is off screen: scroll it into view (browser_scroll), then call browser_locate again for its position"
+        : `If it is meant to be clicked, click the point: ${click}`)
+    );
+  };
 
   /** Find one element by role/name, or fail with what is there instead. */
   async function locateOne(sc: Scope, name: string | undefined, role: string | undefined): Promise<Match & { gen?: number }> {
@@ -399,8 +425,10 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
     const m = loc.matches?.[0];
     if (!m) {
       const url = ((await sc.req<Ping>("engine.ping").catch(() => ({}) as Ping)).tab?.url) ?? "";
+      const hits = loc.textOnPage ?? [];
       throw new AbError("NO_MATCH", `no element matching role=${role ?? "any"} name="${name ?? ""}"${url ? ` on ${url}` : ""}`, {
-        recovery: await suggest(sc, name ?? "", role),
+        recovery: hits.length ? textAdvice(name ?? "", hits) : await suggest(sc, name ?? "", role),
+        ...(hits.length ? { textOnPage: hits } : {}),
       });
     }
     return { ...m, gen: loc.snapshotGeneration };
@@ -658,10 +686,29 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
     while (Date.now() - t0 < timeoutMs) {
       await sleep(300);
       last = await ping(sc).catch(() => ({}) as Ping);
+      // Chrome's own error or warning page: nothing more will load, and no
+      // content script will ever answer there. Say so now, not at the timeout.
+      const le = last.tab?.loadError;
+      if (le && le.ts >= t0 - 1000) return { landed: false, from: beforeUrl, to: le.url, loadError: le };
       if (last.engine?.error || !last.tab) continue;
       if ((last.tab.navCount ?? 0) > before) return { landed: true, from: beforeUrl, to: last.tab.url };
     }
     return { landed: false, from: beforeUrl, to: last.tab?.url, error: last.engine?.error };
+  }
+
+  /**
+   * The failure a navigation that ended on one of Chrome's own pages deserves:
+   * a certificate the browser does not trust is the person's call; anything
+   * else (no such host, nothing listening) is the address or the network.
+   */
+  function loadFailure(le: LoadError): AbError {
+    let host = le.url;
+    try {
+      host = new URL(le.url).host;
+    } catch {}
+    if (/ERR_CERT_|ERR_SSL_/.test(le.error))
+      return new AbError("CERT_INVALID", `${host} has a certificate Chrome does not trust (${le.error}): Chrome is showing its warning page`, { loadError: le });
+    return new AbError("LOAD_FAILED", `${le.url} did not load: ${le.error}`, { loadError: le });
   }
 
   // ============================================================
@@ -815,6 +862,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         const t0 = Date.now();
         const nav = await navigateAndWait(call, sc, url ? { url } : { history }, url ? 15_000 : 10_000, mobileChanged);
         if (!nav.landed) {
+          if (nav.loadError) throw loadFailure(nav.loadError);
           if (history)
             throw new AbError("NAV_TIMEOUT", `${history} did not change the page (still on ${nav.from})`, {
               recovery: `there may be no ${history === "back" ? "earlier" : "later"} page in this tab's history; open the page with agent_browser_visit({url}) instead`,
@@ -931,6 +979,9 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         // Policy gate: only fires for an explicitly labelled sensitive class.
         // A plain click/type/submit is an ordinary action anywhere on the web.
         const tabBefore = (await ping(sc)).tab;
+        // On Chrome's own error page nothing can be clicked; and the "no
+        // receiver" error there would read as a click that navigated away.
+        if (tabBefore?.loadError) throw loadFailure(tabBefore.loadError);
         const tabUrl = tabBefore?.url ?? "";
         const d = ctx.policy.evaluate({ url: tabUrl, actionClass });
         if (!d.allow) {
@@ -1308,7 +1359,9 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
     async (args, call) => {
       const sc = scope(call, args, "tab");
       return inSession(call, sc, async () => {
-        const url = (await ping(sc)).tab?.url ?? "";
+        const before = (await ping(sc)).tab;
+        if (before?.loadError) throw loadFailure(before.loadError);
+        const url = before?.url ?? "";
         const d = ctx.policy.evaluate({ url, actionClass: args.actionClass });
         if (!d.allow) {
           ctx.audit.log("policy.block", { tool: "browser_act", url, action: args.action, reason: d.reason });
@@ -1590,11 +1643,18 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         }
         let target = ref;
         if (name !== undefined || role !== undefined) target = (await locateOne(sc, name, role)).ref;
-        const r = await sc.req<Record<string, unknown> & { screenshot?: string; images?: string[]; hidOverlays?: string[] }>(
-          "engine.screenshot",
-          { fullPage, ref: target, clip, scale, format },
-          90_000,
-        );
+        type Shot = Record<string, unknown> & { screenshot?: string; images?: string[]; hidOverlays?: string[] };
+        let r: Shot;
+        try {
+          r = await sc.req<Shot>("engine.screenshot", { fullPage, ref: target, clip, scale, format }, 90_000);
+        } catch (e) {
+          // Chrome's own page (a certificate warning, an error page) has no
+          // content script to measure it, but the browser can still show what
+          // is on screen — which is exactly what a person needs to see there.
+          if (target !== undefined || !ENGINE_ABSENT.test((e as Error).message)) throw e;
+          r = await sc.req<Shot>("engine.captureViewport");
+          call.degraded.push("a plain viewport capture: this page has no content script (one of Chrome's own pages), so fullPage, clip, scale and format do not apply");
+        }
         const images = (r.images ?? [r.screenshot]).map(imageContent).filter((i): i is Image => i !== null);
         if (!images.length) throw new AbError("CAPTURE_FAILED", "no screenshot came back");
         const state = await sc.req<{ documentGeneration?: string; layoutHash?: string }>("engine.pageState").catch(() => ({}) as { documentGeneration?: string; layoutHash?: string });
@@ -1904,7 +1964,9 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
     [
       "Send an explicit pointer sequence — down / move / up / wheel — for gestures agent_browser_act's drag does not cover ",
       "(a press-and-hold, a multi-point path, a wheel over a canvas, modifier keys). Each step gives x,y in viewport CSS ",
-      "pixels, or `at` (px or % inside the target element). Synthetic events (isTrusted:false; no CDP); pointer capture works.",
+      "pixels, or `at` (px or % inside the target element). An up after a down is followed by a click on the nearest element ",
+      "both landed in, as in a browser — so down+up at a point clicks whatever is there. Synthetic events (isTrusted:false; ",
+      "no CDP); pointer capture works.",
       ADV_RULES,
     ].join(""),
     {
@@ -1935,8 +1997,17 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
       if (existsSync(resolve(ctx.cfg.stateDir, "HALT"))) throw new AbError("HALTED", "HALTED: kill switch active");
       const sc = scope(call, args, "tab");
       return inSession(call, sc, async () => {
+        const le = (await ping(sc).catch(() => ({}) as Ping)).tab?.loadError;
+        if (le) throw loadFailure(le);
         const ref = args.ref ?? (args.name !== undefined || args.role !== undefined ? (await locateOne(sc, args.name, args.role)).ref : undefined);
-        const r = await sc.req<Record<string, unknown>>("engine.act", { action: "pointer", ref, sequence: args.sequence, pointerType: args.pointerType });
+        let r: Record<string, unknown>;
+        try {
+          r = await sc.req<Record<string, unknown>>("engine.act", { action: "pointer", ref, sequence: args.sequence, pointerType: args.pointerType });
+        } catch (e) {
+          // The click it ended with navigated, taking the reply with the page: it ran.
+          if (!PORT_DIED.test((e as Error).message)) throw e;
+          r = { acted: true, action: "pointer", changed: true, signals: { navigated: true, portClosed: true }, snapshotStale: true };
+        }
         await sc.req("engine.waitForStable", { timeout: 4000, quietMs: 300 }).catch(() => {});
         ctx.audit.log("tool.browser_pointer", { ref, steps: args.sequence.length });
         if (r.changed === false) call.warnings.push("nothing on the page changed: the gesture probably did not do what you intended");
