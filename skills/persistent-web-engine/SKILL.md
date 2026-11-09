@@ -10,7 +10,7 @@ description: |
   - Any multi-step web flow: search-then-click, form-fill-then-submit, navigate-and-extract
   - "Find the link / button / field that says X and ..."
 
-  Sessions: without `session`, every call acts in this agent's OWN background window, never a tab a person or another agent is using. A subagent sharing the connection passes its own `session` name; agents that must share one tab both pass `session: "shared:<name>"` (reload/visit then affect both). Cookies and logins are shared by all sessions (one profile).
+  Sessions: without `session`, every call acts in this agent's OWN tab (all agents' tabs share one background window), never a tab a person or another agent is using. A subagent sharing the connection passes its own `session` name; agents that must share one tab both pass `session: "shared:<name>"` (reload/visit then affect both). Cookies and logins are shared by all sessions (one profile).
 
   Primary tools (use these — no `ref` / `snapshotGeneration` to track):
   - `agent_browser_visit({ url } | { history: "back" }, text?, snapshot?)` — navigate (or go back/forward/reload) + wait + return accessibility tree; `text: true` adds the page's visible text, `snapshot: "none"` drops the tree
@@ -45,8 +45,9 @@ That's the whole pattern. No refs, no generations, no manual re-observation. Eac
 
 ## Rules that prevent damage
 
-- **Your window is yours.** Without `session`, the first visit opens your own
-  window in the background and every later call acts there. Before that first
+- **Your tab is yours.** Without `session`, the first visit opens your own tab
+  in the shared agent window (in the background) and every later call acts
+  there; while your call runs, your tab is the one in front. Before that first
   visit there is nothing to act on (`NO_SESSION_TAB`) — call
   `agent_browser_visit` first. Never pass `session: "default"` unless you mean
   "whatever tab is focused", which a person may be using.

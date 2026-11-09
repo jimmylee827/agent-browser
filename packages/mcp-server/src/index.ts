@@ -14,6 +14,8 @@ import { buildId, RUNNING } from "./build.js";
 import { pruneEvidence } from "./evidence.js";
 import { InputHelper } from "./input.js";
 import { JobRunner, pruneJobs } from "./jobs.js";
+import { WindowPool } from "./windows.js";
+import { resolve } from "node:path";
 
 async function main() {
   const cfg = loadConfig();
@@ -32,18 +34,27 @@ async function main() {
   const input = new InputHelper(cfg.input);
   // Daemon-level, like the sessions: the HTTP transport builds a server per request.
   const jobs = new JobRunner({ cfg, bridge, sessions, audit });
+  // Daemon-level too: which window every session's tab shares, and who is acting in it.
+  const windows = new WindowPool(
+    (method, params) => bridge.request(method, params),
+    resolve(cfg.stateDir, "agent-window.json"),
+    (tabId) => sessions.all().some((s) => s.tabId === tabId || !!s.opened?.has(tabId)),
+  );
   const makeServer = (client: ClientInfo): McpServer => {
     const s = new McpServer({ name: "agent-browser", version: "0.0.1" });
-    registerTools(s, { bridge, policy, sessions, audit, cfg, client, warnedStale, input, jobs });
+    registerTools(s, { bridge, policy, sessions, audit, cfg, client, warnedStale, input, jobs, windows });
     return s;
   };
 
-  // A client that went away leaves its windows behind; close them.
+  // A client that went away leaves its pages behind; close them — its tabs in
+  // the shared window, or the window of its own a viewport gave it.
   const releaseClient = async (id: string) => {
     let closed = 0;
     for (const s of sessions.release(id)) {
-      if (s.windowId === undefined) continue;
-      await bridge.request("engine.closeWindow", { windowId: s.windowId }).then(() => closed++, () => {});
+      if (s.ownWindow && s.windowId !== undefined)
+        await bridge.request("engine.closeWindow", { windowId: s.windowId }).then(() => closed++, () => {});
+      else if (s.opened?.size)
+        await bridge.request<{ closed: number }>("engine.closeTabs", { tabIds: [...s.opened] }).then((r) => (closed += r.closed), () => {});
     }
     audit.log("session.release", { client: id.slice(0, 8), closed });
     return closed;

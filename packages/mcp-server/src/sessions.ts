@@ -26,7 +26,12 @@ export interface Session {
   legacy: boolean;
   ownerClient: string;
   tabId?: number;
+  /** The window the tab is in now: the shared agent window, unless ownWindow. */
   windowId?: number;
+  /** The session has a window to itself (it has a viewport): closing the session closes it. */
+  ownWindow?: boolean;
+  /** Tabs this session opened. In the shared window, these are what closes with the session. */
+  opened?: Set<number>;
   /** "popup" once the session has a viewport: only popup windows go below 500px wide. */
   windowType?: string;
   /** What the session asked its pages to be: a viewport, a phone, with sound. */

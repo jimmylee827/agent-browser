@@ -71,7 +71,7 @@ export const CATALOGUE: Record<Code, Entry> = {
   TAB_GONE: { agentCanFix: true, fixSteps: ["the session's tab was closed: open the page again with agent_browser_visit({url})"], humanAction: null },
   NO_SESSION_TAB: {
     agentCanFix: true,
-    fixSteps: ["call agent_browser_visit({url}) first — it opens this session's own window", "or pass tabId (from browser_tabs) to adopt an existing tab on purpose"],
+    fixSteps: ["call agent_browser_visit({url}) first — it opens this session's tab", "or pass tabId (from browser_tabs) to adopt an existing tab on purpose"],
     humanAction: null,
   },
   TAB_OWNED_BY_OTHER: {

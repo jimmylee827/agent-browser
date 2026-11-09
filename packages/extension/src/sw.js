@@ -985,14 +985,105 @@ async function dispatch(method, params) {
       const win = await chrome.windows.get(spare.windowId).catch(() => null);
       return { tabId: spare.id, windowId: spare.windowId, type: win?.type, adopted: true };
     }
+    // The shared agent window: a tab there instead of a window of its own.
+    // A blank tab nobody holds (kept so Chrome never runs windowless) is reused.
+    const home = params.windowId != null ? await chrome.windows.get(params.windowId).catch(() => null) : null;
+    if (home && !params.viewport) {
+      const reuse = params.reuseTabId != null ? await chrome.tabs.get(params.reuseTabId).catch(() => null) : null;
+      const tab =
+        reuse && reuse.windowId === home.id
+          ? await chrome.tabs.update(reuse.id, { url: params.url || "about:blank", active: true })
+          : await chrome.tabs.create({ windowId: home.id, url: params.url || "about:blank", active: true });
+      if (!params.sound) await chrome.tabs.update(tab.id, { muted: true }).catch(() => {});
+      return { tabId: tab.id, windowId: home.id, type: home.type, ...(reuse ? { reused: true } : {}) };
+    }
+    const like2 = params.likeWindowId != null ? await chrome.windows.get(params.likeWindowId).catch(() => null) : null;
     const win = await chrome.windows.create({
       url: params.url || "about:blank",
       focused: false,
       ...shape,
+      ...(!params.viewport && like2?.width ? { width: like2.width, height: like2.height } : {}),
     });
     const tab = win.tabs?.[0];
     if (tab && !params.sound) await chrome.tabs.update(tab.id, { muted: true }).catch(() => {});
     return { tabId: tab?.id, windowId: win.id, type: win.type };
+  }
+  // Where a tab is, optionally bringing it to the front of its window (never
+  // raising the window): only the front tab of a window renders, runs its
+  // animation frames and timers at speed, and fires IntersectionObserver.
+  if (method === "engine.tabPlace") {
+    const t = await chrome.tabs.get(params.tabId).catch(() => null);
+    if (!t) throw tagged("TAB_GONE", `NO_SUCH_TAB: no tab ${params.tabId}`, { tabId: params.tabId });
+    const win = await chrome.windows.get(t.windowId).catch(() => null);
+    const visibility = async (id) =>
+      (await chrome.scripting.executeScript({ target: { tabId: id }, func: () => document.visibilityState }).catch(() => null))?.[0]?.result;
+    let waitedMs;
+    let windowHidden;
+    if (params.activate) {
+      // A window that is minimised, or on another Space, hides even its front
+      // tab: then waiting for "visible" below would only cost time.
+      const front = t.active ? t : (await chrome.tabs.query({ windowId: t.windowId, active: true }).catch(() => []))[0];
+      windowHidden = win?.state === "minimized" || (front ? (await visibility(front.id)) === "hidden" : false);
+      if (!t.active) await chrome.tabs.update(t.id, { active: true });
+      // tabs.update resolves before the page learns it is in front: a call
+      // that went straight on found document.visibilityState still "hidden"
+      // and its timers throttled. Wait for the page to say visible.
+      if (!windowHidden) {
+        const t0 = Date.now();
+        while (Date.now() - t0 < 1500) {
+          const v = await visibility(t.id);
+          if (v === undefined || v === "visible") break;
+          await sleep(25);
+        }
+        waitedMs = Date.now() - t0;
+      }
+    }
+    return {
+      windowId: t.windowId,
+      active: t.active || !!params.activate,
+      windowType: win?.type,
+      ...(waitedMs != null ? { waitedMs } : {}),
+      ...(windowHidden ? { windowHidden: true } : {}),
+    };
+  }
+  // Move a tab into another window, or into a new one of its own (unfocused,
+  // the size of `likeWindowId`). The page is not reloaded.
+  if (method === "engine.moveTab") {
+    const t = await chrome.tabs.get(params.tabId).catch(() => null);
+    if (!t) throw tagged("TAB_GONE", `NO_SUCH_TAB: no tab ${params.tabId}`, { tabId: params.tabId });
+    if (params.toWindowId != null) {
+      if (t.windowId !== params.toWindowId) await chrome.tabs.move(t.id, { windowId: params.toWindowId, index: -1 });
+      if (params.activate) await chrome.tabs.update(t.id, { active: true });
+      return { windowId: params.toWindowId };
+    }
+    const like = await chrome.windows.get(params.likeWindowId ?? t.windowId).catch(() => null);
+    const win = await chrome.windows.create({ tabId: t.id, focused: false, ...(like?.width ? { width: like.width, height: like.height } : {}) });
+    return { windowId: win.id };
+  }
+  // Every tab of one window into another; the emptied window closes itself.
+  if (method === "engine.mergeWindow") {
+    const from = await chrome.tabs.query({ windowId: params.from }).catch(() => []);
+    const to = await chrome.windows.get(params.to).catch(() => null);
+    if (!to) return { moved: 0, gone: "to" };
+    if (!from.length) return { moved: 0, gone: "from" };
+    await chrome.tabs.move(from.map((t) => t.id), { windowId: params.to, index: -1 });
+    return { moved: from.length };
+  }
+  // Close tabs — but never Chrome's last window: on macOS a Chrome with no
+  // window unloads this extension, and the next call has to wake it. The last
+  // tab is blanked instead, ready for the next session.
+  if (method === "engine.closeTabs") {
+    const ids = [];
+    for (const id of params.tabIds ?? []) if (await chrome.tabs.get(id).catch(() => null)) ids.push(id);
+    if (!ids.length) return { closed: 0 };
+    const all = await chrome.tabs.query({});
+    let kept;
+    if (all.every((t) => ids.includes(t.id))) {
+      kept = ids.pop();
+      await chrome.tabs.update(kept, { url: "about:blank" }).catch(() => {});
+    }
+    if (ids.length) await chrome.tabs.remove(ids).catch(() => {});
+    return { closed: ids.length, ...(kept != null ? { keptBlank: kept } : {}) };
   }
   // Bring a session's window to the front. The browser's own API, no OS
   // permission: needed before input posted by the operating system, which

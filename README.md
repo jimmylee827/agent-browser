@@ -158,18 +158,32 @@ the daemon.)
 | `Could not find service "com.agent-browser.mcp-server"` | Old `mcp:restart`; update, or run `npm run mcp:install`. |
 | Tools answer `HALTED` | The kill switch is on (`~/.agent-chrome/HALT`). That is the user's call: `npm run resume`. |
 
-## Sessions: one agent, one window
+## Sessions: one tab each, one window for all
 
 Each MCP connection (one launcher — one agent conversation) gets its **own
-browser window**, opened in the background on its first visit. Its calls act on
-its own tab and nothing else: two agents testing the same page never see each
-other's typing or navigation, and an agent never lands in a tab the user has
-open. Every tool takes an optional `session`:
+tab**, opened in the background on its first visit. Its calls act on that tab
+and nothing else: two agents testing the same page never see each other's
+typing or navigation, and an agent never lands in a tab the user has open.
+
+Every session's tab lives in **one shared agent window**. Chrome runs only a
+window's front tab at full speed (a tab behind it is hidden: no animation
+frames, no IntersectionObserver, timers about once a second), so while a call
+runs, its session's tab is brought to the front of the window — without raising
+the window. When two agents act at the same instant, the second one's tab steps
+out to a window of its own for that call and is folded back in as soon as
+nobody is acting in the shared window. The window count is the number of agents
+acting at once, usually one. Exceptions keep a window of their own: a session
+with a `viewport` (Chrome sizes whole windows) and background jobs (hours as a
+hidden tab would throttle them). When the last session goes, its tab is blanked
+rather than closed, so Chrome keeps a window and the extension stays loaded.
+`agent_browser_status` shows the shared window in `agentWindow`.
+
+Every tool takes an optional `session`:
 
 | `session` | Meaning |
 | --- | --- |
-| omitted | your private window |
-| `"name"` | another private window of yours (for a subagent sharing your connection) |
+| omitted | your private tab |
+| `"name"` | another private tab of yours (for a subagent sharing your connection) |
 | `"shared:<name>"` | one tab shared by every caller passing the same name; each result says who else acted since your last call (`lastActor`, `changedSinceYourLastCall`), and `lock: true` leases it |
 | `"default"` | the old behaviour — whatever tab is focused — with a warning |
 

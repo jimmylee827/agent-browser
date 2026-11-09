@@ -7,6 +7,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **One window for every agent.** Sessions used to get a window each, and a
+  day's work left a stack of them. Every session's tab now shares one agent
+  window; the acting session's tab is brought to the front of it for the length
+  of its call (a background tab was measured at five 50 ms timers in 4.6 s, no
+  animation frames, no IntersectionObserver). Two agents acting at the same
+  instant take two windows for that moment, then fold back into one. A session
+  with a viewport and a background job keep their own windows. Closing the last
+  session blanks its tab instead of leaving Chrome windowless. The shared window
+  survives a server restart (`agent-window.json`); `agent_browser_status` shows
+  it as `agentWindow`. Extension 0.0.11 (`engine.tabPlace`, `moveTab`,
+  `mergeWindow`, `closeTabs`).
 - Job steps (`browser_jobs` steps, `npm run ab -- jobs start --step …`): a job
   can dismiss a consent banner, click a tab or button, fill a field, press a
   key, wait for text — once per page load, checked at start, and a missing

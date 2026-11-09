@@ -19,6 +19,7 @@ import { recordEvidence, writeEvidenceFile } from "../evidence.js";
 import { bodyView, secondPassRedact, summarize, toHar, toNdjson, type NetEntry } from "../network.js";
 import { InputHelper, type InputConfig } from "../input.js";
 import type { JobRunner } from "../jobs.js";
+import { pooled, type Front, type WindowPool } from "../windows.js";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
@@ -55,6 +56,8 @@ interface Ctx {
   input: InputHelper;
   /** Background jobs (absent in the launcher's stub). */
   jobs?: JobRunner;
+  /** The one shared agent window (absent in the launcher's stub). */
+  windows?: WindowPool;
 }
 
 type Text = { type: "text"; text: string };
@@ -81,20 +84,22 @@ class Call {
   extra: Record<string, unknown> = {};
   session?: Session;
   tabId?: number;
+  /** The window this call stands in front of in the shared window pool. */
+  front?: Front;
   constructor(public tool: string) {}
 }
 
 // The rules an agent must know to not damage anything. They go in each tool's
 // own description: agents often load tools by name and never read the skill.
 const SESSION_RULES =
-  " Sessions: without `session`, your calls use your own browser window, private to this connection; " +
+  " Sessions: without `session`, your calls use your own tab, private to this connection (every session's tab sits in one shared agent window; yours is brought to the front while your call runs); " +
   "a subagent sharing your connection should pass its own `session` name. To work on one tab with another agent, " +
   "both pass session \"shared:<name>\" — then a reload or visit affects the other agent too. " +
   "Cookies and logins are shared by every session (one browser profile): a login in one is a login in all.";
 const SESSION_ARG = z
   .string()
   .optional()
-  .describe("Omit for your own private window. A name for a separate private one; \"shared:<name>\" to share a tab with other agents; \"default\" = old behaviour (whatever tab is focused).");
+  .describe("Omit for your own private tab. A name for a separate private one; \"shared:<name>\" to share a tab with other agents; \"default\" = old behaviour (whatever tab is focused).");
 const TAB_ARG = z
   .number()
   .int()
@@ -242,7 +247,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
     else ctx.sessions.checkLease(s, ctx.client.id);
     if (s.legacy)
       call.warnings.push(
-        "session \"default\" acts on whichever tab is focused — which other agents and the user also use. Omit `session` to get a window of your own",
+        "session \"default\" acts on whichever tab is focused — which other agents and the user also use. Omit `session` to get a tab of your own",
       );
     // A client that does not name itself (a launcher from before sessions,
     // or a bare HTTP client) cannot be told apart from any other such one:
@@ -261,7 +266,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
     if (!s.legacy) call.tabId = s.tabId;
     if (need === "tab" && !s.legacy && s.tabId === undefined)
       throw new AbError("NO_SESSION_TAB", "this session has no page yet — nothing to act on", {
-        recovery: "call agent_browser_visit({url}) first (it opens this session's own window), or pass tabId to adopt an existing tab",
+        recovery: "call agent_browser_visit({url}) first (it opens this session's tab), or pass tabId to adopt an existing tab",
       });
     const req = <T,>(method: string, params: Record<string, unknown> = {}, timeoutMs?: number) =>
       ctx.bridge.request<T>(method, call.tabId !== undefined ? { ...params, tabId: call.tabId } : params, timeoutMs);
@@ -307,13 +312,27 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
   /** Run fn under the session's lock, with the shared-tab check before and the record after. */
   async function inSession<T>(call: Call, sc: Scope, fn: () => Promise<T>): Promise<T> {
     return ctx.sessions.withLock(sc.s.key, async () => {
-      await shareCheck(call, sc);
+      // Every session shares one window; for this call, its tab is the one in front.
+      call.front = { key: sc.s.key };
+      const placed = await ctx.windows?.enter(call.front, sc.s).catch(() => undefined);
+      if (placed?.windowHidden)
+        call.warnings.push(
+          "the agent window is off screen (minimised, or on another Space), so Chrome runs this page hidden: timers about once a second, no animation frames, lazy content not loading. Bring the agent Chrome window back on screen if pages seem stuck",
+        );
       try {
+        await shareCheck(call, sc);
         return await fn();
       } finally {
         await seen(sc);
+        await ctx.windows?.leave(call.front).catch(() => {});
       }
     });
+  }
+
+  /** A tab this session opened: closed with the session, and counted as its own. */
+  function bindOpened(s: Session, tabId: number, windowId?: number) {
+    ctx.sessions.bind(s, tabId, windowId);
+    (s.opened ??= new Set()).add(tabId);
   }
 
   const evidenceDir = (s: Session) => (s.shared ? s.key : `${short(ctx.client.id)}${s.label === "(private)" ? "" : `-${s.label}`}`);
@@ -332,14 +351,34 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
    */
   let myWakeId: number | undefined;
 
-  /** Open the session's own window, moving into the wake's blank one when there is one. */
-  async function openSessionWindow(s: { mobile?: boolean; viewport?: unknown; sound?: boolean }, url?: string) {
-    return ctx.bridge.request<{ tabId: number; windowId: number; type: string }>("engine.openSessionWindow", {
-      url: s.mobile ? "about:blank" : url,
+  /**
+   * Open the session's first page: a tab in the shared agent window, or —
+   * for a session with a viewport — a window of its own. Either way it moves
+   * into the wake's blank window when this call woke the browser.
+   */
+  async function openSessionWindow(call: Call, s: Session, url?: string) {
+    const first = s.mobile ? "about:blank" : url;
+    const spare = myWakeId === undefined ? undefined : takeSpareWindow(myWakeId);
+    if (ctx.windows && pooled(s)) {
+      call.front ??= { key: s.key };
+      const w = await ctx.windows.open(call.front, first, s.sound, spare);
+      s.ownWindow = false;
+      return w;
+    }
+    const w = await ctx.bridge.request<{ tabId: number; windowId: number; type: string }>("engine.openSessionWindow", {
+      url: first,
       viewport: s.viewport,
       sound: s.sound,
-      adoptTabId: myWakeId === undefined ? undefined : takeSpareWindow(myWakeId),
+      adoptTabId: spare,
     });
+    s.ownWindow = true;
+    return w;
+  }
+
+  /** Let go of a session's page: its own window, or just its tabs in the shared one. */
+  async function closeSessionPage(s: { ownWindow?: boolean; windowId?: number; tabId?: number; opened?: Set<number> }) {
+    if (s.ownWindow && s.windowId !== undefined) await ctx.bridge.request("engine.closeWindow", { windowId: s.windowId }).catch(() => {});
+    else if (s.opened?.size) await ctx.bridge.request("engine.closeTabs", { tabIds: [...s.opened] }).catch(() => {});
   }
 
   /**
@@ -657,16 +696,20 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
     const needsPopup = !!s.viewport && s.windowType !== "popup";
     if (!s.legacy && (s.tabId === undefined || (needsPopup && nav.url))) {
       if (!nav.url) throw new AbError("NO_SESSION_TAB", "this session has no page yet — there is no history to move through");
-      const old = s.tabId !== undefined ? s.windowId : undefined;
+      // What the session leaves behind when a viewport moves it to a window of its own.
+      const old = s.tabId !== undefined ? { ownWindow: s.ownWindow, windowId: s.windowId, opened: s.opened } : undefined;
+      if (old) s.opened = undefined;
       // A phone's headers must be on the very first request: open blank, set
       // them, then load.
-      const w = await openSessionWindow(s, nav.url);
-      ctx.sessions.bind(s, w.tabId, w.windowId);
+      const w = await openSessionWindow(call, s, nav.url);
+      bindOpened(s, w.tabId, w.windowId);
       s.windowType = w.type;
       call.tabId = w.tabId;
-      if (old !== undefined) await ctx.bridge.request("engine.closeWindow", { windowId: old }).catch(() => {});
-      call.extra.openedWindow = { tabId: w.tabId, windowId: w.windowId, hint: "this session's own window, opened in the background, muted" };
-      ctx.audit.log("session.open_window", { session: s.key.slice(0, 12), tabId: w.tabId, type: w.type });
+      if (old) await closeSessionPage(old);
+      call.extra.openedWindow = s.ownWindow
+        ? { tabId: w.tabId, windowId: w.windowId, hint: "this session's own window (it has a viewport), opened in the background, muted" }
+        : { tabId: w.tabId, windowId: w.windowId, hint: "a tab in the shared agent window, opened in the background, muted" };
+      ctx.audit.log("session.open_window", { session: s.key.slice(0, 12), tabId: w.tabId, type: w.type, shared: !s.ownWindow });
       if (s.mobile) {
         await sc.req("engine.mobile", { mobile: true });
         before = (await ping(sc).catch(() => ({}) as Ping)).tab?.navCount ?? 0;
@@ -749,9 +792,10 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
       const mine = ctx.sessions
         .all()
         .filter((s) => s.ownerClient === ctx.client.id || s.lastSeen.has(ctx.client.id))
-        .map((s) => ({ session: s.label, shared: s.shared, tabId: s.tabId ?? null, windowId: s.windowId ?? null }));
+        .map((s) => ({ session: s.label, shared: s.shared, tabId: s.tabId ?? null, windowId: s.windowId ?? null, ...(s.ownWindow ? { ownWindow: true } : {}) }));
       return {
         serverRunning: true, // answering at all means it is (the launcher reports false)
+        ...(ctx.windows ? { agentWindow: ctx.windows.describe() } : {}),
         bridgeConnected,
         ready: bridgeConnected && !b.staleBuild,
         build: {
@@ -806,9 +850,9 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
   tool(
     "agent_browser_visit",
     [
-      "Open a URL — or go back / forward / reload — in your session's own browser window, wait for it to settle, ",
+      "Open a URL — or go back / forward / reload — in your session's own tab, wait for it to settle, ",
       "and return a compact accessibility-tree snapshot of the links, buttons, fields and headings. The first visit ",
-      "of a session opens its window (in the background). Pass text:true to also get the page's visible text. ",
+      "of a session opens its tab in the shared agent window (in the background). Pass text:true to also get the page's visible text. ",
       "If a captcha or notice blocks the page, the result says outcome:\"needs_human\" — stop and tell the user; do not ",
       "report the page as empty. Failed requests and console errors since the call started are summarised in `diagnostics`. ",
       "Auto-ensures the browser is running.",
@@ -847,7 +891,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
       await ensureBrowser(45_000);
       const sc = scope(call, { session, tabId, lock, leaseMs }, url ? "open" : "tab");
       if ((viewport || mobile !== undefined || sound !== undefined) && sc.s.legacy)
-        throw new AbError("BAD_REQUEST", "viewport, mobile and sound belong to a session's own window; drop session \"default\"");
+        throw new AbError("BAD_REQUEST", "viewport, mobile and sound belong to a session's own tab; drop session \"default\"");
       if (viewport) sc.s.viewport = viewport;
       const mobileChanged = mobile !== undefined && mobile !== !!sc.s.mobile;
       if (mobile !== undefined) sc.s.mobile = mobile;
@@ -1146,8 +1190,10 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
           const child = opened[opened.length - 1];
           if (child) {
             switchedTab = { from: sc.s.tabId, to: child.tabId, hint: "this action opened another tab and your session moved to it; browser_tabs lists, switches and closes tabs" };
-            ctx.sessions.bind(sc.s, child.tabId, child.windowId);
+            bindOpened(sc.s, child.tabId, child.windowId);
             call.tabId = child.tabId;
+            // In the shared window the new tab must be the one in front, or it runs throttled.
+            if (pooled(sc.s)) await ctx.bridge.request("engine.tabPlace", { tabId: child.tabId, activate: true }).catch(() => {});
             await sc.req("engine.waitForStable", { timeout: 6000, quietMs: 400 }).catch(() => {});
           }
         }
@@ -1331,8 +1377,8 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
       if (DRY_RUN) return { dryRun: true, wouldNavigate: args.url ?? args.action };
       return inSession(call, sc, async () => {
         if (!sc.s.legacy && sc.s.tabId === undefined) {
-          const w = await openSessionWindow(sc.s, args.url);
-          ctx.sessions.bind(sc.s, w.tabId, w.windowId);
+          const w = await openSessionWindow(call, sc.s, args.url);
+          bindOpened(sc.s, w.tabId, w.windowId);
           call.tabId = w.tabId;
           ctx.audit.log("tool.browser_navigate", { url: args.url, tabId: w.tabId, opened: true });
           return { navigating: true, to: args.url, tabId: w.tabId, windowId: w.windowId, mode: "opened_session_window" };
@@ -1529,7 +1575,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
     [
       "List, switch, open or close tabs. list shows every tab and which session holds it (`yours`). ",
       "switch makes a tab your session's tab (by explicit tabId; never one another session holds) and brings it ",
-      "to the front of its own window without raising the window. new opens a tab in your session's window. ",
+      "to the front of its own window without raising the window. new opens another tab for your session, in the shared agent window. ",
       "close closes one of your own tabs. With session \"default\", the old behaviour: tools act on the focused tab.",
     ].join(""),
     {
@@ -1553,25 +1599,31 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         return { ...(o ? { session: o.shared || o.job ? o.label : yours ? o.label : "another agent" } : {}), yours };
       };
       const annotate = (l: TabList) => ({ ...l, tabs: l.tabs.map((t) => ({ ...t, ...label(t) })) });
-      const mineTab = (id: number, windowId?: number) => ctx.sessions.ownerOfTab(id) === s || (s.windowId !== undefined && windowId === s.windowId);
+      // Every tab in a window of the session's own is its; in the shared window, only those it opened.
+      const mineTab = (id: number, windowId?: number) =>
+        ctx.sessions.ownerOfTab(id) === s || !!s.opened?.has(id) || (!!s.ownWindow && s.windowId !== undefined && windowId === s.windowId);
 
       if (s.legacy) {
         const out = await ctx.bridge.request<TabList>("engine.tabs", { action, tabId, url, focusWindow: true });
         ctx.audit.log("tool.browser_tabs", { action, tabId, legacy: true });
-        call.warnings.push("session \"default\" acts on whichever tab is focused — which other agents and the user also use. Omit `session` to get a window of your own");
+        call.warnings.push("session \"default\" acts on whichever tab is focused — which other agents and the user also use. Omit `session` to get a tab of your own");
         return annotate(out);
       }
       if (action === "list") return annotate(await list());
       const all = (await list()).tabs;
       if (action === "new") {
-        if (s.windowId === undefined) {
-          const w = await openSessionWindow(s, url);
-          ctx.sessions.bind(s, w.tabId, w.windowId);
+        // A session in the shared window opens its new tab there (or beside
+        // it, when another agent is acting in it); the call ends at once, so
+        // it holds the window only for the opening.
+        if (s.windowId === undefined || (ctx.windows && pooled(s))) {
+          const w = await openSessionWindow(call, s, url);
+          if (call.front) await ctx.windows?.leave(call.front).catch(() => {});
+          bindOpened(s, w.tabId, w.windowId);
           ctx.audit.log("tool.browser_tabs", { action, tabId: w.tabId, opened: true });
-          return { ...annotate(await list()), yourTab: w.tabId };
+          return { ...annotate(await list()), createdTabId: w.tabId, yourTab: w.tabId };
         }
         const out = await ctx.bridge.request<TabList>("engine.tabs", { action: "new", url, windowId: s.windowId });
-        if (out.createdTabId !== undefined) ctx.sessions.bind(s, out.createdTabId, s.windowId);
+        if (out.createdTabId !== undefined) bindOpened(s, out.createdTabId, s.windowId);
         ctx.audit.log("tool.browser_tabs", { action, tabId: out.createdTabId });
         return { ...annotate(out), yourTab: out.createdTabId };
       }

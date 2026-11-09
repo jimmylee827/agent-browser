@@ -44,6 +44,32 @@ test("two clients on one page never see each other's typing; each has its own ta
   assert.equal(steal.data.code, "TAB_OWNED_BY_OTHER");
 });
 
+test("every session's tab shares one window, and each is in front while it acts", { skip }, async () => {
+  const A = await as("win-a");
+  const B = await as("win-b");
+  const va = await A("agent_browser_visit", { url: h.url("form.html"), snapshot: "none" });
+  const vb = await B("agent_browser_visit", { url: h.url("index.html"), snapshot: "none" });
+  const where = async () => {
+    const tabs = (await A("browser_tabs", {})).data.tabs;
+    return [va.data.tabId, vb.data.tabId].map((id) => tabs.find((t) => t.tabId === id));
+  };
+  const [ta, tb] = await where();
+  assert.equal(ta.windowId, tb.windowId, "two sessions, one window");
+  // Both act at the same instant: a hidden tab would answer "hidden", and run
+  // its timers once a second, so the second steps out to a window for its call.
+  const slow = "new Promise(r => setTimeout(() => r(document.visibilityState), 1200))";
+  const t0 = Date.now();
+  const [ea, eb] = await Promise.all([A("browser_eval", { expression: slow }), B("browser_eval", { expression: slow })]);
+  assert.equal(ea.data.value, "visible");
+  assert.equal(eb.data.value, "visible");
+  assert.ok(Date.now() - t0 < 6000, "both ran at full speed, side by side");
+  const [ta2, tb2] = await where();
+  assert.equal(ta2.windowId, tb2.windowId, "afterwards they are back in one window");
+  // A session's call puts its own tab in front, so it is never the throttled one.
+  const front = await A("browser_eval", { expression: "document.visibilityState" });
+  assert.equal(front.data.value, "visible");
+});
+
 test("a session with no page yet has nothing to screenshot (no foreign tab)", { skip }, async () => {
   const C = await as("fresh");
   const r = await C("browser_screenshot", {});
