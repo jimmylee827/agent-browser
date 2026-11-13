@@ -37,6 +37,9 @@ export type Code =
   | "CAPTURE_UNAVAILABLE"
   | "JOB_NOT_FOUND"
   | "JOB_LIMIT"
+  | "HOST_PAUSED"
+  | "INCOGNITO_UNAVAILABLE"
+  | "VIEWPORT_MISMATCH"
   | "ENGINE_ERROR";
 
 interface Entry {
@@ -85,7 +88,7 @@ export const CATALOGUE: Record<Code, Entry> = {
     fixSteps: ["call agent_browser_ensure_running", "if it still fails, tell the user in one sentence and record the step as not done"],
     humanAction: "if Chrome is open but never connects: load the extension once via chrome://extensions → Load unpacked → packages/extension",
   },
-  NAV_TIMEOUT: { agentCanFix: true, fixSteps: ["retry once", "if it repeats, check agent_browser_status"], humanAction: null },
+  NAV_TIMEOUT: { agentCanFix: true, fixSteps: ["inspect the current tab and browser status", "a navigation may still be pending; do not blindly replay a history/form submission"], humanAction: null },
   // Chrome's own warning page: nothing of the agent's runs there, and getting
   // past it is a security decision that belongs to the person.
   CERT_INVALID: {
@@ -142,7 +145,7 @@ export const CATALOGUE: Record<Code, Entry> = {
   CAPTURE_FAILED: { agentCanFix: true, fixSteps: ["retry once", "if it repeats, call agent_browser_status"], humanAction: null },
   RESPONSE_TIMEOUT: {
     agentCanFix: true,
-    fixSteps: ["look at what did arrive (recent, or browser_network)", "widen urlPattern, or raise timeout", "check the action that should have sent it ran (noEffect?)"],
+    fixSteps: ["look at what did arrive (recent, or browser_network)", "widen urlPattern, or raise timeout", "the action may already have run: inspect application state before deliberately submitting again"],
     humanAction: null,
   },
   NETWORK_BLOCKED: {
@@ -152,7 +155,7 @@ export const CATALOGUE: Record<Code, Entry> = {
   },
   CAPTURE_UNAVAILABLE: {
     agentCanFix: true,
-    fixSteps: ["reload the page (agent_browser_visit({history:\"reload\"})) so it loads with capture on", "then repeat the action that sends the request"],
+    fixSteps: ["reload the page (agent_browser_visit({history:\"reload\"})) so it loads with capture on", "inspect application state before deliberately sending any action again"],
     humanAction: null,
   },
   JOB_NOT_FOUND: { agentCanFix: true, fixSteps: ["list the jobs (browser_jobs({action:\"list\"}))", "retry with an id from the list"], humanAction: null },
@@ -161,7 +164,10 @@ export const CATALOGUE: Record<Code, Entry> = {
     fixSteps: ["stop a job you no longer need, or ask for a slower interval", "do not raise the limits yourself"],
     humanAction: "raise jobs.maxJobs or the job's maxLoadsPerHour in config/local.json if this job is wanted",
   },
-  ENGINE_ERROR: { agentCanFix: true, fixSteps: ["retry once", "if it repeats, call agent_browser_status"], humanAction: null },
+  HOST_PAUSED: { agentCanFix: true, fixSteps: ["inspect the page/network without resubmitting", "wait until the cooldown expires; an explicit override applies to one call only"], humanAction: null },
+  INCOGNITO_UNAVAILABLE: { agentCanFix: false, fixSteps: ["ask the user to enable Allow in Incognito for Agent Bridge", "do not silently use a regular tab instead"], humanAction: "enable Allow in Incognito on the extension card in chrome://extensions" },
+  VIEWPORT_MISMATCH: { agentCanFix: true, fixSteps: ["inspect requested and actual dimensions", "change the viewport or explicitly set strictViewport:false to accept best effort"], humanAction: null },
+  ENGINE_ERROR: { agentCanFix: true, fixSteps: ["inspect the outcome before retrying any state-changing operation", "if it repeats, call agent_browser_status"], humanAction: null },
 };
 
 /** An error with a catalogue code and optional structured detail. */

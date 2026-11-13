@@ -187,10 +187,24 @@ Every tool takes an optional `session`:
 | `"shared:<name>"` | one tab shared by every caller passing the same name; each result says who else acted since your last call (`lastActor`, `changedSinceYourLastCall`), and `lock: true` leases it |
 | `"default"` | the old behaviour — whatever tab is focused — with a warning |
 
-Cookies and logins are **not** separated: there is one browser profile, so a
-login in one session is a login in all. Use test accounts you are happy to
-leave in that profile; a page's attempt to save a credential
-(`navigator.credentials.store`) is refused and reported.
+Ordinary sessions share cookies/logins in one profile. Incognito pages use a
+separate private jar, **shared by every Incognito window in that profile**, not
+an independent jar per agent. Use accounts you are happy to leave in the chosen
+context; a page's attempt to save a credential (`navigator.credentials.store`)
+is refused and reported.
+
+`agent_browser_visit({url, incognito:true})` and
+`browser_tabs({action:"new", incognito:true})` create private pages. The user
+must first enable **Allow in Incognito** for Agent Bridge at `chrome://extensions`.
+A denied permission is `INCOGNITO_UNAVAILABLE`, never a regular-window fallback.
+Tab listings include `incognito`; explicitly passing `tabId` adopts its actual
+mode. Private tabs never join the regular window pool. Teardown closes only
+agent-created tabs, not adopted user tabs or unrelated siblings.
+
+**Incognito is not ephemeral tool recording.** Screenshots, traffic and logs
+still follow normal capture/redaction/retention settings; downloaded files also
+remain on disk. Entry/results warn about this. Closing an agent's private tab
+does not clear private cookies while another private window remains open.
 
 ## Results
 
@@ -246,15 +260,29 @@ Ref-based, for surgical control. Most agents never need them.
 
 ## Two things that make it work on real sites
 
-**Dead-click escalation.** SPA buttons routinely ignore a synthetic click from
-an extension's isolated world — the handler is a React fiber prop, hydration
-hasn't attached the listener yet, or the effect is gated on the tab being
-focused. When a click provably changes nothing, `agent_browser_act` waits to
-confirm, then re-clicks inside the page's own JS world: hydration wait → focus
-and visibility spoof → authentic pointer/mouse sequence → native click → React
-fiber `onClick` → `formAction` POST, reporting which strategy landed. The
-confirm step exists so a slow-but-successful handler is never clicked twice;
-pass `robust: "never"` on non-idempotent buttons.
+**Robust click, one activation.** SPA buttons can need hydration preparation
+and page-world execution. Robust click remains the primary engine: prepare the
+target, select a strategy, activate once, then observe. `robust: "auto"` and
+`"always"` use it before the first activation; `"never"` uses the basic engine.
+There is no hidden second click and no consecutive chain of submission methods.
+
+The agent can deliberately recover after inspecting the page/network by making
+a new call with `strategy: "native"`, `"react"`, `"form"`, or `"form-action"`;
+`"auto"` uses the normal pointer/click strategy. Each call attempts one strategy.
+A quiet DOM or missing network record does **not** prove that an earlier handler
+failed. Check application state before resubmitting a consequential operation.
+`robust:"always"` also waits for a late hydration signal even when no React
+properties are present yet. For focus-gated handlers, `focusWindow:true` is an
+explicit option that may bring Chrome forward; it is never an implicit retry.
+Native new-tab links select the content-script realm before activation because
+Chrome handles page-world synthetic popups differently.
+
+Results separate `dispatch` (`not_dispatched`, `completed`, `unknown`) from
+`actionOutcome` (`effect_observed`, `request_observed`, `response_received`,
+`unknown`). `businessSuccess: "not_verified"` and `automaticRetryAllowed: false`
+are deliberate: HTTP 200 is not a business-success guarantee. A failed response
+wait preserves the snapshot and dispatch state in `responseError`; it does not
+say that a submitted action was never done.
 
 **Redirect capture.** Every top-frame navigation goes into a ring buffer, so
 `browser_wait_for_navigation({urlPattern})` can answer "did we pass through a
@@ -373,8 +401,9 @@ npm run ab -- jobs start --id dash --url https://dash.example/overview \
 
 At most 10 steps, run once per page load after `jobs.defaults.pageGraceMs`. A step that
 finds nothing (unless marked `?`) counts as the page being unwell: the healing
-ladder takes over. No step ever double-fires: steps use a plain click, never the
-dead-click retry or real OS input.
+ladder takes over. Each step dispatches one basic activation, without a robust
+fallback chain or real OS input. This is not an exactly-once guarantee across
+job reloads/restarts; use application idempotency for consequential submissions.
 
 ### Secrets: a password, code or card a job may type
 
@@ -413,6 +442,56 @@ stays disconnected — on macOS, a Chrome with no window open has unloaded the
 extension — the server opens a window, a few times a day at most. Records are
 removed after `evidence.retainDays`.
 
+## Host pauses, request overrides and downloads
+
+Short full-document access-block/rate-limit pages are detected even without an
+overlay. Strong HTTP rate-limit signals also pause the destination hostname for
+`browsing.cooldownMs` (default 300000 ms), extended by valid `Retry-After`.
+Foreground operations and background jobs share this registry. Inspection still
+works; automatic reload/recreate is not a foreground recovery policy.
+`browser_cooldowns()` lists pauses. `overrideCooldown:true` is an explicit
+one-call override, not a global reset or a scheduled replay. This gates our
+operations, not autonomous network requests already running in a page.
+
+Visits accept `headers: {"Accept":"application/json"}`. Overrides are installed
+before the initial navigation, scoped to its exact URL/tab/main-frame/method,
+and cleaned up afterwards. They do not follow unrelated redirects or become
+session defaults. Browser-managed/invalid headers are rejected; this is not CDP
+request interception. Mobile defaults and explicit navigation overrides have
+separate rules, with the explicit override taking precedence for that request.
+
+`browser_post` sends one POST from an existing session tab:
+
+```json
+{"url":"https://example.com/api","mode":"fetch","encoding":"json","body":"{\"q\":\"test\"}"}
+```
+
+- `mode:"fetch"`: returns bounded status/body data without navigating. Supports
+  JSON/text bodies and form/multipart `fields:[["name","value"]]`. Uses the
+  selected tab's cookie context and normal CSP/CORS rules. Redirects are manual,
+  not silently followed with caller headers. No extension-origin fetch fallback.
+- `mode:"form"`: submits fields as URL-encoded or multipart POST and navigates
+  the tab. No JSON/text form navigation or local file attachment. Browser
+  form-action, cookie and SameSite rules still apply.
+- Both honor the kill switch, ownership, policy, viewport strictness and host
+  pauses; errors/timeouts never cause a resend or a transport fallback. Use
+  `actionClass` for sensitive actions, as for clicks.
+
+`browser_downloads({id})` inspects Chrome's actual download state/error/filename.
+Omitting ID deliberately lists recent **browser-wide** downloads. The tool does
+not change the download directory or open files. Chrome supplies no reliable
+originating tab ID: attribution is `unknown`, not guessed from URL/time.
+
+Viewport results expose requested and achieved dimensions. Best effort warns;
+`strictViewport:true` on visit persists for the session and blocks action/POST
+dispatch on mismatch. Set it false to accept best effort. Eval timeout errors
+name `timeoutMs` (default 5000, range 100–25000); stopping the wait does not
+necessarily stop the underlying page operation.
+
+Automatic evidence expires per record/image pair after `evidence.retainDays`
+(default 14), including inside active session directories. Standalone exports
+and old orphan images expire by their own age. There is **no size cap**.
+
 ## From a terminal
 
 Everything an agent's tools can read or start, `npm run ab` does too, with
@@ -425,7 +504,20 @@ npm run ab -- network --tab <id> --url /api/ --bodies
 npm run ab -- network --tab <id> --export har
 npm run ab -- jobs list
 npm run ab -- secrets list
+npm run ab -- visit --url https://example.com --incognito --json
+npm run ab -- act --spec action.json --json
+npm run ab -- post --spec request.json --json
+npm run ab -- downloads --id 123 --json
+npm run ab -- cooldowns --json
+npm run ab -- tool browser_inspect --spec arguments.json --json
 ```
+
+`--stdin` reads an arguments object without putting payloads in shell arguments.
+`--session NAME` selects a persistent terminal session; `--client ID` separates
+terminal callers (default `terminal`). CLI operations use the same registered
+schemas, locks, policy gates and outcome handlers as MCP, via `/command`.
+The legacy `/visit`, `/navigate`, `/act`, `/robust-click` aliases use those same
+handlers and retain their explicitly focused-tab (`session:"default"`) behavior.
 
 ## Safety
 

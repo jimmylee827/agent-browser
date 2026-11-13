@@ -10,7 +10,7 @@ description: |
   - Any multi-step web flow: search-then-click, form-fill-then-submit, navigate-and-extract
   - "Find the link / button / field that says X and ..."
 
-  Sessions: without `session`, every call acts in this agent's OWN tab (all agents' tabs share one background window), never a tab a person or another agent is using. A subagent sharing the connection passes its own `session` name; agents that must share one tab both pass `session: "shared:<name>"` (reload/visit then affect both). Cookies and logins are shared by all sessions (one profile).
+  Sessions: without `session`, every call acts in this agent's OWN tab (all agents' tabs share one background window), never a tab a person or another agent is using. A subagent sharing the connection passes its own `session` name; agents that must share one tab both pass `session: "shared:<name>"` (reload/visit then affect both). Ordinary sessions share regular cookies; Incognito sessions share a separate private jar with every Incognito window in that profile. Tool evidence/traffic still persists in Incognito.
 
   Primary tools (use these — no `ref` / `snapshotGeneration` to track):
   - `agent_browser_visit({ url } | { history: "back" }, text?, snapshot?)` — navigate (or go back/forward/reload) + wait + return accessibility tree; `text: true` adds the page's visible text, `snapshot: "none"` drops the tree
@@ -65,6 +65,39 @@ That's the whole pattern. No refs, no generations, no manual re-observation. Eac
   the page as empty. A consent banner you can dismiss says `agentCanFix: true`
   and gives the dismiss button's ref.
 
+## Privacy, pauses and direct requests
+
+- `agent_browser_visit({url,incognito:true})` and
+  `browser_tabs({action:"new",incognito:true})` create private pages. The user
+  must enable Allow in Incognito on Agent Bridge; never silently fall back.
+  Listings/results carry `incognito`; explicit adoption uses the tab's actual
+  mode. All private windows share private cookies; they are not per-agent contexts.
+  Tool evidence/traffic and downloaded files still persist. Adopted user tabs
+  are not automatically closed with an agent session.
+- `outcome:"blocked"` means a static access/rate-limit page was recognized.
+  Shared host cooldowns gate foreground operations and jobs, not inspection or
+  autonomous traffic from a page already running. Inspect `browser_cooldowns()`.
+  `overrideCooldown:true` deliberately bypasses only one call, not other agents.
+- Visit supports validated `headers` scoped to that navigation's exact
+  destination/tab/main-frame/method. Not arbitrary interception; invalid or
+  browser-managed headers are rejected. No credential forwarding to other origins.
+- `browser_post({url,mode:"fetch",encoding:"json",body:"..."})` sends one POST
+  from the selected current tab. Fetch supports JSON/text/form/multipart and
+  returns bounded response data, obeying CSP/CORS; redirects are manual.
+  `mode:"form"` navigates by URL-encoded/multipart `fields:[["name","value"]]`.
+  No automatic retry, transport fallback or arbitrary CSP-eval bypass. Use
+  `actionClass` for consequential requests and verify application outcomes.
+- `browser_downloads({id})` reads actual state/error/filename. Omitting ID
+  deliberately lists recent browser-wide downloads; attribution to a tab is
+  unknown. No directory changes or automatic opening.
+- `strictViewport:true` on visit persists until set false: action/POST dispatch
+  is blocked on an unmet viewport. Default best effort returns requested/actual
+  sizes and warnings. Eval's `timeoutMs` is 100–25000 (default 5000); increasing
+  it changes waiting time, not the page's CSP or the operation's retry safety.
+- Terminal parity: `npm run ab -- visit|act|post --spec args.json --json`,
+  `ab cooldowns`, `ab downloads --id ID`, or `ab tool TOOL --stdin --json`.
+  These use the same registered schemas/guards/handlers as MCP.
+
 ## Patterns by intent
 
 ### "Get information from a page"
@@ -98,8 +131,10 @@ agent_browser_act({ name: "Search", action: "fill", value: "accessibility tree",
 agent_browser_act({ name: "Search", action: "press", value: "Enter" })   # submits the form, like a real Enter
 ```
 
-If a result says `noEffect: true`, the action changed nothing — try another way
-(click the search button, or `action: "submit"`) instead of assuming it worked.
+`noEffect:true` means no effect was observed, not that a handler did nothing.
+Inspect the snapshot, matching network evidence and application state first.
+The agent may deliberately choose a new robust strategy on a later call, but
+must not treat missing evidence or a timeout as proof that resubmission is safe.
 
 ### "Keep results small"
 
@@ -326,20 +361,28 @@ r = agent_browser_act({ name: "new", role: "link", action: "click" })
 
 ### "The button does nothing when clicked"
 
-Handled for you. SPA buttons often ignore a synthetic click — the handler is a
-React fiber prop, the listener isn't attached yet, or the effect is gated on the
-tab being focused. When a click provably changes nothing, `agent_browser_act`
-waits a beat to confirm, then re-clicks inside the page's own JS world
-(hydration wait → focus spoof → authentic pointer sequence → native click →
-fiber `onClick` → `formAction`).
+Robust click is preserved as the primary engine: prepare the target/hydration,
+select a strategy before dispatch, activate once, then observe. It never fires
+pointer, native, React and form methods consecutively. `robust:"auto"` and
+`"always"` use robust preparation before the first activation; `"never"` uses
+the basic engine. `always` also waits for late hydration; `focusWindow:true`
+explicitly brings Chrome forward for focus-gated handlers and may interrupt the
+user. Native new-tab links select their execution realm before activation.
 
-The result tells you whether that happened:
+The agent may inspect an ineffective attempt and deliberately choose a new
+call with `strategy:"native"`, `"react"`, `"form"`, or `"form-action"`.
+`"auto"` selects the pointer/click path. Each call attempts one strategy;
+existing sensitive-action policy gates still apply.
+
 ```json
-{ "acted": true, "escalated": "robust", "navigated": true }
+{ "dispatch": "completed", "activationEngine": "robust", "strategy": "pointer", "actionOutcome": "unknown", "businessSuccess": "not_verified", "automaticRetryAllowed": false }
 ```
 
-For a button where firing twice would be harmful — *Place order*, *Send*,
-*Delete* — pass `robust: "never"` and handle a dead click yourself.
+`completed` means dispatch, not application success. A quiet DOM, failed
+connection or missing traffic cannot establish that a submission is safe to
+repeat. A matching response suppresses `noEffect`, but HTTP 200 is not proof of
+business success. Response-wait failures retain snapshots and `responseError`
+without automatically resending the action.
 
 ### "Log in with Google / finish an OAuth or SSO flow"
 

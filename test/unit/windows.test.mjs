@@ -208,7 +208,7 @@ test("a blank tab nobody holds is reused instead of adding a tab", async () => {
 test("sessions with a viewport and background jobs are left to their own windows", async () => {
   const c = fakeChrome();
   const pool = new WindowPool(c.req, stateFile(), () => false);
-  for (const s of [session("v", { viewport: { width: 390, height: 844 }, tabId: 1 }), session("j", { job: "poll", tabId: 2 })]) {
+  for (const s of [session("v", { viewport: { width: 390, height: 844 }, tabId: 1 }), session("j", { job: "poll", tabId: 2 }), session("private", { incognito: true, tabId: 3 })]) {
     const f = { key: s.key };
     await pool.enter(f, s);
     await pool.leave(f);

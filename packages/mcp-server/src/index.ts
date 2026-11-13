@@ -15,6 +15,8 @@ import { pruneEvidence } from "./evidence.js";
 import { InputHelper } from "./input.js";
 import { JobRunner, pruneJobs } from "./jobs.js";
 import { WindowPool } from "./windows.js";
+import { HostAdmission } from "./host-admission.js";
+import { invokeBrowserOperation } from "./command-dispatch.js";
 import { resolve } from "node:path";
 
 async function main() {
@@ -33,7 +35,8 @@ async function main() {
   const warnedStale = new Set<string>();
   const input = new InputHelper(cfg.input);
   // Daemon-level, like the sessions: the HTTP transport builds a server per request.
-  const jobs = new JobRunner({ cfg, bridge, sessions, audit });
+  const admission = new HostAdmission(resolve(cfg.stateDir, "host-cooldowns.json"), () => Math.max(1000, cfg.browsing?.cooldownMs ?? 300_000));
+  const jobs = new JobRunner({ cfg, bridge, sessions, audit, admission });
   // Daemon-level too: which window every session's tab shares, and who is acting in it.
   const windows = new WindowPool(
     (method, params) => bridge.request(method, params),
@@ -42,7 +45,7 @@ async function main() {
   );
   const makeServer = (client: ClientInfo): McpServer => {
     const s = new McpServer({ name: "agent-browser", version: "0.0.1" });
-    registerTools(s, { bridge, policy, sessions, audit, cfg, client, warnedStale, input, jobs, windows });
+    registerTools(s, { bridge, policy, sessions, audit, cfg, client, warnedStale, input, jobs, windows, admission });
     return s;
   };
 
@@ -51,9 +54,8 @@ async function main() {
   const releaseClient = async (id: string) => {
     let closed = 0;
     for (const s of sessions.release(id)) {
-      if (s.ownWindow && s.windowId !== undefined)
-        await bridge.request("engine.closeWindow", { windowId: s.windowId }).then(() => closed++, () => {});
-      else if (s.opened?.size)
+      // Ownership belongs to created tabs, not every tab in their window.
+      if (s.opened?.size)
         await bridge.request<{ closed: number }>("engine.closeTabs", { tabIds: [...s.opened] }).then((r) => (closed += r.closed), () => {});
     }
     audit.log("session.release", { client: id.slice(0, 8), closed });
@@ -103,6 +105,7 @@ async function main() {
     makeMcpServer: makeServer,
     makeHttpTransport: () => new StreamableHTTPServerTransport({ sessionIdGenerator: undefined }), // stateless
     releaseClient,
+    invokeOperation: (client, name, args) => invokeBrowserOperation({ bridge, policy, sessions, audit, cfg, client, warnedStale, input, jobs, windows, admission }, name, args),
   }, jobs);
   jobs.start();
 

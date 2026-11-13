@@ -5,6 +5,8 @@
 // import. generated-secret.js is produced by scripts/sync-ext-secret.mjs.
 import { BRIDGE_SECRET, BRIDGE_PORT } from "./generated-secret.js";
 import * as netstore from "./lib/netstore.js";
+import { activateOnce } from "./lib/activation.js";
+import { postInPage, headerRule } from "./lib/requests.js";
 import { keyMatcher, redactHeaders, redactUrl, redactBody, redactValues } from "./lib/redact.js";
 import { mergeStreams, filterEntries, isFailed } from "./lib/net-merge.js";
 
@@ -115,6 +117,12 @@ chrome.tabs.onCreated.addListener(async (t) => {
   if (opener?.mutedInfo?.muted && opener.mutedInfo.reason === "extension") chrome.tabs.update(t.id, { muted: true }).catch(() => {});
   if (MOBILE.has(t.openerTabId)) setMobile(t, MOBILE.get(t.openerTabId)).catch(() => {});
 });
+chrome.webNavigation.onCreatedNavigationTarget.addListener((d) => {
+  if (!OPENED.some((o) => o.tabId === d.tabId)) {
+    OPENED.push({ tabId: d.tabId, openerTabId: d.sourceTabId, ts: Date.now() });
+    if (OPENED.length > 50) OPENED.shift();
+  }
+});
 chrome.tabs.onRemoved.addListener((id) => {
   NAV_COUNT.delete(id);
   netstore.clearTab(id, { keepPending: true }).catch(() => {});
@@ -159,7 +167,37 @@ async function setViewport(tab, v) {
 // (a per-tab header rule) — and the page sees touch support and a coarse,
 // hoverless pointer (page-world patches, re-applied on every load).
 const MOBILE = new Map();
-const ruleIdFor = (tabId) => (tabId % 2147483000) + 1;
+// Disjoint ID spaces: odd mobile rules, even transient navigation rules.
+const ruleIdFor = (tabId) => (tabId % 1_000_000_000) * 2 + 1;
+const navRuleId = (tabId) => (tabId % 1_000_000_000) * 2 + 2;
+const navRuleReady = chrome.declarativeNetRequest.getSessionRules().then((rules) =>
+  chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: rules.filter((r) => r.priority === 10).map((r) => r.id) })).catch(() => {});
+const navTimers = new Map();
+const navTargets = new Map();
+async function clearNavHeaders(tabId) {
+  await navRuleReady;
+  clearTimeout(navTimers.get(tabId)); navTimers.delete(tabId); navTargets.delete(tabId);
+  await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [navRuleId(tabId)] });
+}
+async function setNavHeaders(tabId, params) {
+  await clearNavHeaders(tabId);
+  if (!params.headers || !Object.keys(params.headers).length) return;
+  const rule = headerRule(navRuleId(tabId), tabId, params.url, params.headers, params.method || "get");
+  await chrome.declarativeNetRequest.updateSessionRules({ addRules: [rule] });
+  const url = new URL(params.url); url.hash = "";
+  navTargets.set(tabId, { url: url.href });
+  navTimers.set(tabId, setTimeout(() => clearNavHeaders(tabId).catch(() => {}), 30000));
+}
+chrome.tabs.onRemoved.addListener((id) => clearNavHeaders(id).catch(() => {}));
+chrome.webRequest.onBeforeRequest.addListener((d) => {
+  const target = navTargets.get(d.tabId);
+  if (target && !target.requestId && d.url === target.url) target.requestId = d.requestId;
+}, { urls: ["<all_urls>"], types: ["main_frame"] });
+const finishNavHeaders = (d) => {
+  if (navTargets.get(d.tabId)?.requestId === d.requestId) clearNavHeaders(d.tabId).catch(() => {});
+};
+chrome.webRequest.onCompleted.addListener(finishNavHeaders, { urls: ["<all_urls>"], types: ["main_frame"] });
+chrome.webRequest.onErrorOccurred.addListener(finishNavHeaders, { urls: ["<all_urls>"], types: ["main_frame"] });
 function mobileUA() {
   const major = (navigator.userAgent.match(/Chrome\/(\d+)/) || [])[1] || "120";
   return `Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Mobile Safari/537.36`;
@@ -751,6 +789,11 @@ async function callEngine(tabId, method, params) {
       try {
         reply = await chrome.tabs.sendMessage(tabId, { method, params }, { frameId: 0 });
       } catch (retryErr) {
+        // Re-injection is safe only when delivery is conclusively absent.
+        // A retry whose port closes may itself have activated the target.
+        const retryMessage = String(retryErr.message || retryErr);
+        if (!RETRY_SAFE.has(method) && !/Receiving end does not exist|Could not establish connection/.test(retryMessage))
+          throw tagged("PORT_CLOSED_AFTER_ACTION", "reply lost after possible dispatch; no replay", { dispatch: "unknown" });
         lastErr = retryErr;
         await new Promise((r) => setTimeout(r, 400));
         continue;
@@ -957,7 +1000,31 @@ async function dispatch(method, params) {
   // start playing at the person beside it. A session with a viewport gets a
   // popup-type window, the kind Chrome lets go narrower than 500px.
   if (method.startsWith("net.")) return await netDispatch(method, params);
+  if (method === "engine.incognitoAccess") return { allowed: await chrome.extension.isAllowedIncognitoAccess() };
+  if (method === "engine.downloads") {
+    const items = await chrome.downloads.search(params.id !== undefined ? { id: params.id } : { limit: Math.min(params.limit || 20, 100), orderBy: ["-startTime"] });
+    return { scope: "browser-wide", attribution: "unknown", downloads: items.map((d) => ({ id: d.id, url: redactUrl(d.url, isSecretKey), filename: d.filename, state: d.state, error: d.error, exists: d.exists, incognito: d.incognito, startTime: d.startTime, bytesReceived: d.bytesReceived, totalBytes: d.totalBytes })), warning: "Files persist on disk after Incognito closes. Chrome does not reliably identify the originating tab." };
+  }
+  if (method === "engine.navigationHeaders") {
+    const t = await tabFor(params);
+    await setNavHeaders(t.id, params);
+    return { configured: true, tabId: t.id };
+  }
+  if (method === "engine.post") {
+    const tab = await tabFor(params);
+    if (params.mode === "form") await setNavHeaders(tab.id, { ...params, method: "post" });
+    try {
+      const [r] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, world: "MAIN", func: postInPage, args: [params] });
+      const result = r?.result || { dispatch: "unknown", error: "page returned no result" };
+      if (result.response?.body) result.response.body = scrubText(result.response.body, result.response.headers?.find((h) => h.name === "content-type")?.value || "");
+      if (result.response?.headers) result.response.headers = redactHeaders(result.response.headers, NETCFG.redactHeaders);
+      if (result.response?.url) result.response.url = redactUrl(result.response.url, isSecretKey);
+      return result;
+    } catch (e) { return { dispatch: "unknown", actionOutcome: "unknown", error: String(e.message || e), note: "No automatic retry; inspect state before resubmitting" }; }
+    finally { if (params.mode === "form") setTimeout(() => clearNavHeaders(tab.id).catch(() => {}), 30000); }
+  }
   if (method === "engine.openSessionWindow") {
+    if (params.incognito && !(await chrome.extension.isAllowedIncognitoAccess())) throw tagged("INCOGNITO_UNAVAILABLE", "Enable Allow in Incognito for Agent Bridge");
     const like = await chrome.windows.getLastFocused().catch(() => null);
     const shape = params.viewport
       ? { type: "popup", width: Math.max(params.viewport.width, 100), height: params.viewport.height + 90 }
@@ -968,7 +1035,7 @@ async function dispatch(method, params) {
     // that one over is what keeps one visit to one window; without it every
     // launch left a blank window behind that no session owned and nothing closed.
     const spare = params.adoptTabId != null ? await chrome.tabs.get(params.adoptTabId).catch(() => null) : null;
-    if (spare) {
+    if (spare && !!spare.incognito === !!params.incognito) {
       if (params.viewport && spare.windowId) {
         // Only a popup window may go below 500px wide; moving the tab there
         // leaves the normal window it came from empty, and Chrome drops that.
@@ -988,7 +1055,7 @@ async function dispatch(method, params) {
     // The shared agent window: a tab there instead of a window of its own.
     // A blank tab nobody holds (kept so Chrome never runs windowless) is reused.
     const home = params.windowId != null ? await chrome.windows.get(params.windowId).catch(() => null) : null;
-    if (home && !params.viewport) {
+    if (home && !params.viewport && !!home.incognito === !!params.incognito) {
       const reuse = params.reuseTabId != null ? await chrome.tabs.get(params.reuseTabId).catch(() => null) : null;
       const tab =
         reuse && reuse.windowId === home.id
@@ -1000,6 +1067,7 @@ async function dispatch(method, params) {
     const like2 = params.likeWindowId != null ? await chrome.windows.get(params.likeWindowId).catch(() => null) : null;
     const win = await chrome.windows.create({
       url: params.url || "about:blank",
+      incognito: !!params.incognito,
       focused: false,
       ...shape,
       ...(!params.viewport && like2?.width ? { width: like2.width, height: like2.height } : {}),
@@ -1042,6 +1110,7 @@ async function dispatch(method, params) {
       windowId: t.windowId,
       active: t.active || !!params.activate,
       windowType: win?.type,
+      incognito: !!t.incognito,
       ...(waitedMs != null ? { waitedMs } : {}),
       ...(windowHidden ? { windowHidden: true } : {}),
     };
@@ -1052,12 +1121,14 @@ async function dispatch(method, params) {
     const t = await chrome.tabs.get(params.tabId).catch(() => null);
     if (!t) throw tagged("TAB_GONE", `NO_SUCH_TAB: no tab ${params.tabId}`, { tabId: params.tabId });
     if (params.toWindowId != null) {
+      const dest = await chrome.windows.get(params.toWindowId);
+      if (!!dest.incognito !== !!t.incognito) throw tagged("BAD_REQUEST", "cannot move tabs across regular/private contexts");
       if (t.windowId !== params.toWindowId) await chrome.tabs.move(t.id, { windowId: params.toWindowId, index: -1 });
       if (params.activate) await chrome.tabs.update(t.id, { active: true });
       return { windowId: params.toWindowId };
     }
     const like = await chrome.windows.get(params.likeWindowId ?? t.windowId).catch(() => null);
-    const win = await chrome.windows.create({ tabId: t.id, focused: false, ...(like?.width ? { width: like.width, height: like.height } : {}) });
+    const win = await chrome.windows.create({ tabId: t.id, incognito: !!t.incognito, focused: false, ...(like?.width ? { width: like.width, height: like.height } : {}) });
     return { windowId: win.id };
   }
   // Every tab of one window into another; the emptied window closes itself.
@@ -1066,6 +1137,7 @@ async function dispatch(method, params) {
     const to = await chrome.windows.get(params.to).catch(() => null);
     if (!to) return { moved: 0, gone: "to" };
     if (!from.length) return { moved: 0, gone: "from" };
+    if (from.some((t) => !!t.incognito !== !!to.incognito)) throw tagged("BAD_REQUEST", "cannot merge regular/private windows");
     await chrome.tabs.move(from.map((t) => t.id), { windowId: params.to, index: -1 });
     return { moved: from.length };
   }
@@ -1079,8 +1151,15 @@ async function dispatch(method, params) {
     const all = await chrome.tabs.query({});
     let kept;
     if (all.every((t) => ids.includes(t.id))) {
-      kept = ids.pop();
-      await chrome.tabs.update(kept, { url: "about:blank" }).catch(() => {});
+      const regular = all.find((t) => !t.incognito);
+      if (regular) {
+        kept = regular.id;
+        ids.splice(ids.indexOf(kept), 1);
+        await chrome.tabs.update(kept, { url: "about:blank" }).catch(() => {});
+      } else {
+        // Do not keep an Incognito session alive just to retain the bridge.
+        await chrome.windows.create({ url: "about:blank", incognito: false, focused: false });
+      }
     }
     if (ids.length) await chrome.tabs.remove(ids).catch(() => {});
     return { closed: ids.length, ...(kept != null ? { keptBlank: kept } : {}) };
@@ -1112,7 +1191,7 @@ async function dispatch(method, params) {
   if (method === "engine.setViewport") return await setViewport(await tabFor(params), params);
   if (method === "engine.toPopupWindow") {
     const t = await tabFor(params);
-    const win = await chrome.windows.create({ tabId: t.id, type: "popup", focused: false });
+    const win = await chrome.windows.create({ tabId: t.id, incognito: !!t.incognito, type: "popup", focused: false });
     return { windowId: win.id };
   }
   if (method === "engine.mobile") return await setMobile(await tabFor(params), params);
@@ -1126,7 +1205,7 @@ async function dispatch(method, params) {
       await chrome.windows.update(params.windowId, { state: "normal" });
       return { state: "normal", restored: true };
     }
-    return { state: win.state };
+    return { state: win.state, incognito: !!win.incognito };
   }
   if (method === "engine.closeWindow") {
     await chrome.windows.remove(params.windowId).catch(() => {});
@@ -1221,14 +1300,19 @@ async function dispatch(method, params) {
     const active = await activeTab().catch(() => null);
     const all = await chrome.tabs.query({});
     return {
-      tabs: all.map((t) => ({ tabId: t.id, url: t.url, title: t.title, active: t.id === active?.id, frontOfWindow: t.active, windowId: t.windowId, ...(t.mutedInfo?.muted ? { muted: true } : {}) })),
+      tabs: all.map((t) => ({ tabId: t.id, url: t.url, title: t.title, active: t.id === active?.id, frontOfWindow: t.active, windowId: t.windowId, incognito: !!t.incognito, ...(t.mutedInfo?.muted ? { muted: true } : {}) })),
       activeTabId: active?.id,
       ...(created ? { createdTabId: created.id } : {}),
       ...(focusedWindow ? { focusedWindow } : {}),
     };
   }
   if (method === "engine.openedFrom") {
-    return { opened: OPENED.filter((o) => o.openerTabId === params.tabId && o.ts >= (params.since || 0)) };
+    const opened = [];
+    for (const o of OPENED.filter((o) => o.openerTabId === params.tabId && o.ts >= (params.since || 0))) {
+      const tab = await chrome.tabs.get(o.tabId).catch(() => null);
+      if (tab) opened.push({ ...o, windowId: tab.windowId, incognito: !!tab.incognito });
+    }
+    return { opened };
   }
   if (method === "engine.waitForNavigation") return await waitForNavigation(params);
   if (method === "engine.navHistory")
@@ -1245,7 +1329,7 @@ async function dispatch(method, params) {
     return {
       sw: "ok",
       tab: {
-        id: tab.id, url: tab.url, title: tab.title, status: tab.status, windowId: tab.windowId, navCount: NAV_COUNT.get(tab.id) || 0,
+        id: tab.id, url: tab.url, title: tab.title, status: tab.status, windowId: tab.windowId, incognito: !!tab.incognito, navCount: NAV_COUNT.get(tab.id) || 0,
         ...(LOAD_ERROR.has(tab.id) ? { loadError: LOAD_ERROR.get(tab.id) } : {}),
       },
       engine: pong,
@@ -1332,7 +1416,7 @@ async function evalInPage(tabId, params) {
         if (awaitPromise && value && typeof value.then === "function")
           value = await Promise.race([
             value,
-            new Promise((_, rej) => setTimeout(() => rej(new Error(`the promise did not settle within ${timeoutMs}ms`)), timeoutMs)),
+            new Promise((_, rej) => setTimeout(() => rej(new Error(`the promise did not settle within ${timeoutMs}ms; set timeoutMs (default 5000, range 100–25000). Only waiting stopped; the underlying operation may still run`)), timeoutMs)),
           ]);
       } catch (e) {
         const msg = String((e && e.message) || e);
@@ -1367,173 +1451,28 @@ async function evalInPage(tabId, params) {
 // strategies in the same context the page uses for itself. Verified by URL
 // navigation, not heuristic.
 async function robustClick(tabId, params = {}) {
-  const ref = params.ref;
-  const navTimeoutMs = params.navTimeoutMs ?? 6000;
-  const tabBefore = await chrome.tabs.get(tabId);
-  const beforeUrl = tabBefore.url ?? "";
-
-  // Programmatic focus + activation: the SAME things a real user click does
-  // before reaching the button. Without these the page's React handlers can
-  // run but focus/visibility-gated effects (analytics, fetch progress, nav)
-  // stay deprioritized — which is what made auto-click "need a user click first".
-  try {
-    await chrome.tabs.update(tabId, { active: true });
-    if (typeof tabBefore.windowId === "number") {
-      await chrome.windows.update(tabBefore.windowId, { focused: true, drawAttention: false });
-    }
-  } catch {}
-  // Give the OS focus change a tick to propagate before MAIN-world runs.
-  await new Promise((r) => setTimeout(r, 100));
-
-  // The page's world cannot see the engine's refs. The engine marks the one
-  // element with a random attribute for the instant it takes to find it here;
-  // it is removed at once. Every frame is tried: it may be in an iframe.
-  const mark = await callEngine(tabId, "markTarget", { ref: params.ref, gen: params.gen });
-  if (!mark?.attr) throw tagged("REF_NOT_FOUND", "REF_NOT_FOUND: element gone, re-observe");
-  const results = await chrome.scripting.executeScript({
-    target: { tabId, allFrames: true },
-    world: "MAIN",
-    func: async (attr, hydrationTimeoutMs) => {
-      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-      const el = document.querySelector(`[${attr}]`);
-      if (!el) return { error: "ref not found in this frame", frameUrl: location.href };
-      el.removeAttribute(attr);
-      const tried = [];
-      const reactPropsKey = () => Object.keys(el).find((k) => k.startsWith("__reactProps$"));
-      const reactPropsOf = () => {
-        const k = reactPropsKey();
-        return k ? el[k] : null;
-      };
-
-      // 0a. Force "this tab is focused & visible" at the JS level: spoof
-      //     document.hasFocus()/visibilityState and fire matching events. This
-      //     unblocks focus-gated React effects (analytics, fetch progress,
-      //     navigation) that otherwise pause when the window's in the bg.
-      try {
-        Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "visible" });
-        Object.defineProperty(document, "hidden", { configurable: true, get: () => false });
-        document.hasFocus = () => true;
-        window.dispatchEvent(new Event("focus"));
-        document.dispatchEvent(new Event("visibilitychange"));
-        tried.push("forceFocus");
-      } catch (e) { tried.push("forceFocus_err:" + (e.message || e)); }
-
-      // 0. Wait for React hydration: poll until the element either has a
-      //    React onClick handler attached, OR sits inside a <form>, OR a
-      //    hydration deadline elapses. This is the ROOT cause of the earlier
-      //    intermittency — we used to click before hydration listeners existed.
-      const tHy = Date.now();
-      let hydrated = false;
-      while (Date.now() - tHy < hydrationTimeoutMs) {
-        const props = reactPropsOf();
-        const onClickAttached = props && typeof props.onClick === "function";
-        const formExists = !!el.closest("form");
-        if (onClickAttached || formExists) { hydrated = true; break; }
-        await sleep(120);
-      }
-      tried.push(`hydrated=${hydrated}(${Date.now() - tHy}ms)`);
-
-      // 1. requestSubmit on enclosing form (OAuth consent is usually a form).
-      try {
-        const form = el.closest("form");
-        if (form && typeof form.requestSubmit === "function") {
-          form.requestSubmit(el);
-          tried.push("requestSubmit");
-        } else {
-          tried.push("no_form");
-        }
-      } catch (e) { tried.push("requestSubmit_err:" + (e.message || e)); }
-
-      // 2. Authentic pointer→mouse→click sequence (more realistic than .click()
-      //    alone; React 18+ delegated listeners look at full bubble path).
-      try {
-        const r = el.getBoundingClientRect();
-        const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
-        const opts = { bubbles: true, cancelable: true, composed: true,
-                       clientX: cx, clientY: cy, button: 0, view: window };
-        el.dispatchEvent(new PointerEvent("pointerover", opts));
-        el.dispatchEvent(new MouseEvent("mouseover", opts));
-        el.dispatchEvent(new PointerEvent("pointermove", opts));
-        el.dispatchEvent(new MouseEvent("mousemove", opts));
-        el.dispatchEvent(new PointerEvent("pointerdown", opts));
-        el.dispatchEvent(new MouseEvent("mousedown", opts));
-        if (typeof el.focus === "function") el.focus();
-        el.dispatchEvent(new PointerEvent("pointerup", opts));
-        el.dispatchEvent(new MouseEvent("mouseup", opts));
-        el.dispatchEvent(new MouseEvent("click", opts));
-        tried.push("eventSeq");
-      } catch (e) { tried.push("eventSeq_err:" + (e.message || e)); }
-
-      // 3. Native .click() — page-world (NOT cross-realm; isTrusted still false
-      //    but realm is the page's, so handlers see consistent context).
-      try { el.click(); tried.push("click"); } catch (e) { tried.push("click_err:" + (e.message || e)); }
-
-      // 4. React fiber: call the bound onClick handler directly.
-      try {
-        const props = reactPropsOf();
-        if (props && typeof props.onClick === "function") {
-          const fake = {
-            preventDefault: () => {}, stopPropagation: () => {},
-            target: el, currentTarget: el, isTrusted: false,
-            type: "click", nativeEvent: new MouseEvent("click"),
-          };
-          props.onClick(fake);
-          tried.push("reactOnClick");
-        } else {
-          tried.push("no_reactOnClick");
-        }
-      } catch (e) { tried.push("react_err:" + (e.message || e)); }
-
-      // 5. React 19 server-action / formAction fallback: if the button has a
-      //    formAction prop, post the form to it via fetch.
-      try {
-        const props = reactPropsOf();
-        const fa = el.getAttribute("formaction") || (props && props.formAction);
-        const form = el.closest("form");
-        if (typeof fa === "string" && form) {
-          const fd = new FormData(form);
-          // include the button name/value so server knows which submitter.
-          if (el.name) fd.append(el.name, el.value || "");
-          // Don't await — fire-and-forget, navigation will be detected by SW.
-          fetch(fa, { method: form.method || "POST", body: fd, credentials: "include" }).catch(() => {});
-          tried.push("formActionFetch");
-        }
-      } catch (e) { tried.push("formAction_err:" + (e.message || e)); }
-
-      return {
-        tried, hydrated, frameUrl: location.href,
-        role: el.getAttribute("role") || el.tagName.toLowerCase(),
-        name: (el.textContent || el.getAttribute("aria-label") || "").trim().slice(0, 60),
-        diag: {
-          tag: el.tagName, type: el.type || null,
-          inForm: !!el.closest("form"),
-          hasOnClick: !!(reactPropsOf() && reactPropsOf().onClick),
-          hasFormAction: !!(el.getAttribute("formaction") || (reactPropsOf() && reactPropsOf().formAction)),
-        },
-      };
-    },
-    args: [mark.attr, params.hydrationTimeoutMs ?? 4000],
-  });
-
-  // Aggregate per-frame results. NOTE executeScript wraps each return value
-  // in InjectionResult — `tried` lives at r.result.tried (NOT r.tried).
-  const allFrames = results.map((r) => r?.result).filter(Boolean);
-  const hit = allFrames.find((f) => Array.isArray(f.tried));
-
-  // Verify by navigation away from the consent URL.
-  const t0 = Date.now();
-  while (Date.now() - t0 < navTimeoutMs) {
-    await new Promise((r) => setTimeout(r, 250));
-    const tab = await chrome.tabs.get(tabId);
-    if ((tab.url ?? "") !== beforeUrl) {
-      return { acted: true, navigated: true, from: beforeUrl, to: tab.url,
-               strategies: hit?.tried, foundInFrame: hit?.frameUrl, diag: hit?.diag,
-               frames: allFrames.length };
-    }
+  if (params.focusWindow) await dispatch("engine.focusWindow", { tabId });
+  // The engine checks actionability/occlusion and configures dialogs before
+  // marking the target. No activation has happened at this point.
+  let mark;
+  try { mark = await callEngine(tabId, "prepareActivation", params); }
+  catch (e) { e.detail = { ...e.detail, dispatch: "not_dispatched" }; throw e; }
+  // Chrome treats a page-world synthetic target=_blank differently from an
+  // extension content-world link activation. Select the realm BEFORE firing,
+  // rather than reopening a popup after a page-world attempt may have run.
+  if (mark.nativeNewTabLink && (!params.strategy || params.strategy === "auto")) {
+    const result = await callEngine(tabId, "act", { ...params, action: "click" });
+    return { ...result, dispatch: "completed", strategy: "content-pointer", strategies: ["content-pointer"] };
   }
-  return { acted: true, navigated: false, beforeUrl,
-           strategies: hit?.tried, foundInFrame: hit?.frameUrl, diag: hit?.diag,
-           perFrame: allFrames };
+  const results = await chrome.scripting.executeScript({
+    target: { tabId, allFrames: true }, world: "MAIN", func: activateOnce,
+    args: [mark.attr, { strategy: params.strategy || "auto", waitForHydration: !!params.waitForHydration, hydrationTimeoutMs: params.hydrationTimeoutMs ?? 4000 }],
+  });
+  const hit = results.map((r) => r.result).find((r) => r?.found);
+  if (!hit) throw tagged("REF_NOT_FOUND", "target disappeared before activation", { dispatch: "not_dispatched" });
+  if (hit.dispatch === "not_dispatched") throw tagged("NOT_ACTIONABLE", hit.error || "activation not dispatched", hit);
+  const evidence = await callEngine(tabId, "activationEvidence", { since: mark.startedAt }).catch(() => ({}));
+  return { ...hit, ...evidence, ...(mark.passwordField ? { passwordField: true, host: mark.host } : {}) };
 }
 
 // Stealthy native-dialog auto-handler: a MAIN-world page script (NOT CDP, NOT
@@ -1629,7 +1568,7 @@ chrome.runtime.onInstalled.addListener((d) => {
 // file the extension is made of, with what is on disk; reload once if they differ.
 const EXTENSION_FILES = [
   "manifest.json", "src/sw.js", "src/generated-secret.js", "src/content/engine.js", "src/content/diag-hook.js",
-  "src/content/net-relay.js", "src/main/net-hook.js", "src/main/page.js", "src/lib/netstore.js", "src/lib/redact.js", "src/lib/net-merge.js",
+  "src/content/net-relay.js", "src/main/net-hook.js", "src/main/page.js", "src/lib/netstore.js", "src/lib/redact.js", "src/lib/net-merge.js", "src/lib/activation.js", "src/lib/requests.js",
 ];
 async function diskHash() {
   let h = 5381;

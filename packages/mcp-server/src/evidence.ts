@@ -1,4 +1,4 @@
-import { mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, rmSync, rmdirSync, lstatSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { AppConfig } from "./config.js";
 
@@ -53,18 +53,37 @@ export function writeEvidenceFile(cfg: AppConfig, session: string, tool: string,
   }
 }
 
-/** Remove session directories untouched for longer than retainDays. */
+/** Expire complete records by their own age, even in an active directory.
+ * No JSON path is trusted and no symlink is traversed. A fresh member protects
+ * its whole pair, including the interval between writing image and JSON. */
 export function pruneEvidence(cfg: AppConfig, now = Date.now()): number {
   const root = resolve(cfg.stateDir, "sessions");
+  const cutoff = now - cfg.evidence.retainDays * 86_400_000;
   let removed = 0;
+  if (!Number.isFinite(cutoff) || cfg.evidence.retainDays < 0) return 0;
   try {
-    for (const d of readdirSync(root)) {
-      const p = resolve(root, d);
-      if (now - statSync(p).mtimeMs > cfg.evidence.retainDays * 86_400_000) {
-        rmSync(p, { recursive: true, force: true });
-        removed++;
+    for (const d of readdirSync(root, { withFileTypes: true })) {
+      if (!d.isDirectory() || d.isSymbolicLink()) continue;
+      const dir = resolve(root, d.name);
+      const groups = new Map<string, { path: string; time: number }[]>();
+      for (const f of readdirSync(dir, { withFileTypes: true })) {
+        if (!f.isFile() || !/\.(json|png|jpe?g|har|ndjson)$/i.test(f.name)) continue;
+        const path = resolve(dir, f.name);
+        const st = lstatSync(path);
+        if (!st.isFile() || st.isSymbolicLink()) continue;
+        const base = f.name.replace(/\.(json|png|jpe?g)$/i, "");
+        const group = groups.get(base) ?? [];
+        group.push({ path, time: st.mtimeMs });
+        groups.set(base, group);
       }
+      for (const files of groups.values()) {
+        if (files.every((f) => f.time < cutoff)) {
+          for (const f of files) { rmSync(f.path); removed++; }
+        }
+      }
+      // Non-recursive removal fails safely if a writer adds a fresh record.
+      if (!readdirSync(dir).length) rmdirSync(dir);
     }
-  } catch {}
+  } catch { /* pruning never interrupts browser operations */ }
   return removed;
 }

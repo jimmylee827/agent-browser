@@ -21,6 +21,17 @@ test("\"default\" keeps the old, legacy behaviour", () => {
   assert.equal(r.key, resolveKey("b", "default").key);
 });
 
+test("created-tab ownership survives switching away and transfers with deliberate adoption", () => {
+  const m = new SessionManager();
+  const a = m.get(resolveKey("a"), "a"), b = m.get(resolveKey("b"), "b");
+  a.opened = new Set([10]); m.bind(a, 11);
+  assert.equal(m.ownerOfTab(10), a);
+  m.bind(b, 10);
+  assert.equal(a.opened.has(10), false);
+  assert.equal(b.opened.has(10), true);
+  assert.equal(m.ownerOfTab(10), b);
+});
+
 test("a tab belongs to the session it is bound to", () => {
   const m = new SessionManager();
   const s = m.get(resolveKey("a"), "a");

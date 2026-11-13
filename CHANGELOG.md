@@ -7,6 +7,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- Extension 0.0.12 (no CDP): private browsing, scoped requests and safe activation.
+- Single-strategy robust activation, retained as the primary click engine, with
+  explicit agent-selected recovery strategies and no hidden multi-fire chain.
+- Independent dispatch/observed-outcome reporting; response timeouts retain
+  action evidence instead of declaring a dispatched action "not done".
+- Full-document block-page detection and shared foreground/job host cooldowns,
+  with inspection/status and explicit one-call overrides.
+- Incognito adoption/creation, permission checks, context-safe window handling
+  and persistent-recording disclosure. Private windows share one private jar.
+- Scoped navigation-header overrides, explicit form/fetch POST modes, download
+  status inspection, and shared CLI/MCP command dispatch (`ab tool`, `post`, etc.).
+- One bounded exact target re-lookup, optional strict viewport handling and
+  actionable eval timeout diagnostics. Evidence expiry now reaches individual
+  old records in active sessions, with no storage-size cap.
 - **One window for every agent.** Sessions used to get a window each, and a
   day's work left a stack of them. Every session's tab now shares one agent
   window; the acting session's tab is brought to the front of it for the length

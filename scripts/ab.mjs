@@ -4,7 +4,15 @@
 // --json prints the server's own answer for scripts.
 //
 //   npm run ab -- status
-//   npm run ab -- tabs
+//   npm run ab -- tabs [list|new|switch|close] [--tab ID] [--incognito]
+//   npm run ab -- visit --url URL [--incognito] [--spec request.json] [--json]
+//   npm run ab -- act --spec action.json [--json]
+//   npm run ab -- post --spec request.json [--json]
+//   npm run ab -- downloads [--id ID] [--json]
+//   npm run ab -- cooldowns [--json]
+//   npm run ab -- tool TOOL_NAME --spec arguments.json [--json]
+//     --stdin reads a JSON arguments object; --session NAME selects a persistent terminal session.
+//     These call the same schemas/guards/handlers as MCP. No hidden retry.
 //   npm run ab -- network --tab 123 [--url RE] [--status 4xx] [--type api|all|…] [--bodies] [--limit N]
 //   npm run ab -- network --tab 123 --export har|ndjson
 //   npm run ab -- network --tab 123 --clear
@@ -67,7 +75,7 @@ function die(message, code = 1) {
 async function call(path, init) {
   let r;
   try {
-    r = await fetch(BASE + path, { ...init, signal: AbortSignal.timeout(60_000) });
+    r = await fetch(BASE + path, { ...init, signal: AbortSignal.timeout(180_000) });
   } catch {
     die(`the agent-browser server is not answering on ${BASE} (npm run setup starts it)`, 2);
   }
@@ -290,6 +298,37 @@ commands.secrets = async () => {
   }
   die(`unknown: secrets ${sub}`);
 };
+
+// Terminal mutations go through the registered browser operation rather than
+// a second implementation of policy, session locks or activation semantics.
+const specArgs = () => {
+  let args = {};
+  if (flags.spec || flags.stdin) {
+    try { args = JSON.parse(readFileSync(flags.stdin ? 0 : resolve(String(flags.spec)), "utf8")); }
+    catch { die("--spec/--stdin must contain a JSON arguments object"); }
+    if (!args || typeof args !== "object" || Array.isArray(args)) die("arguments must be an object");
+  }
+  if (flags.session !== undefined) args.session = String(flags.session);
+  if (flags.tab !== undefined) args.tabId = Number(flags.tab);
+  if (flags.url !== undefined) args.url = String(flags.url);
+  if (flags.incognito !== undefined) args.incognito = flags.incognito !== "false";
+  if (flags["override-cooldown"]) args.overrideCooldown = true;
+  return args;
+};
+const operation = async (name, args) => {
+  const r = await call("/command", { method: "POST", headers: { "content-type": "application/json", "x-ab-client": String(flags.client ?? "terminal") }, body: JSON.stringify({ name, args }) });
+  const text = r.content?.find((c) => c.type === "text")?.text;
+  const data = text ? JSON.parse(text) : r;
+  out(data, (d) => console.log(JSON.stringify(d, null, 2)));
+  if (r.isError) process.exitCode = 1;
+};
+commands.visit = () => operation("agent_browser_visit", specArgs());
+commands.act = () => operation("agent_browser_act", specArgs());
+commands.post = () => operation("browser_post", specArgs());
+commands.downloads = () => operation("browser_downloads", { ...(flags.id !== undefined ? { id: Number(flags.id) } : {}) });
+commands.cooldowns = () => operation("browser_cooldowns", {});
+commands.tabs = () => operation("browser_tabs", { ...specArgs(), action: positional[0] ?? "list" });
+commands.tool = () => positional[0] ? operation(positional[0], specArgs()) : die("tool needs a registered tool name");
 
 if (!cmd || cmd === "help" || flags.help || !commands[cmd]) {
   const lines = readFileSync(fileURLToPath(import.meta.url), "utf8").split("\n").slice(1);

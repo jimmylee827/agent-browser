@@ -31,7 +31,7 @@ export interface Front {
   windowId?: number;
 }
 
-export const pooled = (s: Session): boolean => !s.legacy && !s.job && !s.viewport;
+export const pooled = (s: Session): boolean => !s.legacy && !s.job && !s.viewport && !s.incognito;
 
 export class WindowPool {
   private homeId?: number;
@@ -93,8 +93,8 @@ export class WindowPool {
 
   private async alive(windowId: number | undefined): Promise<boolean> {
     if (windowId === undefined) return false;
-    const w = await this.req<{ state?: string }>("engine.windowState", { windowId }).catch(() => null);
-    return !!w && w.state !== "gone";
+    const w = await this.req<{ state?: string; incognito?: boolean }>("engine.windowState", { windowId }).catch(() => null);
+    return !!w && !w.incognito && w.state !== "gone";
   }
 
   /** Home, if it is still open; otherwise an overflow window takes its place. */

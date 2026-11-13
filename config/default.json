@@ -75,6 +75,10 @@
     "redactHeaders": ["authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key", "x-auth-token", "x-csrf-token", "x-xsrf-token", "x-amz-security-token"],
     "redactKeys": "^(pass|pwd|pin|otp|cvv|cvc|csc|ssn|sig|sid|code|auth|jwt|session|signature|cookie|cardnumber|ccnumber|cardcvc)$|password|passwd|passcode|secret|token|apikey|credential|sessionid|privatekey"
   },
+  "browsing": {
+    "comment": "Shared foreground/job pause after strong access-block/rate-limit evidence. Inspection stays available; overrideCooldown is explicit and per call. Does not stop a page's autonomous network traffic.",
+    "cooldownMs": 300000
+  },
   "jobs": {
     "comment": "Background jobs keep a page open in their own window, record the responses that match, and heal it when it stops answering: reload, then navigate again, then reopen the window, then stop and say so. Page loads (scheduled and remedial) are capped per hour. Records go to <stateDir>/jobs/<id>/<date>.ndjson, removed after evidence.retainDays.",
     "enabled": true,
@@ -94,7 +98,7 @@
     "maxBrowserLaunchesPerDay": 6
   },
   "evidence": {
-    "comment": "Each visit and screenshot is recorded under <stateDir>/sessions/<session>/ with a viewport image; directories older than retainDays are removed at startup.",
+    "comment": "Each visit and screenshot is recorded under <stateDir>/sessions/<session>/ with a viewport image; individual evidence records older than retainDays expire at startup and daily, even in active sessions. No size cap.",
     "enabled": true,
     "retainDays": 14
   },

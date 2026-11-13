@@ -38,6 +38,9 @@ export interface Session {
   viewport?: { width: number; height: number; deviceScaleFactor?: number };
   mobile?: boolean;
   sound?: boolean;
+  incognito?: boolean;
+  strictViewport?: boolean;
+  lastUrl?: string;
   lastActor?: string;
   lastActAt?: number;
   lease?: { client: string; until: number };
@@ -104,10 +107,15 @@ export class SessionManager {
 
   /** The session that holds a tab, if any. */
   ownerOfTab(tabId: number): Session | undefined {
-    return this.all().find((s) => s.tabId === tabId);
+    return this.all().find((s) => s.tabId === tabId) ?? this.all().find((s) => s.opened?.has(tabId));
   }
 
   bind(s: Session, tabId: number, windowId?: number): void {
+    // A deliberate transfer must also transfer cleanup ownership, otherwise
+    // releasing the former session could close the newly adopted tab.
+    for (const other of this.all()) {
+      if (other !== s && other.opened?.delete(tabId)) (s.opened ??= new Set()).add(tabId);
+    }
     s.tabId = tabId;
     if (windowId !== undefined) s.windowId = windowId;
   }

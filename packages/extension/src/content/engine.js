@@ -568,6 +568,14 @@
     return { attr };
   }
 
+  async function prepareActivation(p = {}) {
+    const el = resolve(p.ref, p.gen);
+    await ensureActionable(el);
+    pageCfg({ dialog: p.onDialog === "dismiss" ? "dismiss" : "accept", dialogText: p.dialogText ?? null });
+    return { ...markTarget(p), startedAt: Date.now(), nativeNewTabLink: el.tagName === "A" && el.target === "_blank" && !!el.href,
+      passwordField: el.type === "password", host: location.hostname };
+  }
+
   function drawMarks() {
     document.getElementById(AB.names.marks)?.remove();
     const layer = document.createElement("div");
@@ -1226,7 +1234,7 @@
       const e = new Error(
         "HOVER_NOT_EFFECTIVE: hovering changed nothing on the page" +
           (hover.unreadableStylesheets ? ` (${hover.unreadableStylesheets} stylesheet(s) from another origin could not be read, so their :hover rules could not be applied)` : "") +
-          "; a real mouse hover cannot be made without CDP",
+          "; try trusted:true if the native input helper is available",
       );
       e.code = "HOVER_NOT_EFFECTIVE";
       e.detail = { hoverRules: hover.hoverRules, unreadableStylesheets: hover.unreadableStylesheets || 0 };
@@ -1405,6 +1413,15 @@
   }
 
   function detectWall() {
+    // A server-rendered block page has no overlay at all. Require a short
+    // document and a strong title/heading signature, not a word in prose.
+    const pageText = (document.body?.innerText || "").trim();
+    const heading = document.querySelector("h1")?.textContent?.trim() || "";
+    const signature = /^(?:access denied|request (?:blocked|rejected)|you (?:have been|are) blocked|sorry,? you have been blocked|too many requests|rate limit(?: exceeded)?|存取遭拒|訪問被拒絕|访问被拒绝|請求過於頻繁|请求过于频繁)[.!。！\s]*$/i;
+    if (pageText.length < 3000 && pageText.length > 0 && (signature.test(heading) || (!heading && signature.test(document.title)))) {
+      return { reason: /too many|rate limit|頻繁|频繁/i.test(heading || document.title) ? "rate_limit" : "access_block",
+        agentCanFix: false, evidence: { heading, title: document.title, textLength: pageText.length }, rule: "short-document-block-heading" };
+    }
     const frames = [...document.querySelectorAll("iframe")].filter(isCaptchaFrame);
     const roots = overlayRoots();
     // A captcha is a wall wherever it is: no agent can pass it.
@@ -2003,9 +2020,14 @@
         else if (m === "inspect") sendResponse(inspect(msg.params));
         else if (m === "hoverState") sendResponse(hoverState(msg.params));
         else if (m === "pointInView") sendResponse(await pointInView(msg.params));
-        else if (m === "detectWall") sendResponse({ needsHuman: detectWall() });
+        else if (m === "detectWall") sendResponse({ needsHuman: detectWall(), url: location.href, documentGeneration: pageState().documentGeneration });
         else if (m === "diagnostics") sendResponse(diagnostics(msg.params));
         else if (m === "markTarget") sendResponse(markTarget(msg.params));
+        else if (m === "prepareActivation") sendResponse(await prepareActivation(msg.params));
+        else if (m === "activationEvidence") sendResponse({
+          dialogs: dialogList().filter((d) => d.ts >= msg.params.since).map(shapeDialog),
+          credentialStoreBlocked: credentialList().filter((d) => d.ts >= msg.params.since).map(({ what, type, id, ts }) => ({ kind: what, type, id, ts })),
+        });
         else if (m === "clearMarks") {
           clearMarks();
           sendResponse({ ok: true });

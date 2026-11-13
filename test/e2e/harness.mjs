@@ -83,6 +83,7 @@ const escapeHtml = (t) => String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "
 // what authorization arrived), a POST echo, slow and big answers, a poll whose
 // health a test switches (/api/mode?set=up|down|blank), and SSE.
 export const api = { mode: "up", polls: 0 };
+const operationProbes = new Map();
 // The login a job's steps fill in: this password, and the current code of this authenticator seed.
 export const LOGIN = { password: "e2e-pass-Zq81!", seed: "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" };
 const { totp } = await import(resolve(dirname(fileURLToPath(import.meta.url)), "../../packages/mcp-server/dist/secrets.js"));
@@ -92,6 +93,19 @@ const json = (res, code, body, headers = {}) => {
 };
 function apiRoute(req, res, url) {
   const p = url.pathname;
+  if (p === "/api/operation-probe") {
+    const id = url.searchParams.get("id") || "default";
+    const records = operationProbes.get(id) || [];
+    if (req.method !== "POST") return json(res, 200, { count: records.length, records });
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      records.push({ method: req.method, body, headers: req.headers });
+      operationProbes.set(id, records);
+      json(res, 200, { count: records.length, got: body, type: req.headers["content-type"] });
+    });
+    return true;
+  }
   if (p === "/api/items")
     return json(res, 200, { items: [{ id: 1, name: "jacket", price: 480 }, { id: 2, name: "tee", price: 120 }], sawAuthorization: !!req.headers.authorization, token: "srv-secret-token" }, { "Set-Cookie": "sid=server-session; Path=/" });
   if (p === "/api/login") {
@@ -150,6 +164,14 @@ function fixtureServer(port, other) {
     if (url.pathname === "/tone.wav") {
       res.writeHead(200, { "Content-Type": "audio/wav" });
       return res.end(TONE);
+    }
+    if (url.pathname === "/probe-redirect") {
+      res.writeHead(302, { Location: `http://127.0.0.1:${other}/probe-nav` });
+      return res.end();
+    }
+    if (url.pathname === "/probe-nav") {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      return res.end(`<!doctype html><title>Header probe</title><h1>Header probe</h1><pre>${escapeHtml(JSON.stringify({ probe: req.headers["x-ab-probe"] || null, accept: req.headers.accept }))}</pre>`);
     }
     // What the browser said it is, as the server saw it.
     if (url.pathname === "/ua") {

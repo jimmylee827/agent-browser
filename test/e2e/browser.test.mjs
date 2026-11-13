@@ -257,7 +257,7 @@ test("a pointer press and release clicks, and a gesture that does nothing says s
   assert.match((await P("browser_observe", { mode: "read" })).data.text, /continued/);
   const idle = await P("browser_pointer", { sequence: [{ type: "move", x: 1100, y: 850 }] });
   assert.equal(idle.data.changed, false);
-  assert.match(idle.data.warning ?? "", /nothing on the page changed/);
+  assert.match(idle.data.warning ?? "", /no effect observed/);
 });
 
 test("a certificate Chrome does not trust is the person's call, with a picture; a dead address is said plainly", { skip }, async (t) => {

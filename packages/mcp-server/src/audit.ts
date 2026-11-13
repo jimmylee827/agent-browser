@@ -5,6 +5,15 @@ const SECRET_KEYS = /(token|secret|password|cookie|authorization|refresh|access)
 
 /** Shallow redaction so credentials never reach the audit log. */
 function redact(value: unknown): unknown {
+  if (typeof value === "string" && /^https?:\/\//i.test(value)) {
+    try {
+      const url = new URL(value);
+      url.username = ""; url.password = "";
+      for (const k of url.searchParams.keys()) if (SECRET_KEYS.test(k)) url.searchParams.set(k, "[redacted]");
+      if (/(token|secret|password|code|auth)=/i.test(url.hash)) url.hash = "[redacted]";
+      return url.href;
+    } catch { return "[invalid url]"; }
+  }
   if (value == null || typeof value !== "object") return value;
   const out: Record<string, unknown> = Array.isArray(value) ? ([] as never) : {};
   for (const [k, v] of Object.entries(value)) {

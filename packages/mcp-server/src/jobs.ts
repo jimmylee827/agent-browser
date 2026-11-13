@@ -22,6 +22,7 @@ import { evalBlockedBy } from "./policy.js";
 import { decide, freshState, type LadderState, type Observation } from "./ladder.js";
 import { agentChromeRunning, wakeBrowser } from "./host-helper-client.js";
 import type { NetEntry } from "./network.js";
+import type { HostAdmission } from "./host-admission.js";
 import { allowedOn, findSecret, getValue } from "./secrets.js";
 
 export interface CaptureRule {
@@ -305,7 +306,7 @@ export class JobRunner {
   private lastLaunchAt = 0;
 
   constructor(
-    private ctx: { cfg: AppConfig; bridge: Bridge; sessions: SessionManager; audit: Audit },
+    private ctx: { cfg: AppConfig; bridge: Bridge; sessions: SessionManager; audit: Audit; admission?: HostAdmission },
   ) {
     this.file = loadJobs(ctx.cfg);
   }
@@ -452,6 +453,7 @@ export class JobRunner {
     for (let batch = 0; batch < 20; batch++) {
       const r = await this.ctx.bridge.request<{ entries: NetEntry[]; ids: number[] }>("net.drain", { jobId: j.spec.id, olderThanMs: 2000, maxBytes: 2_000_000 });
       if (!r.ids.length) break;
+      this.ctx.admission?.observe(r.entries, `job:${j.spec.id}`);
       const keep = r.entries.filter((e) => !e.url || capture.some((c) => c.url(e.url) && (!c.method || c.method === e.method)) || health?.(e.url));
       append(this.cfg, j.spec.id, `${day(Date.now())}.ndjson`, keep.map((e) => ({ ...e, job: j.spec.id, uid: `${e.tabId}:${e.id}` })));
       await this.ctx.bridge.request("net.ack", { ids: r.ids });
@@ -536,6 +538,25 @@ export class JobRunner {
       return this.save();
     }
     const s = this.ctx.sessions.jobSession(j.spec.id);
+    let currentUrl = j.spec.url;
+    if (s.tabId !== undefined) {
+      const wall = await this.ctx.bridge.request<{ needsHuman?: { reason?: string }; url?: string; documentGeneration?: string }>("engine.detectWall", { tabId: s.tabId }).catch(() => null);
+      currentUrl = wall?.url ?? currentUrl;
+      const reason = wall?.needsHuman?.reason;
+      if (reason === "access_block" || reason === "rate_limit") {
+        this.ctx.admission?.pause(currentUrl, reason, `job:${j.spec.id}`, undefined,
+          `document:${s.tabId}:${wall?.documentGeneration ?? j.state.pageLoadedAt}`);
+      }
+    }
+    try { this.ctx.admission?.check(j.spec.url); this.ctx.admission?.check(currentUrl); }
+    catch (e) {
+      if (codeOf(e) !== "HOST_PAUSED") throw e;
+      if (s.tabId !== undefined) await this.drain(j);
+      j.state.status = "needs-attention";
+      j.state.lastReason = (e as Error).message;
+      this.save();
+      return;
+    }
 
     const first = j.state.status === "starting" && j.state.tabId === undefined;
     let tabAlive = first ? false : await this.ensureTab(j, s);
@@ -562,6 +583,8 @@ export class JobRunner {
     if (ext) j.state.extVersion = ext;
 
     const seen = await this.drain(j);
+    this.ctx.admission?.check(j.spec.url);
+    this.ctx.admission?.check(currentUrl);
     // The job's steps, once per page load, when the page has had time to start.
     if (tabAlive && j.spec.steps?.length && j.state.pageLoadedAt !== undefined && j.state.stepsRanFor !== j.state.pageLoadedAt && now - j.state.pageLoadedAt >= this.settings(j).pageGraceMs) {
       j.state.stepsRanFor = j.state.pageLoadedAt;
@@ -623,6 +646,8 @@ export class JobRunner {
     const tabId = j.state.tabId;
     const req = <T,>(m: string, p: Record<string, unknown> = {}) => this.ctx.bridge.request<T>(m, { ...p, tabId });
     for (const [i, st] of (j.spec.steps ?? []).entries()) {
+      const current = await req<{ tab?: { url?: string } }>("engine.ping");
+      this.ctx.admission?.check(current.tab?.url ?? j.spec.url);
       if (existsSync(resolve(this.cfg.stateDir, "HALT"))) return {};
       const label = `${st.action}${st.name ? ` "${st.name}"` : ""}${st.secret ? ` with secret ${st.secret}` : ""}`;
       const fail = (why: string) => {

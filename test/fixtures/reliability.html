@@ -1,0 +1,14 @@
+<!doctype html><meta charset="utf-8"><title>Reliable activation</title>
+<h1>Reliable activation</h1>
+<button id="fetch">Fetch only</button><button id="late">Delayed fetch</button>
+<button id="normal">Set normal cookie</button><button id="private">Set private cookie</button>
+<script>
+const params = new URLSearchParams(location.search);
+const target = '/api/operation-probe?id=' + encodeURIComponent(params.get('id') || 'default');
+const send = () => fetch(target, {method:'POST', body:'one'});
+document.getElementById('fetch').onclick = send;
+document.getElementById('late').onclick = () => setTimeout(send, 1000);
+const cookie = params.get('cookie') || 'ab_probe';
+document.getElementById('normal').onclick = () => { document.cookie = cookie + '=normal; Path=/; SameSite=Lax'; };
+document.getElementById('private').onclick = () => { document.cookie = cookie + '=private; Path=/; SameSite=Lax'; };
+</script>

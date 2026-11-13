@@ -37,6 +37,7 @@ export interface AppConfig {
   network: NetworkConfig;
   jobs: JobsConfig;
   evidence: { enabled: boolean; retainDays: number };
+  browsing?: { cooldownMs?: number };
   audit: { file: string };
 }
 
@@ -151,12 +152,13 @@ function applyLocal(cfg: AppConfig, local: Partial<AppConfig> | null): AppConfig
   }
   if (local.input) cfg.input = { ...cfg.input, ...local.input };
   if (local.evidence) cfg.evidence = { ...cfg.evidence, ...local.evidence };
+  if (local.browsing) cfg.browsing = { ...cfg.browsing, ...local.browsing };
   return cfg;
 }
 
 // What a person may change in config/local.json while the daemon runs. Ports,
 // paths and secrets are read once, at start.
-const RELOADABLE = ["policy", "eval", "diagnostics", "network", "jobs", "evidence"] as const;
+const RELOADABLE = ["policy", "eval", "diagnostics", "network", "jobs", "evidence", "browsing"] as const;
 
 /**
  * Re-read config/local.json into the config every part of the daemon shares.

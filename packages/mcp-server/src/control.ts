@@ -25,6 +25,7 @@ interface McpHooks {
   makeHttpTransport: () => StreamableHTTPServerTransport;
   /** A client went away: close what it owned. */
   releaseClient: (id: string) => Promise<number>;
+  invokeOperation?: (client: ClientInfo, name: string, args: Record<string, unknown>) => Promise<unknown>;
 }
 
 const readBody = (req: IncomingMessage) =>
@@ -101,6 +102,20 @@ export function startControl(
     }
 
     try {
+      if (url.pathname === "/command" && req.method === "POST" && mcp?.invokeOperation) {
+        const body = JSON.parse((await readBody(req)) || "{}");
+        if (typeof body.name !== "string" || !body.args || typeof body.args !== "object" || Array.isArray(body.args)) return send(res, 400, { error: "name and args object required" });
+        return send(res, 200, await mcp.invokeOperation({ id: header(req, "x-ab-client") ?? "terminal" }, body.name, body.args));
+      }
+      const aliases: Record<string, string> = { "/visit": "agent_browser_visit", "/navigate": "browser_navigate", "/act": "browser_act", "/robust-click": "browser_robust_click" };
+      if (aliases[url.pathname] && mcp?.invokeOperation) {
+        const args = req.method === "POST" ? JSON.parse((await readBody(req)) || "{}") : Object.fromEntries(url.searchParams);
+        // These legacy routes explicitly retain their focused-tab behavior.
+        args.session ??= "default";
+        const result = await mcp.invokeOperation({ id: header(req, "x-ab-client") ?? "terminal" }, aliases[url.pathname], args) as { content?: { type: string; text?: string }[]; isError?: boolean };
+        const text = result.content?.find((c) => c.type === "text")?.text;
+        return send(res, result.isError ? 400 : 200, text ? JSON.parse(text) : result);
+      }
       if (url.pathname === "/status") {
         // The extension's version is what tells a person whether the one in
         // Chrome is the one on disk, so status is useful outside an MCP call.
