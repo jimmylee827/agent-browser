@@ -1,0 +1,34 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Action and visit evidence</title>
+<style>
+  body { font: 16px system-ui; padding: 24px; }
+  dialog { min-width: 350px; padding: 30px; }
+</style>
+<h1 id="result">Public page</h1>
+<button id="background">Continue</button>
+<button id="plan" aria-pressed="false">Select plan</button>
+<button aria-pressed="false">Other plan</button>
+<button id="activity">Activity only</button>
+<button id="verify">Verify count</button>
+<button id="route">Same-document route</button>
+<button>Duplicate</button><button>Duplicate</button>
+<p id="status"></p>
+<dialog id="panel" aria-modal="true">
+  <h2 id="panel-title">Choose a panel</h2>
+  <button id="foreground">Continue</button>
+</dialog>
+<script>
+  const $ = (id) => document.getElementById(id);
+  let count = 0;
+  $("background").onclick = () => { $("result").textContent = "Background chosen"; };
+  $("foreground").onclick = () => { $("result").textContent = "Foreground chosen"; $("panel").close(); };
+  $("plan").onclick = () => { $("plan").setAttribute("aria-pressed", "true"); };
+  $("activity").onclick = () => { $("status").textContent = `Activity ${++count}`; };
+  $("verify").onclick = () => { $("result").textContent = `Count ${count}`; };
+  $("route").onclick = () => history.pushState({}, "", "#routed");
+  if (location.search === "?login") {
+    $("panel").innerHTML = '<h2>Sign in to continue</h2><form><label>Password <input type="password"></label><button>Sign in</button></form>';
+  }
+  $("panel").showModal();
+</script>

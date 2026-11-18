@@ -4,6 +4,7 @@ import type { Bridge } from "./bridge/server.js";
 import type { Audit } from "./audit.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { browserRecovery, hostHelper } from "./host-helper-client.js";
 import { buildStatus } from "./build.js";
 import { rejectBrowserOrigin } from "./http-guard.js";
 import { secondPassRedact, toHar, toNdjson, type NetEntry } from "./network.js";
@@ -116,6 +117,7 @@ export function startControl(
         const text = result.content?.find((c) => c.type === "text")?.text;
         return send(res, result.isError ? 400 : 200, text ? JSON.parse(text) : result);
       }
+      if (url.pathname === "/health") return send(res, 200, { serverRunning: true });
       if (url.pathname === "/status") {
         // The extension's version is what tells a person whether the one in
         // Chrome is the one on disk, so status is useful outside an MCP call.
@@ -123,10 +125,16 @@ export function startControl(
         try {
           onDisk = JSON.parse(readFileSync(resolve(cfg.extensionDir, "manifest.json"), "utf8")).version;
         } catch {}
-        const running = bridge.extension?.version;
+        const connected = bridge.connected();
+        const running = connected ? bridge.extension?.version : undefined;
+        const build = buildStatus();
         return send(res, 200, {
-          bridgeConnected: bridge.connected(),
-          build: buildStatus(),
+          serverRunning: true,
+          bridgeConnected: connected,
+          ready: connected && !build.staleBuild,
+          ...browserRecovery(cfg, bridge).status(),
+          hostHelperReachable: hostHelper.available() && await hostHelper.health(),
+          build,
           repoRoot: cfg.repoRoot,
           extension: running || onDisk ? { running: running ?? null, onDisk, stale: !!running && !!onDisk && running !== onDisk } : undefined,
         });

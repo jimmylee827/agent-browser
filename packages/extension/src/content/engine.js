@@ -863,9 +863,45 @@
     });
   }
 
+  function activeDialog() {
+    const candidates = [...document.querySelectorAll('dialog[open],[role="dialog"],[role="alertdialog"],[aria-modal="true"],.modal.show,.modal.in')]
+      .filter(visible).reverse();
+    return candidates.find((e) => {
+      const r = e.getBoundingClientRect();
+      const x = (Math.max(0, r.left) + Math.min(innerWidth, r.right)) / 2;
+      const y = (Math.max(0, r.top) + Math.min(innerHeight, r.bottom)) / 2;
+      return x >= 0 && x < innerWidth && y >= 0 && y < innerHeight && e.contains(document.elementFromPoint(x, y));
+    });
+  }
+
+  function selectionState(el) {
+    if (typeof el.checked === "boolean") return el.checked;
+    if (el.tagName === "OPTION") return el.selected;
+    for (const key of ["aria-selected", "aria-checked", "aria-pressed"]) {
+      const v = el.getAttribute(key);
+      if (v === "true" || v === "false") return v === "true";
+    }
+  }
+
+  function expectation(p) {
+    const want = p.name.trim().toLowerCase();
+    const dialog = activeDialog();
+    if (p.kind === "heading") {
+      const found = [...(dialog || document).querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]')]
+        .some((e) => visible(e) && (accName(e) || e.innerText || "").trim().toLowerCase() === want);
+      return { state: found ? "present" : "absent" };
+    }
+    const options = [...(dialog || document).querySelectorAll('option,input[type=checkbox],input[type=radio],[aria-selected],[aria-checked],[aria-pressed]')]
+      .filter((e) => (e.tagName === "OPTION" ? visible(e.closest("select")) : visible(e)) && (!p.role || role(e) === p.role) &&
+        (accName(e) || (e.tagName === "OPTION" ? e.label : "")).trim().toLowerCase() === want);
+    const state = options.length === 1 ? selectionState(options[0]) : undefined;
+    return { state: options.length > 1 ? "ambiguous" : state === undefined ? "unobservable" : state ? "present" : "absent" };
+  }
+
   function locate(params = {}) {
-    if (!AB.refs.size) buildTree(params);
-    const want = (params.name || "").toLowerCase();
+    if (!AB.refs.size || params.forAction) buildTree(params);
+    const want = (params.name || "").trim().toLowerCase();
+    const dialog = params.forAction ? activeDialog() : undefined;
     const search = () => {
       const matches = [];
       for (const [r, el] of AB.refs) {
@@ -879,19 +915,29 @@
         const section = AB.sectionOf?.get(el) || "";
         const long = [group, section].filter(Boolean).map((p) => `${p} ${name}`.toLowerCase());
         if (want && !name.toLowerCase().includes(want) && !long.some((l) => l.includes(want))) continue;
-        matches.push({ ref: r, role: role(el), name, ...(group ? { group } : {}), ...(section ? { section } : {}) });
+        const match = { ref: r, role: role(el), name, ...(group ? { group } : {}), ...(section ? { section } : {}) };
+        if (params.forAction) {
+          match.foreground = !!dialog?.contains(el);
+          const box = el.getBoundingClientRect();
+          const doc = el.ownerDocument;
+          const hit = doc.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
+          match.available = visible(el) && !el.matches(":disabled") && !el.closest('[inert],[aria-disabled="true"]') && (!hit || hit === el || el.contains(hit));
+        }
+        matches.push(match);
       }
       // Best match first: the exact name, then one that starts with it, then
       // any that contains it; controls before headings and landmarks. In page
       // order, "Play" found the heading "Player" before the Play button.
-      if (want) {
+      if (want || params.forAction) {
         const rank = (m) => {
           const n = m.name.trim().toLowerCase();
           const longer = [m.group, m.section].filter(Boolean).map((p) => `${p} ${m.name}`.trim().toLowerCase());
           const fit = n === want || longer.includes(want) ? 0 : n.startsWith(want) ? 1 : 2;
           return fit * 2 + (INTERACTIVE.has(m.role) ? 0 : 1);
         };
-        matches.sort((a, b) => rank(a) - rank(b));
+        if (params.forAction) for (const m of matches) m.actionRank =
+          (m.available ? 0 : 30) + (dialog && !m.foreground ? 12 : 0) + rank(m);
+        matches.sort((a, b) => params.forAction ? a.actionRank - b.actionRank : rank(a) - rank(b));
       }
       return matches;
     };
@@ -1194,7 +1240,12 @@
     try {
       const { cx, cy } = await ensureActionable(el);
       switch (p.action) {
-        case "click": await humanClick(el, cx, cy); break;
+        case "click": {
+          const recipient = { kind: "event_recipient", tag: el.tagName.toLowerCase(), role: role(el), name: clip(accName(el), 100) };
+          await humanClick(el, cx, cy);
+          extra.activationTarget = recipient;
+          break;
+        }
         case "hover": hover = await emulateHover(el, cx, cy); break;
         case "drag": extra = await drag(el, p); break;
         case "pointer": extra = await pointerSequence(el, p); break;
@@ -1240,7 +1291,7 @@
       e.detail = { hoverRules: hover.hoverRules, unreadableStylesheets: hover.unreadableStylesheets || 0 };
       throw e;
     }
-    const { drag: dragInfo, rects, value: dragValue, valuenow, note, pointer, ...signalsExtra } = extra;
+    const { drag: dragInfo, rects, value: dragValue, valuenow, note, pointer, activationTarget, ...signalsExtra } = extra;
     return {
       acted: true,
       action: p.action,
@@ -1251,6 +1302,7 @@
       ...(hover ? { hover: { emulated: true, hoverRules: hover.hoverRules, ...(hover.unreadableStylesheets ? { unreadableStylesheets: hover.unreadableStylesheets } : {}) } } : {}),
       ...(dragInfo ? { drag: dragInfo, rects, ...(dragValue ? { value: dragValue } : {}), ...(valuenow ? { valuenow } : {}), ...(note ? { note } : {}) } : {}),
       ...(pointer ? { pointer } : {}),
+      ...(activationTarget ? { activationTarget } : {}),
       ...(dialogs.length ? { dialogs } : {}),
       ...(credentialStoreBlocked.length ? { credentialStoreBlocked } : {}),
       ...(el.type === "password" && ["type", "fill"].includes(p.action) ? { passwordField: true, host: location.host } : {}),
@@ -1437,6 +1489,15 @@
       };
     }
     for (const root of roots) {
+      const loginHeading = root.getAttribute("aria-label") || root.querySelector("h1,h2,h3,[role=heading]")?.textContent?.trim() || "";
+      const prompt = /(?:^|\b)(?:sign[ -]?in|log[ -]?in|sign in to continue|please sign in)(?:$|\b)|登入|登錄|登录/.test(loginHeading.toLowerCase());
+      const password = [...root.querySelectorAll('input[type="password"]')].some(visible);
+      const r = root.getBoundingClientRect();
+      const central = document.elementFromPoint(innerWidth / 2, innerHeight / 2);
+      if (prompt && password && r.width >= innerWidth * 0.2 && central && root.contains(central) &&
+          (root.matches('dialog:modal,[aria-modal="true"],.modal.show,.modal.in') || !!fixedAncestor(root))) {
+        return { reason: "login", agentCanFix: false, node: { ref: refFor(root), role: role(root) || "dialog", name: clip(loginHeading, 80) }, rule: "foreground-login-form" };
+      }
       // A notice or banner is short. A fixed layer holding a whole app is
       // not a wall, whatever words its content happens to contain.
       const full = root.innerText || "";
@@ -1459,7 +1520,7 @@
 
   const wallError = (wall, what) => {
     const e = new Error(
-      `NEEDS_HUMAN: ${what} — ${wall.reason === "captcha" ? "a captcha" : "a notice"} blocks the page` +
+      `NEEDS_HUMAN: ${what} — ${wall.reason === "captcha" ? "a captcha" : wall.reason === "login" ? "a login form" : "a notice"} blocks the page` +
         (wall.dismiss && wall.agentCanFix ? ` (dismiss it: ref ${wall.dismiss.ref} "${wall.dismiss.name}")` : ""),
     );
     e.code = wall.agentCanFix ? "OCCLUDED" : "NEEDS_HUMAN";
@@ -1494,7 +1555,7 @@
     }
     if (blocker) {
       const wall = detectWall();
-      if (wall && (wall.reason === "captcha" || AB.refs.get(wall.node.ref)?.contains(blocker))) throw wallError(wall, "the element is covered");
+      if (wall && (wall.reason === "captcha" || AB.refs.get(wall.node?.ref)?.contains(blocker))) throw wallError(wall, "the element is covered");
       const e = new Error(`OCCLUDED: the element is covered by ${selectorOf(blocker)}`);
       e.code = "OCCLUDED";
       e.detail = { occludedBy: selectorOf(blocker), occluder: nodeInfo(blocker) };
@@ -1995,6 +2056,11 @@
           sendResponse({
             pong: true, url: location.href, title: document.title, ts: Date.now(),
             documentGeneration: pageState().documentGeneration,
+            ...(msg.params?.navigationTiming ? (() => {
+              const timing = performance.getEntriesByType("navigation")[0];
+              const status = timing?.type !== "back_forward" && timing?.activationStart === 0 ? timing?.responseStatus : undefined;
+              return Number.isInteger(status) && status > 0 ? { navigationStatus: status } : {};
+            })() : {}),
             // Whether this document's traffic is being recorded: one opened
             // before capture was switched on (or on a blocked host) is not.
             netHook: !!window.__abNetRelay?.hooked,
@@ -2020,6 +2086,7 @@
         else if (m === "inspect") sendResponse(inspect(msg.params));
         else if (m === "hoverState") sendResponse(hoverState(msg.params));
         else if (m === "pointInView") sendResponse(await pointInView(msg.params));
+        else if (m === "expectation") sendResponse(expectation(msg.params));
         else if (m === "detectWall") sendResponse({ needsHuman: detectWall(), url: location.href, documentGeneration: pageState().documentGeneration });
         else if (m === "diagnostics") sendResponse(diagnostics(msg.params));
         else if (m === "markTarget") sendResponse(markTarget(msg.params));

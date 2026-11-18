@@ -38,6 +38,7 @@ export class Bridge {
   private pending = new Map<string, Pending>();
   /** What the connected extension said it is. */
   extension?: { version?: string };
+  connectionEpoch = 0;
 
   constructor(
     private cfg: AppConfig,
@@ -83,6 +84,7 @@ export class Bridge {
         }
         authed = true;
         this.client = ws;
+        this.connectionEpoch++;
         this.extension = msg.extension;
         this.audit.log("bridge.connected", { ip });
         // What the extension needs from the config: where console capture may

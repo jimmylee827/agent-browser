@@ -105,6 +105,9 @@ async function tabFor(params = {}) {
 
 // Top-frame commits per tab, so a caller can tell the page changed under it.
 const NAV_COUNT = new Map();
+const TOP_COMMIT = new Map();
+const TOP_RESPONSE = new Map();
+const TOP_ROUTE = new Map();
 // Tabs opened from another tab (target=_blank, window.open), newest last.
 const OPENED = [];
 chrome.tabs.onCreated.addListener(async (t) => {
@@ -125,6 +128,9 @@ chrome.webNavigation.onCreatedNavigationTarget.addListener((d) => {
 });
 chrome.tabs.onRemoved.addListener((id) => {
   NAV_COUNT.delete(id);
+  TOP_COMMIT.delete(id);
+  TOP_RESPONSE.delete(id);
+  TOP_ROUTE.delete(id);
   netstore.clearTab(id, { keepPending: true }).catch(() => {});
   if (MOBILE.delete(id)) chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [ruleIdFor(id)] }).catch(() => {});
 });
@@ -504,6 +510,10 @@ if (chrome.webRequest) {
   }, all, ["requestHeaders"]);
   chrome.webRequest.onCompleted.addListener((d) => {
     if (d.tabId < 0) return;
+    // Keep only status metadata, keyed by the browser's actual document ID.
+    // An absent ID cannot be safely inferred from URL (reloads reuse it).
+    if (d.frameId === 0 && d.type === "main_frame" && d.documentId && NETCFG?.enabled && !hostBlocked(d.url))
+      TOP_RESPONSE.set(d.tabId, { documentId: d.documentId, status: d.statusCode, ts: d.timeStamp });
     wireFinish(d, { status: d.statusCode, statusLine: d.statusLine, responseHeaders: d.responseHeaders, fromCache: d.fromCache, ip: d.ip });
   }, all, ["responseHeaders"]);
   chrome.webRequest.onErrorOccurred.addListener((d) => {
@@ -1320,9 +1330,18 @@ async function dispatch(method, params) {
 
   const tab = await tabFor(params);
   if (method === "engine.ping") {
-    const pong = await callEngine(tab.id, "ping", params).catch((e) => ({
+    const commit = TOP_COMMIT.get(tab.id);
+    const route = TOP_ROUTE.get(tab.id);
+    const response = TOP_RESPONSE.get(tab.id);
+    const captureStatus = !!NETCFG?.enabled && !hostBlocked(tab.url || "");
+    const pong = await callEngine(tab.id, "ping", { ...params, navigationTiming: captureStatus && !!commit && commit.url === tab.url && !route }).catch((e) => ({
       error: String(e.message || e),
     }));
+    const { navigationStatus, ...engine } = pong;
+    const current = TOP_COMMIT.get(tab.id) === commit && TOP_ROUTE.get(tab.id) === route;
+    const status = current && captureStatus && commit && !route && commit.url === tab.url &&
+      (response?.documentId === commit.id && response.ts >= commit.ts - 1000 ? response.status : navigationStatus);
+    const httpStatus = Number.isInteger(status) && status >= 100 && status <= 599 ? status : undefined;
     // `status` ("loading" | "complete") is the honest signal that a click
     // already started something — a pending navigation hasn't changed the URL
     // yet, so without it a successful click looks identical to a dead one.
@@ -1330,9 +1349,11 @@ async function dispatch(method, params) {
       sw: "ok",
       tab: {
         id: tab.id, url: tab.url, title: tab.title, status: tab.status, windowId: tab.windowId, incognito: !!tab.incognito, navCount: NAV_COUNT.get(tab.id) || 0,
+        ...(commit ? { documentId: commit.id } : {}),
+        ...(typeof httpStatus === "number" ? { httpStatus, responseCommitAt: commit.ts } : {}),
         ...(LOAD_ERROR.has(tab.id) ? { loadError: LOAD_ERROR.get(tab.id) } : {}),
       },
-      engine: pong,
+      engine,
     };
   }
   if (method === "engine.observe") {
@@ -1484,6 +1505,8 @@ chrome.webNavigation.onCommitted.addListener((d) => {
   if (MOBILE.has(d.tabId))
     chrome.scripting.executeScript({ target: { tabId: d.tabId, frameIds: [d.frameId] }, world: "MAIN", injectImmediately: true, func: mobilePatch, args: [MOBILE.get(d.tabId).ua] }).catch(() => {});
   if (d.frameId !== 0) return;
+  TOP_COMMIT.set(d.tabId, { id: d.documentId, url: d.url, ts: d.timeStamp });
+  TOP_ROUTE.delete(d.tabId);
   recordNav(d.url, d.tabId); // so redirect-based flows can be inspected after the fact
   NAV_COUNT.set(d.tabId, (NAV_COUNT.get(d.tabId) || 0) + 1);
   ensureConnected(); // navigation wakes the SW — opportunistically (re)connect
@@ -1519,11 +1542,13 @@ chrome.tabs.onRemoved.addListener((id) => LOAD_ERROR.delete(id));
 // A same-document route change (pushState, a hash route) is a navigation too.
 chrome.webNavigation.onHistoryStateUpdated.addListener((d) => {
   if (d.frameId !== 0) return;
+  TOP_ROUTE.set(d.tabId, d.url);
   recordNav(d.url, d.tabId);
   NAV_COUNT.set(d.tabId, (NAV_COUNT.get(d.tabId) || 0) + 1);
 });
 chrome.webNavigation.onReferenceFragmentUpdated.addListener((d) => {
   if (d.frameId !== 0) return;
+  TOP_ROUTE.set(d.tabId, d.url);
   recordNav(d.url, d.tabId);
   NAV_COUNT.set(d.tabId, (NAV_COUNT.get(d.tabId) || 0) + 1);
 });

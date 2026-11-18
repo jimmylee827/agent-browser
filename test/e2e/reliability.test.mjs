@@ -111,6 +111,57 @@ test("CLI dispatch uses the same registered handler and JSON output", { skip }, 
   assert.ok(Array.isArray(JSON.parse(r.stdout).pauses));
 });
 
+test("visit uses the final document status, not a background HTTP error", { skip }, async () => {
+  const page = await A("agent_browser_visit", { url: h.url("visit-evidence/background"), snapshot: "none" });
+  assert.equal(page.data.visit?.kind, "content", JSON.stringify(page.data));
+  assert.equal(page.data.visit.httpStatus, 200);
+  const denied = await A("agent_browser_visit", { url: h.url("visit-evidence/redirect"), snapshot: "none" });
+  assert.equal(denied.data.outcome, "blocked", JSON.stringify(denied.data));
+  assert.equal(denied.data.visit.httpStatus, 403);
+  assert.ok(denied.data.url.endsWith("/denied"));
+  assert.ok(denied.data.degraded.length);
+  const reload = await A("agent_browser_visit", { history: "reload", snapshot: "none" });
+  assert.equal(reload.data.visit?.httpStatus, 403, JSON.stringify(reload.data));
+});
+
+test("failed main-document transport is not a landed HTTP error", { skip }, async () => {
+  const r = await A("agent_browser_visit", { url: h.url("visit-evidence/disconnect"), snapshot: "none" });
+  assert.equal(r.isError, true, JSON.stringify(r.data));
+  assert.equal(r.data.code, "LOAD_FAILED", JSON.stringify(r.data));
+  assert.equal(r.data.visit?.kind, "transport_failure");
+  assert.equal(r.data.visit?.httpStatus, undefined);
+});
+
+test("visible sign-in form is a human gate, not empty content", { skip }, async () => {
+  const r = await A("agent_browser_visit", { url: h.url("evidence.html?login"), snapshot: "none" });
+  assert.equal(r.data.visit?.kind, "login_required", JSON.stringify(r.data));
+  assert.equal(r.data.outcome, "needs_human");
+  assert.match(r.data.visit.nextStep, /user to sign in/);
+});
+
+test("single action distinguishes foreground, selection, weak mutation and route evidence", { skip }, async () => {
+  await A("agent_browser_visit", { url: h.url("evidence.html") });
+  const foreground = await A("agent_browser_act", { name: "Continue", role: "button", expect: { kind: "heading", name: "Foreground chosen" } });
+  assert.equal(foreground.data.expectation?.state, "satisfied", JSON.stringify(foreground.data));
+  assert.equal(foreground.data.activationTarget?.tag, "button");
+  const selected = await A("agent_browser_act", { name: "Select plan", expect: { kind: "selected", name: "Select plan" } });
+  assert.equal(selected.data.expectation?.state, "satisfied", JSON.stringify(selected.data));
+  const quiet = await A("agent_browser_act", { name: "Activity only", expect: { kind: "selected", name: "Other plan" }, snapshot: "none" });
+  assert.equal(quiet.data.expectation?.state, "unmet", JSON.stringify(quiet.data));
+  assert.equal(quiet.data.evidenceStrength, "activity_only");
+  assert.equal(quiet.data.automaticRetryAllowed, false);
+  const check = await A("agent_browser_act", { name: "Verify count", expect: { kind: "heading", name: "Count 1" } });
+  assert.equal(check.data.expectation?.state, "satisfied", JSON.stringify(check.data));
+  const moved = await A("agent_browser_act", { name: "Same-document route", expect: { kind: "url", includes: "#routed" }, snapshot: "none" });
+  assert.equal(moved.data.navigation, "route", JSON.stringify(moved.data));
+  assert.equal(moved.data.navigated, true);
+  assert.equal(moved.data.signals.navigated, true);
+  const tie = await A("agent_browser_act", { name: "Duplicate", role: "button" });
+  assert.equal(tie.data.code, "AMBIGUOUS_MATCH", JSON.stringify(tie.data));
+  assert.equal(tie.data.dispatch, "not_dispatched");
+  assert.equal(tie.data.candidates.length, 2);
+});
+
 test("ordinary article is not blocked; static block pauses subsequent host actions", { skip }, async () => {
   const article = await A("agent_browser_visit", { url: h.url("block-article.html") });
   assert.notEqual(article.data.outcome, "blocked");

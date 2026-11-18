@@ -6,11 +6,11 @@ import { activateOnce } from "../../packages/extension/src/lib/activation.js";
 function harness({ react = false, form = false, delay = 0 } = {}) {
   let requests = 0;
   const fire = () => delay ? setTimeout(() => requests++, delay) : requests++;
-  const el = { type: "submit", removeAttribute() {}, getAttribute() { return null; },
+  const el = { tagName: "BUTTON", type: "submit", removeAttribute() {}, getAttribute() { return null; },
     closest() { return this.form; }, getBoundingClientRect() { return { left: 0, top: 0, width: 80, height: 30 }; },
     focus() {}, click: fire, dispatchEvent(e) { if (e.type === "click") fire(); } };
   if (react) el.__reactProps$test = { onClick: fire };
-  if (form) el.form = { requestSubmit: fire };
+  if (form) el.form = { tagName: "FORM", requestSubmit: fire };
   const ctx = vm.createContext({ document: { querySelector: () => el, documentElement: {} }, location: { href: "https://example.test/" },
     window: {}, MutationObserver: class { observe() {} disconnect() {} },
     MouseEvent: class { constructor(type) { this.type = type; } }, PointerEvent: class { constructor(type) { this.type = type; } },
@@ -24,6 +24,7 @@ for (const strategy of ["auto", "pointer", "native", "react", "form"]) {
     assert.equal(h.count(), 1);
     assert.equal(r.dispatch, "completed");
     assert.equal(r.strategies.length, 1);
+    assert.equal(r.activationTarget.tag, strategy === "form" ? "form" : "button");
   });
 }
 test("fetch-only/late handler: no visible effect never triggers replay", async () => {

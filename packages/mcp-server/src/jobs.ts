@@ -20,7 +20,7 @@ import type { Session, SessionManager } from "./sessions.js";
 import { AbError, codeOf } from "./errors.js";
 import { evalBlockedBy } from "./policy.js";
 import { decide, freshState, type LadderState, type Observation } from "./ladder.js";
-import { agentChromeRunning, wakeBrowser } from "./host-helper-client.js";
+import { browserRecovery } from "./host-helper-client.js";
 import type { NetEntry } from "./network.js";
 import type { HostAdmission } from "./host-admission.js";
 import { allowedOn, findSecret, getValue } from "./secrets.js";
@@ -337,7 +337,7 @@ export class JobRunner {
   start(): void {
     // Each job resumes where it was: the tick finds its tab again, or opens one.
     for (const j of this.file.jobs) if (j.spec.enabled) this.schedule(j, 2000);
-    this.supervisor = setInterval(() => void this.supervise(), 30_000);
+    this.supervisor = setInterval(() => void this.supervise().catch((e) => this.ctx.audit.log("jobs.recovery_error", { error: String(e) })),  30_000);
     this.supervisor.unref();
   }
 
@@ -738,11 +738,11 @@ export class JobRunner {
     if (now - downSince < this.cfg.jobs.bridgeDownRecoverAfterMs || now - this.lastLaunchAt < 10 * 60_000) return;
     this.file.launches = this.file.launches.filter((t) => t > now - DAY && t <= now);
     if (this.file.launches.length >= this.cfg.jobs.maxBrowserLaunchesPerDay) return;
-    const running = agentChromeRunning(this.cfg.profileDir);
     this.lastLaunchAt = now;
+    const result = await browserRecovery(this.cfg, this.ctx.bridge).ensure(45_000);
+    if (!result.attempted) return;
     this.file.launches.push(now);
     this.save();
-    const via = await wakeBrowser(this.cfg.profileDir, this.cfg.extensionDir);
-    this.ctx.audit.log("jobs.recover_browser", { reason: running ? "chrome running with no agent window" : "chrome not running", via, attempt: this.file.launches.length });
+    this.ctx.audit.log("jobs.recover_browser", { via: result.wake?.via, outcome: result.state, attempt: this.file.launches.length });
   }
 }

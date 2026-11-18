@@ -33,3 +33,20 @@ export function httpUrl(value: string): URL {
     throw new AbError("BAD_REQUEST", "target must be HTTP(S), without URL credentials");
   return url;
 }
+
+export type ExpectationProbe = { state: "present" | "absent" | "ambiguous" | "unobservable" };
+export function expectationResult(before: ExpectationProbe, after: ExpectationProbe, pending: boolean) {
+  const state = after.state === "present" ? before.state === "present" ? "already_true" : before.state === "absent" ? "satisfied" : "true_after"
+    : after.state === "ambiguous" || after.state === "unobservable" ? after.state : pending ? "pending" : "unmet";
+  return { state, before: before.state, after: after.state };
+}
+
+export function navigationEvidence(before: { url?: string; documentId?: string; navCount?: number } | undefined,
+  after: { url?: string; documentId?: string; navCount?: number } | undefined, switched: boolean) {
+  if (switched) return "new_tab";
+  if (before?.documentId && after?.documentId)
+    return before.documentId !== after.documentId ? "document" : before.url !== after.url || before.navCount !== after.navCount ? "route" : "none";
+  if (after?.url && before?.url !== after.url) return "url_changed";
+  if (before?.navCount !== undefined && after?.navCount !== undefined && before.navCount !== after.navCount) return "navigation_observed";
+  return "none";
+}

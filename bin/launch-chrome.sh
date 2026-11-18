@@ -9,10 +9,10 @@ CFG="$ROOT/config/default.json"
 
 expand() { local p="$1"; echo "${p/#\~/$HOME}"; }
 
-PROFILE_DIR="$(expand "$(jq -r .profileDir "$CFG")")"
+PROFILE_DIR="${AB_PROFILE_DIR:-$(expand "$(jq -r .profileDir "$CFG")")}"
 EXT_DIR="$ROOT/packages/extension"
 
-CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+CHROME="${AB_CHROME_BIN:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
 [[ -x "$CHROME" ]] || { echo "Google Chrome not found at expected path." >&2; exit 1; }
 
 mkdir -p "$PROFILE_DIR"

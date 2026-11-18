@@ -237,12 +237,14 @@ element and a screenshot; Chrome's certificate warning comes back as
 | `browser_scroll({to \| y})` | Scroll; reports `atBottom` and how much an infinite feed grew. |
 | `browser_wait({text? \| name? \| role?, gone?} \| {response})` | Wait for text or an element to appear or go; for a response (`{urlPattern}`, up to 5 minutes, returned parsed); with none, for the page to go quiet. |
 | `agent_browser_status()` | Is the browser ready? No side effects. |
-| `agent_browser_ensure_running()` | Idempotent launch (auto-fires on first visit). |
+| `agent_browser_ensure_running()` | One recovery attempt per outage/profile state. If the extension is disabled, stop and follow the human action; retries do not open more windows. |
 
 `action` is one of `click | type | fill | clear | press | hover | focus |
 check | uncheck | submit | select | drag`. Name matching is case-insensitive:
 an exact name wins over a prefix, a prefix over a substring, a control over a
-heading; pass `role` when a name is still ambiguous.
+heading. For named actions, available controls in the foreground dialog take
+precedence over background matches. Equally ranked duplicate controls fail
+before dispatch and return candidates; narrow the name/role or use a candidate ref.
 
 Events are synthetic (`isTrusted: false`) — the price of having no CDP. Hover
 applies the page's own `:hover` rules and fails with `HOVER_NOT_EFFECTIVE` when
@@ -250,6 +252,21 @@ nothing changes; drag works with pointer capture and HTML5 drag-and-drop. Things
 that need a real user gesture — `video.play()` with sound, `requestFullscreen` —
 are refused by Chrome, and the refusal shows up in `diagnostics`. `snapshot` is `full`
 (default), `viewport`, or `none` — use the smaller ones for a run of fills.
+
+A visit returns `visit.kind` and, when observed for the final committed main
+document, `visit.httpStatus`. A failed background request is not the document's
+status. `login_required` and `challenge` are human handoffs in the same tab;
+`access_blocked` is a stop signal. An unreadable document is not verified content.
+
+`agent_browser_act` can check an explicit outcome, for example
+`expect: {kind: "selected", name: "1200M"}`, `expect: {kind: "heading", name:
+"Order summary"}`, or `expect: {kind: "url", includes: "/summary"}`. The
+`expectation` result distinguishes `satisfied`, `already_true`, `true_after`
+(without a known baseline), `unmet`, `pending`, `ambiguous`, and `unobservable`.
+`activationTarget`, when available, describes the recipient of the synthetic
+event or the chosen invocation target, not a verified OS hit. `evidenceStrength:
+"activity_only"` means mutations or a response were observed but no specific
+outcome was established. Nothing in the result authorizes an automatic replay.
 
 ### Advanced primitives
 
@@ -487,6 +504,13 @@ Viewport results expose requested and achieved dimensions. Best effort warns;
 dispatch on mismatch. Set it false to accept best effort. Eval timeout errors
 name `timeoutMs` (default 5000, range 100–25000); stopping the wait does not
 necessarily stop the underlying page operation.
+
+Regular tabs share sign-ins in the persistent agent profile. Closing a tab or
+ending a session does not erase the profile or all evidence. Screenshots and
+session evidence are under `~/.agent-chrome/sessions/`; job captures are under
+`~/.agent-chrome/jobs/`; the activity log is `~/.agent-chrome/audit.log` and
+is not pruned by the evidence-retention setting. Choose capture/retention in
+`config/local.json`; retain or remove exported files separately as needed.
 
 Automatic evidence expires per record/image pair after `evidence.retainDays`
 (default 14), including inside active session directories. Standalone exports

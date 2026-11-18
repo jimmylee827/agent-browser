@@ -68,38 +68,12 @@ async function status() {
   }
 }
 
-/** The agent profile's Chrome, running now? */
-const chromeRunning = () => {
+async function registration(current) {
+  if (current?.extensionRegistration) return current.extensionRegistration;
   try {
-    execFileSync("pgrep", ["-f", `user-data-dir=${PROFILE}`], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
-};
-
-/**
- * Is Agent Bridge loaded into the agent profile, and switched on? Read from
- * the profile's own record of its extensions, so "not connected" can say which
- * step is missing: jmaxi's extension was loaded and enabled, and setup still
- * told the person to Load unpacked. null when the profile can't be read.
- */
-function installedExtension() {
-  for (const file of ["Secure Preferences", "Preferences"]) {
-    let prefs;
-    try {
-      prefs = JSON.parse(readFileSync(resolve(PROFILE, "Default", file), "utf8"));
-    } catch {
-      continue;
-    }
-    const entry = Object.values(prefs?.extensions?.settings || {}).find((e) => e?.path && resolve(e.path) === EXTENSION);
-    if (entry) {
-      const reasons = entry.disable_reasons;
-      return { loaded: true, enabled: !(Array.isArray(reasons) ? reasons.length : reasons) && entry.state !== 0 };
-    }
-    if (prefs?.extensions?.settings) return { loaded: false };
-  }
-  return null;
+    const { extensionRegistration } = await import("../packages/mcp-server/dist/readiness.js");
+    return extensionRegistration(PROFILE, EXTENSION);
+  } catch { return "unknown"; }
 }
 
 function chromeBinary() {
@@ -197,36 +171,28 @@ if (!CHECK && mac) {
 
 // ----------------------------------------------------------------- browser
 
-let connected = false;
-if (!CHECK) {
+const before = await status();
+if (!CHECK && before?.repoRoot && resolve(before.repoRoot) !== root) {
+  record("This install", "fail", `another agent-browser is already running from ${before.repoRoot}`);
+  console.error("\nUse that install, or stop its server before running setup here.");
+  process.exit(1);
+}
+if (!CHECK && before && !before.bridgeConnected) {
   step("Browser");
-  // The extension connecting is what proves the whole chain works. It drops
-  // briefly while it reloads itself, so a missed window is retried.
-  const waitConnected = async (tries) => {
-    for (let i = 0; i < tries && !connected; i++) {
-      await sleep(500);
-      connected = !!(await status())?.bridgeConnected;
-    }
-  };
-  const launch = () => spawn("bash", [resolve(root, "bin/launch-chrome.sh")], { detached: true, stdio: "ignore", cwd: root }).unref();
-  if (!chromeRunning()) {
-    launch();
-    record("Chrome", "ok", "launched on the agent profile");
-  } else {
-    // A running Chrome is not a running extension. On macOS, closing the
-    // agent profile's last window unloads the profile and its extension while
-    // the app stays up (jmaxi sat like that for hours, and setup waited on it
-    // and gave up). Launching again opens a window in that Chrome, which
-    // loads the profile back.
-    await waitConnected(16);
-    if (connected) record("Chrome", "ok", "already running on the agent profile");
-    else {
-      launch();
-      record("Chrome", "ok", "running with no window open: opened one");
-    }
+  // Setup, the CLI, MCP clients and jobs share the daemon's one-wake limit.
+  try {
+    const response = await fetch(`${BASE}/command`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "agent_browser_ensure_running", args: {} }),
+      signal: AbortSignal.timeout(60_000),
+    });
+    const body = await response.json();
+    const result = JSON.parse(body.content?.find((c) => c.type === "text")?.text ?? "{}");
+    if (result.bridgeConnected) record("Bridge", "ok", "connected");
+    else record("Bridge", "warn", result.humanAction ?? result.recovery ?? "look at npm run doctor; no second wake was attempted");
+  } catch {
+    record("Bridge", "warn", "could not confirm browser recovery; check npm run doctor before retrying");
   }
-  await waitConnected(120);
-  if (!connected) await waitConnected(20);
 }
 
 // ------------------------------------------------------------- verification
@@ -239,11 +205,14 @@ if (!CHECK && final?.repoRoot && resolve(final.repoRoot) !== root) {
   console.error(`\nStop that one first (\`npm run mcp:stop\` there), or use this install instead of a second clone.\n`);
   process.exit(1);
 }
-connected = connected || !!final?.bridgeConnected;
+const connected = !!final?.bridgeConnected;
 const ext = final?.extension;
+const installed = await registration(final);
 const versionOnDisk = JSON.parse(readFileSync(resolve(EXTENSION, "manifest.json"), "utf8")).version;
 
 if (!CHECK) step("Result");
+else record("Server", final ? "ok" : "fail", final ? BASE : "not reachable");
+if (typeof final?.chromeRunning === "boolean") record("Agent Chrome", final.chromeRunning ? "ok" : "warn", final.chromeRunning ? "running" : "not running");
 if (final?.build) {
   final.build.staleBuild
     ? record("Server build", "warn", `running ${final.build.running} but ${final.build.onDisk} is on disk: ${final.build.restart}`)
@@ -258,9 +227,7 @@ if (connected) {
   record(
     "Extension",
     CHECK ? "fail" : "warn",
-    CHECK && chromeRunning()
-      ? "not connected, though Chrome is running: with no agent window open its extension is unloaded, and `npm run setup` opens one"
-      : "not connected",
+    installed === "disabled" ? "installed but disabled" : installed === "missing" ? "not installed" : "not connected",
   );
 }
 
@@ -302,25 +269,25 @@ if (!CHECK && has("claude")) {
 // ------------------------------------------------------------------ summary
 
 if (!connected) {
-  const installed = installedExtension();
   const again = `Then run \`npm run setup\` again (it will say Extension: connected), or
 \`npm run doctor\` to check without changing anything.`;
+  if (final?.nextStep) console.log(`\nNext: ${final.nextStep}\n`);
   console.log(final?.extension?.stale
     ? `
 \x1b[1mThe extension did not reconnect after its update.\x1b[0m Reload it once: chrome://extensions → Reload ↻ on Agent Bridge.
 `
-    : installed?.loaded && !installed.enabled
+    : installed === "disabled"
     ? `
 \x1b[1mAgent Bridge is loaded but switched off.\x1b[0m In the agent Chrome: chrome://extensions → switch Agent Bridge on.
 
 ${again}
 `
-    : installed?.loaded
+    : installed === "enabled" || installed === "unknown"
     ? `
-\x1b[1mAgent Bridge is loaded but did not connect.\x1b[0m In the agent Chrome:
+\x1b[1mAgent Bridge did not connect.\x1b[0m In the agent Chrome:
 
   1. Keep a window open (\`npm run launch\` opens one): with none, Chrome unloads the extension
-  2. If it still says not connected: chrome://extensions → Reload ↻ on Agent Bridge, and
+  2. If the card is present and enabled but still not connected: Reload ↻ on Agent Bridge, and
      open its "Errors" button if it shows one
 
 ${again}
@@ -334,8 +301,8 @@ ${again}
 
 ${again}
 `);
-  if (!CHECK) {
-    // Open the page for them, as a tab in the agent Chrome.
+  if (!CHECK && installed === "missing") {
+    // Explicit setup can open the install page for a missing extension.
     if (chrome && mac) spawn(chrome, [`--user-data-dir=${PROFILE}`, "chrome://extensions"], { detached: true, stdio: "ignore" }).unref();
   }
 }

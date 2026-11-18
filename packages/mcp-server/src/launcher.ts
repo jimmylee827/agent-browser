@@ -65,8 +65,11 @@ async function localToolList() {
 
 async function daemonUp(): Promise<boolean> {
   try {
-    const r = await fetch(`${BASE}/status`, { signal: AbortSignal.timeout(800) });
-    return r.ok;
+    const signal = AbortSignal.timeout(800);
+    const r = await fetch(`${BASE}/health`, { signal });
+    if (r.ok) return true;
+    // Older daemons have no cheap health route yet.
+    return r.status === 404 && (await fetch(`${BASE}/status`, { signal })).ok;
   } catch {
     return false;
   }

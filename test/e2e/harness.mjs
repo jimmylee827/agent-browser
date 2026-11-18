@@ -165,6 +165,19 @@ function fixtureServer(port, other) {
       res.writeHead(200, { "Content-Type": "audio/wav" });
       return res.end(TONE);
     }
+    if (url.pathname === "/visit-evidence/disconnect") return req.socket.destroy();
+    if (url.pathname === "/visit-evidence/redirect") {
+      res.writeHead(302, { Location: "/visit-evidence/denied" });
+      return res.end();
+    }
+    if (url.pathname === "/visit-evidence/denied") {
+      res.writeHead(403, { "Content-Type": "text/html; charset=utf-8" });
+      return res.end("<!doctype html><title>Security notice</title><h1>Network security policy</h1><p>This route cannot be displayed.</p>");
+    }
+    if (url.pathname === "/visit-evidence/background") {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      return res.end(`<h1>Public content</h1><a href="#signin">Sign in</a><script>fetch('/visit-evidence/denied')</script>`);
+    }
     if (url.pathname === "/probe-redirect") {
       res.writeHead(302, { Location: `http://127.0.0.1:${other}/probe-nav` });
       return res.end();

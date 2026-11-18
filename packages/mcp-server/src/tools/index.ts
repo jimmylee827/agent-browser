@@ -7,11 +7,10 @@ import type { Audit } from "../audit.js";
 import type { AppConfig } from "../config.js";
 import type { ClientInfo } from "../control.js";
 import {
-  agentChromeRunning as agentChromeRunningOn,
+  browserRecovery,
   hostHelper,
   noteSpareWindow,
   takeSpareWindow,
-  wakeBrowser,
 } from "../host-helper-client.js";
 import { AbError, CATALOGUE, codeOf, HALT_ADVICE, POLICY_ADVICE } from "../errors.js";
 import { buildId, buildStatus, RUNNING } from "../build.js";
@@ -22,7 +21,8 @@ import type { JobRunner } from "../jobs.js";
 import { pooled, type Front, type WindowPool } from "../windows.js";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { actionOutcome, requestHeaders, httpUrl, type Dispatch } from "../browser-operations.js";
+import { actionOutcome, expectationResult, navigationEvidence, requestHeaders, httpUrl, type Dispatch, type ExpectationProbe } from "../browser-operations.js";
+import { classifyVisit } from "../visit-outcome.js";
 import type { HostAdmission } from "../host-admission.js";
 
 export { HALT_ADVICE };
@@ -282,7 +282,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
 
   type LoadError = { error: string; url: string; ts: number };
   type Ping = {
-    tab?: { id?: number; url?: string; title?: string; status?: string; windowId?: number; navCount?: number; loadError?: LoadError };
+    tab?: { id?: number; url?: string; title?: string; status?: string; windowId?: number; navCount?: number; documentId?: string; httpStatus?: number; responseCommitAt?: number; loadError?: LoadError };
     engine?: { error?: string; title?: string; documentGeneration?: string };
   };
 
@@ -374,7 +374,6 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
   // Browser up
   // ============================================================
 
-  const agentChromeRunning = () => agentChromeRunningOn(ctx.cfg.profileDir);
 
   /**
    * The wake this call performed, if any. Only the caller that woke the
@@ -419,31 +418,22 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
    * that needs a live browser so the wake path and its advice exist once.
    */
   async function ensureBrowser(timeoutMs: number): Promise<{ already: boolean; launchedVia?: string; waitedMs?: number }> {
-    if (ctx.bridge.connected()) return { already: true };
-    // The worker may just be reconnecting (browser starting, extension
-    // reloaded). Give it a moment before concluding nothing is there — but
-    // only if the agent Chrome is running at all; otherwise there is nothing
-    // to wait for, and the wait only delayed every cold start by 8s.
-    if (agentChromeRunning() && (await ctx.bridge.waitForConnection(8_000))) return { already: true };
-    if (existsSync(resolve(ctx.cfg.stateDir, "HALT"))) throw new AbError("HALTED", "HALTED: kill switch active");
-    const { via, wakeId, performed } = await wakeBrowser(ctx.cfg.profileDir, ctx.cfg.extensionDir);
-    // Callers that joined a wake already under way did not wake anything.
-    if (performed) ctx.audit.log(via === "launch" ? "browser.launch" : "browser.new_window", {});
+    const recovery = browserRecovery(ctx.cfg, ctx.bridge);
     const t0 = Date.now();
-    if (await ctx.bridge.waitForConnection(timeoutMs)) {
-      myWakeId = wakeId;
-      // The window the wake opened is a spare: one session moves into it.
-      const list = await ctx.bridge
-        .request<{ tabs: { tabId: number; url: string; windowId: number }[] }>("engine.tabs", { action: "list" })
-        .catch(() => null);
-      if (list) await noteSpareWindow(list.tabs, wakeId, (tabId) => !!ctx.sessions.ownerOfTab(tabId));
-      return { already: false, launchedVia: via, waitedMs: Date.now() - t0 };
+    const r = await recovery.ensure(timeoutMs);
+    if (r.attempted && r.wake) ctx.audit.log(r.wake.via === "launch" ? "browser.launch" : "browser.new_window", {});
+    if (r.state !== "connected") {
+      const code = r.state === "halted" ? "HALTED" : r.state === "human" ? "EXTENSION_NOT_READY" : "BRIDGE_DOWN";
+      throw new AbError(code, r.advice ?? "Agent Browser did not connect", {
+        recovery: r.advice, readiness: recovery.status(),
+        ...(r.state === "human" || r.state === "suppressed" ? { agentCanFix: false, humanAction: r.advice } : {}),
+      });
     }
-    throw new AbError("BRIDGE_DOWN", `agent browser did not connect within ${timeoutMs}ms (woke it via ${via})`, {
-      recovery:
-        "if Chrome opened, the extension needs loading once (a human step: chrome://extensions → Load unpacked → packages/extension); " +
-        "if it did not, run `npm run launch` in the agent-browser repo and read its output",
-    });
+    if (!r.wake) return { already: true };
+    myWakeId = r.wake.wakeId;
+    const list = await ctx.bridge.request<{ tabs: { tabId: number; url: string; windowId: number }[] }>("engine.tabs", { action: "list" }).catch(() => null);
+    if (list) await noteSpareWindow(list.tabs, myWakeId, (tabId) => !!ctx.sessions.ownerOfTab(tabId));
+    return { already: false, launchedVia: r.wake.via, waitedMs: Date.now() - t0 };
   }
 
   // ============================================================
@@ -474,7 +464,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
       : "call agent_browser_visit to refresh the page snapshot, OR widen the name to a less specific substring";
   };
 
-  type Match = { ref: number; role: string; name: string };
+  type Match = { ref: number; role: string; name: string; actionRank?: number; foreground?: boolean; available?: boolean };
   type TextHit = { tag: string; class?: string; text: string; cursor: string; at: { x: number; y: number }; offscreen?: boolean };
   type Located = { snapshotGeneration?: number; matches?: Match[]; textOnPage?: TextHit[] };
 
@@ -492,12 +482,12 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
   };
 
   /** Find one element by role/name, or fail with what is there instead. */
-  async function locateOne(sc: Scope, name: string | undefined, role: string | undefined): Promise<Match & { gen?: number }> {
-    let loc = await sc.req<Located>("engine.locate", { role, name });
+  async function locateOne(sc: Scope, name: string | undefined, role: string | undefined, forAction = false): Promise<Match & { gen?: number }> {
+    let loc = await sc.req<Located>("engine.locate", { role, name, forAction });
     if (!loc.matches?.length) {
       await sc.req("engine.waitForStable", { timeout: 700, quietMs: 150 }).catch(() => {});
       await sc.req("engine.observe", { mode: "semantic" }).catch(() => {});
-      loc = await sc.req<Located>("engine.locate", { role, name });
+      loc = await sc.req<Located>("engine.locate", { role, name, forAction });
     }
     const m = loc.matches?.[0];
     if (!m) {
@@ -508,6 +498,12 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         ...(hits.length ? { textOnPage: hits } : {}),
       });
     }
+    if (forAction && m.available && m.actionRank !== undefined) {
+      const tied = loc.matches!.filter((x) => x.available && x.actionRank === m.actionRank && x.role === m.role);
+      if (tied.length > 1) throw new AbError("AMBIGUOUS_MATCH", "More than one equally likely control matches; no action was dispatched.", {
+        candidates: tied.slice(0, 5), recovery: "Choose a candidate by ref or use a more specific locator.", dispatch: "not_dispatched",
+      });
+    }
     return { ...m, gen: loc.snapshotGeneration };
   }
 
@@ -515,7 +511,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
     url?: string;
     tree?: unknown[];
     screenshot?: string;
-    needsHuman?: { reason: string; agentCanFix: boolean; node?: { name?: string; ref?: number }; dismiss?: { ref: number; name: string; disabled?: boolean } };
+    needsHuman?: { reason: string; agentCanFix: boolean; humanAction?: string; node?: { name?: string; ref?: number }; dismiss?: { ref: number; name: string; disabled?: boolean } };
   };
   type SnapshotSize = "full" | "viewport" | "none";
 
@@ -531,10 +527,10 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
     if (size !== "none") return sc.req<Snap>("engine.observe", { mode: "semantic", viewportOnly: size === "viewport", details });
     // No tree, but a wall is still reported: an agent keeping its results
     // small must still learn that a captcha stands in its way.
-    const [b, w] = await Promise.all([brief(sc), sc.req<{ needsHuman?: Snap["needsHuman"] }>("engine.detectWall").catch(() => null)]);
-    if (!w?.needsHuman) return b;
+    const [b, w] = await Promise.all([brief(sc), sc.req<{ needsHuman?: Snap["needsHuman"]; documentGeneration?: string }>("engine.detectWall").catch(() => null)]);
+    if (!w?.needsHuman) return { ...b, ...(w ? { inspected: true, documentGeneration: w.documentGeneration } : {}) };
     const shot = w.needsHuman.reason === "captcha" ? await sc.req<{ screenshot?: string }>("engine.captureViewport").catch(() => null) : null;
-    return { ...b, outcome: "needs_human", needsHuman: w.needsHuman, ...(shot?.screenshot ? { screenshot: shot.screenshot } : {}) };
+    return { ...b, documentGeneration: w.documentGeneration, outcome: "needs_human", needsHuman: w.needsHuman, ...(shot?.screenshot ? { screenshot: shot.screenshot } : {}) };
   };
 
   /**
@@ -589,7 +585,12 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
       const pause = ctx.admission?.pause(String(snap.url ?? ""), w.reason, "page", undefined,
         `document:${call.tabId}:${snap.documentGeneration ?? snap.url}`);
       call.warnings.push("this page reports an access block/rate limit; further host operations are paused. Inspection is still available");
+      call.degraded.push(`page blocked by ${w.reason}`);
       return { ...rest, outcome: "blocked", block: w, ...(pause ? { cooldown: pause } : {}) };
+    }
+    if (w.reason === "login") {
+      call.degraded.push("a sign-in overlay covers the page — needs a human");
+      return { ...rest, outcome: "needs_human", needsHuman: { ...w, humanAction: "Sign in in this tab, then tell the agent to continue." } };
     }
     if (w.agentCanFix && w.dismiss)
       call.warnings.push(`a notice covers the page; dismiss it first: agent_browser_act({ref: ${w.dismiss.ref}}) ("${w.dismiss.name}")`);
@@ -786,7 +787,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
       // content script will ever answer there. Say so now, not at the timeout.
       const le = last.tab?.loadError;
       if (le && le.ts >= t0 - 1000) return { landed: false, from: beforeUrl, to: le.url, loadError: le };
-      if (last.engine?.error || !last.tab) continue;
+      if (!last.tab) continue;
       if ((last.tab.navCount ?? 0) > before) return { landed: true, from: beforeUrl, to: last.tab.url };
     }
     return { landed: false, from: beforeUrl, to: last.tab?.url, error: last.engine?.error };
@@ -859,6 +860,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         },
         staleBuild: b.staleBuild,
         ...extensionStatus(),
+        ...browserRecovery(ctx.cfg, ctx.bridge).status(),
         sessions: mine,
         ...(ctx.jobs?.list().length
           ? { jobs: { count: ctx.jobs.list().length, needsAttention: ctx.jobs.needsAttention() } }
@@ -877,7 +879,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
       "If this fails, tell the user in one sentence and record the step as not done.",
     ].join(""),
     {
-      timeoutMs: z.number().int().default(45_000),
+      timeoutMs: z.number().int().min(1).max(120_000).default(45_000),
       restartIfStale: z.boolean().default(false).describe("Restart the server if agent_browser_status reports staleBuild"),
     },
     async ({ timeoutMs, restartIfStale }) => {
@@ -979,6 +981,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         try { nav = await navigateAndWait(call, sc, url ? { url, headers: safeHeaders } : { history }, url ? 15_000 : 10_000, mobileChanged); }
         finally { if (safeHeaders && call.tabId !== undefined) await sc.req("engine.navigationHeaders", { headers: {} }).catch(() => {}); }
         if (!nav.landed) {
+          call.extra.visit = { kind: "transport_failure", nextStep: "Inspect the current tab and connection; do not retry blindly." };
           if (nav.loadError) throw loadFailure(nav.loadError);
           if (history)
             throw new AbError("NAV_TIMEOUT", `${history} did not change the page (still on ${nav.from})`, {
@@ -991,12 +994,39 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         await applyViewport(call, sc);
         if (popups !== undefined) await allowPopups(call, sc, popups);
         const settled = await settlePage(call, sc);
-        const snap = reportWall(call, await attachText(sc, await observeAs(sc, snapshot, details), text));
+        let snap: Snap;
+        let observed = false;
+        try {
+          snap = reportWall(call, await attachText(sc, await observeAs(sc, snapshot, details), text));
+          observed = snapshot !== "none" || snap.inspected === true || !!snap.needsHuman;
+        } catch (e) {
+          if (!ENGINE_ABSENT.test(String((e as Error).message))) throw e;
+          snap = await brief(sc).catch(() => ({ url: nav.to }));
+        }
+        const final = await ping(sc).catch(() => null);
+        if (final?.tab?.loadError && final.tab.loadError.ts >= t0 - 1000) {
+          call.extra.visit = { kind: "transport_failure" };
+          throw loadFailure(final.tab.loadError);
+        }
+        const document = final?.tab;
+        const same = !!document?.url && document.url === snap.url &&
+          (!snap.documentGeneration || !final?.engine?.documentGeneration || snap.documentGeneration === final.engine.documentGeneration);
+        const status = same && (document.responseCommitAt ?? 0) >= t0 - 50 ? document.httpStatus : undefined;
+        const visit = classifyVisit(snap.needsHuman?.reason, status, observed && same);
+        if (visit.kind === "access_blocked" && snap.outcome !== "blocked") call.degraded.push(`main document returned HTTP ${status}`);
+        if (visit.kind === "login_required" && !snap.needsHuman) {
+          call.degraded.push(`main document returned HTTP ${status} — authentication required`);
+          snap.needsHuman = { reason: "login", agentCanFix: false, humanAction: visit.nextStep };
+        }
+        if (visit.kind === "http_error" || visit.kind === "unknown") call.degraded.push(visit.kind === "unknown" ? "document could not be verified" : `main document returned HTTP ${status}`);
+        const outcome = snap.outcome ?? (visit.kind === "access_blocked" ? "blocked" : visit.kind === "login_required" ? "needs_human" : visit.kind === "http_error" ? "http_error" : undefined);
         const [diagnostics, network] = await Promise.all([diagSummary(sc, t0), networkSummary(sc, t0)]);
         const ev = await evidence(sc, "visit", { url: snap.url, title: snap.title, ...(history ? { history } : {}) });
         ctx.audit.log("tool.agent_browser_visit", { ...(history ? { history, from: nav.from } : { url }), to: snap.url, tabId: call.tabId, ...(ev ? { evidence: ev.file } : {}) });
         return {
           ...snap,
+          ...(outcome ? { outcome } : {}),
+          visit,
           tabId: call.tabId,
           ...(settled.settled ? {} : { settled: false, settleReason: settled.reason }),
           ...(diagnostics ? { diagnostics } : {}),
@@ -1080,6 +1110,11 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         .boolean()
         .optional()
         .describe("click/hover only, macOS: a REAL mouse event from the operating system, for pages that gate on a user gesture (sound, fullscreen, native dialogs). The agent window comes forward for the instant of the gesture and focus returns afterwards; the cursor does not move. Needs the input helper (npm run input-helper:install)."),
+      expect: z.discriminatedUnion("kind", [
+        z.object({ kind: z.literal("heading"), name: z.string().trim().min(1).max(160) }),
+        z.object({ kind: z.literal("url"), includes: z.string().min(1).max(500) }),
+        z.object({ kind: z.literal("selected"), name: z.string().trim().min(1).max(160), role: z.string().min(1).max(40).optional() }),
+      ]).optional().describe("Read-only outcome check before and after the one action; a missed check never repeats the action."),
       session: SESSION_ARG,
       tabId: TAB_ARG,
       lock: z.boolean().optional().describe("Shared sessions: true takes (or renews) a lease so other clients cannot act until it ends; false releases it"),
@@ -1132,7 +1167,16 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         //    the same pass as the action: a second lookup from here could
         //    re-index the page and renumber this one's ref.
         if (args.focusWindow) call.warnings.push("explicit focusWindow:true brings the Chrome window forward");
-        const match: Match & { gen?: number } = ref !== undefined ? { ref, role: role ?? "", name: name ?? "" } : await locateOne(sc, name, role);
+        const match: Match & { gen?: number } = ref !== undefined ? { ref, role: role ?? "", name: name ?? "" } : await locateOne(sc, name, role, true);
+        const readExpectation = async (): Promise<ExpectationProbe> => {
+          if (!args.expect) return { state: "unobservable" };
+          if (args.expect.kind === "url") {
+            const url = (await ping(sc).catch(() => null))?.tab?.url;
+            return { state: !url ? "unobservable" : url.includes(args.expect.includes) ? "present" : "absent" };
+          }
+          return sc.req<ExpectationProbe>("engine.expectation", args.expect, 2000).catch(() => ({ state: "unobservable" }));
+        };
+        const beforeExpected = args.expect ? await readExpectation() : undefined;
         const toLocator = to && (to.name !== undefined || to.role !== undefined) ? { name: to.name, role: to.role } : undefined;
 
         // 2. Act with the just-located ref + matching generation.
@@ -1295,18 +1339,10 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         // One answer to "did we navigate", measured after the settle. The
         // engine's own flag is taken 60ms after the action, before most
         // navigations commit, so the two used to disagree.
-        const navigated = typeof after.url === "string" && tabUrl !== after.url;
-        const tabNow = (await ping(sc).catch(() => null))?.tab;
-        if (sc.s.legacy && tabNow?.id != null && tabBefore?.id != null && tabNow.id !== tabBefore.id)
-          switchedTab = { from: tabBefore.id, to: tabNow.id, hint: "this action opened or moved to another tab; browser_tabs lists, switches and closes tabs" };
-        // An action meant to change something that changed nothing is not a
-        // success. The Enter that did nothing on Wikipedia came back as a
-        // plain `acted: true`; say so instead, so the caller tries another way.
-        // A slow server: the form was submitted, but the next page has not
-        // arrived. The tab is loading — that is an effect, not a no-op.
-        const loading = !navigated && tabNow?.status === "loading";
-        // Derive noEffect only after collecting the explicitly matching response.
-        let noEffect = false;
+        const afterSnapshot = await ping(sc).catch(() => null);
+        const firstTab = afterSnapshot?.tab;
+        if (sc.s.legacy && firstTab?.id != null && tabBefore?.id != null && firstTab.id !== tabBefore.id)
+          switchedTab = { from: tabBefore.id, to: firstTab.id, hint: "this action opened or moved to another tab; browser_tabs lists, switches and closes tabs" };
         if (result.credentialStoreBlocked?.length)
           call.warnings.push("the page tried to save a credential in the browser (credentials.store); it was refused, nothing was saved");
         if (result.passwordField && result.host) {
@@ -1332,12 +1368,24 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
             call.degraded.push("response observation failed; activation may already have run — do not automatically resubmit");
           }
         }
-        noEffect = action !== "focus" && !navigated && !loading && !switchedTab && result.changed === false && !awaited;
+        const finalObservation = args.waitForResponse ? await ping(sc).catch(() => null) ?? afterSnapshot : afterSnapshot;
+        const tabNow = finalObservation?.tab;
+        const navigation = navigationEvidence(tabBefore, tabNow ?? (after.url ? { url: after.url } : undefined), !!switchedTab);
+        const navigated = navigation !== "none";
+        const loading = tabNow?.status === "loading";
+        const snapshotAfterStale = navigationEvidence(firstTab, tabNow, false) !== "none" ||
+          (!!after.documentGeneration && !!finalObservation?.engine?.documentGeneration && after.documentGeneration !== finalObservation.engine.documentGeneration);
+        const expected = beforeExpected && expectationResult(beforeExpected, await readExpectation(), loading);
+        const signal = result.signals ?? {};
+        const strength = navigated || expected?.state === "satisfied" || signal.valueChanged === true || !!result.dialogs?.length
+          ? "specific_observation" : awaited || (typeof signal.domMutations === "number" && signal.domMutations > 0)
+          ? "activity_only" : loading ? "pending" : "unknown";
+        const noEffect = action !== "focus" && !navigated && !loading && !switchedTab && result.changed === false && !awaited && expected?.state !== "satisfied";
         if (noEffect) call.warnings.push("no effect observed; a delayed handler or submission may still have run. Inspect state before an explicit recovery attempt");
-        const outcome = actionOutcome({ dispatch: call.extra.dispatch as Dispatch, changed: !!result.changed || navigated || !!switchedTab, response: awaited?.response, loading });
+        const outcome = actionOutcome({ dispatch: call.extra.dispatch as Dispatch, changed: !!result.changed || navigated || expected?.state === "satisfied", response: awaited?.response, loading });
         Object.assign(call.extra, outcome);
 
-        const { acted: _a, changed: _c, signals, dialogs, credentialStoreBlocked, passwordField: _p, host: _h, snapshotStale: _st, action: _ac, ...engineExtra } = result;
+        const { acted: _a, changed: _c, signals, dialogs, credentialStoreBlocked, passwordField: _p, host: _h, snapshotStale: _st, action: _ac, navigated: _earlyNav, ...engineExtra } = result;
         ctx.audit.log("tool.agent_browser_act", { name, role, action, urlBefore: tabUrl, urlAfter: after.url, noEffect, tabId: call.tabId });
         return {
           acted: call.extra.dispatch === "completed" ? true : undefined,
@@ -1347,8 +1395,11 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
           value,
           signals: { ...(signals ?? {}), navigated },
           escalated,
-          navigated,
           ...engineExtra,
+          navigated,
+          navigation,
+          evidenceStrength: strength,
+          ...(expected ? { expectation: expected } : {}),
           ...(noEffect ? { noEffect } : {}),
           ...(loading
             ? { stillLoading: true, hint: "the action started a page load that has not finished: call browser_wait, then look — do not repeat the action" }
@@ -1363,8 +1414,9 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
           ...(awaited ? { response: awaited.response, responseWaitedMs: awaited.waitedMs } : {}),
           ...(responseError ? { responseError } : {}),
           urlBefore: tabUrl,
-          urlAfter: after.url,
+          urlAfter: tabNow?.url ?? after.url,
           snapshotAfter: after,
+          ...(snapshotAfterStale ? { snapshotAfterStale: true } : {}),
         };
       });
     },

@@ -111,7 +111,10 @@ const commands = {
     out(s, (d) => {
       console.log(`bridge     ${d.bridgeConnected ? "connected" : "NOT connected"}`);
       console.log(`build      ${d.build?.running}${d.build?.staleBuild ? `  (stale: ${d.build.onDisk} on disk)` : ""}`);
-      if (d.extension) console.log(`extension  ${d.extension.running ?? "?"}${d.extension.stale ? `  (stale: ${d.extension.onDisk} on disk)` : ""}`);
+      if (d.chromeRunning !== undefined) console.log(`chrome     ${d.chromeRunning ? "running" : "not running"}`);
+      if (d.hostHelperReachable !== undefined) console.log(`helper     ${d.hostHelperReachable ? "reachable" : "not reachable"}`);
+      if (d.extension || d.extensionRegistration) console.log(`extension  ${d.extension?.running ?? d.extensionRegistration ?? "?"}${d.extension?.stale ? `  (stale: ${d.extension.onDisk} on disk)` : ""}`);
+      if (d.nextStep) console.log(`next       ${d.nextStep}`);
     });
     if (!s.bridgeConnected) process.exit(2);
   },

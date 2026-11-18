@@ -9,6 +9,7 @@ export type Code =
   | "STALE_SNAPSHOT"
   | "REF_NOT_FOUND"
   | "NO_MATCH"
+  | "AMBIGUOUS_MATCH"
   | "NOT_ACTIONABLE"
   | "OCCLUDED"
   | "HOVER_NOT_EFFECTIVE"
@@ -16,6 +17,7 @@ export type Code =
   | "NO_SESSION_TAB"
   | "TAB_OWNED_BY_OTHER"
   | "SESSION_LOCKED"
+  | "EXTENSION_NOT_READY"
   | "BRIDGE_DOWN"
   | "NAV_TIMEOUT"
   | "CERT_INVALID"
@@ -63,6 +65,7 @@ export const CATALOGUE: Record<Code, Entry> = {
   },
   STALE_SNAPSHOT: { agentCanFix: true, fixSteps: ["take a fresh snapshot (agent_browser_visit / browser_observe)", "retry with the new ref"], humanAction: null },
   REF_NOT_FOUND: { agentCanFix: true, fixSteps: ["take a fresh snapshot (browser_observe)", "retry with the new ref, or act by name with agent_browser_act"], humanAction: null },
+  AMBIGUOUS_MATCH: { agentCanFix: true, fixSteps: ["choose an explicit candidate ref or narrow the locator"], humanAction: null },
   NO_MATCH: { agentCanFix: true, fixSteps: ["retry with one of the similar elements listed, a shorter name, or no role", "or call browser_observe to see what is there"], humanAction: null },
   NOT_ACTIONABLE: { agentCanFix: true, fixSteps: ["wait (browser_wait) or scroll, then retry", "if it is disabled, do what enables it first"], humanAction: null },
   OCCLUDED: { agentCanFix: true, fixSteps: ["close or dismiss the element named in occludedBy", "then retry"], humanAction: null },
@@ -83,6 +86,7 @@ export const CATALOGUE: Record<Code, Entry> = {
     humanAction: null,
   },
   SESSION_LOCKED: { agentCanFix: true, fixSteps: ["wait until the lease ends (see lockedFor), or use your own session"], humanAction: null },
+  EXTENSION_NOT_READY: { agentCanFix: false, fixSteps: ["follow the extension instructions in readiness.nextStep"], humanAction: "check Agent Bridge in chrome://extensions" },
   BRIDGE_DOWN: {
     agentCanFix: true,
     fixSteps: ["call agent_browser_ensure_running", "if it still fails, tell the user in one sentence and record the step as not done"],

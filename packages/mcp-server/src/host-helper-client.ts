@@ -1,6 +1,10 @@
 import { readFileSync, existsSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, resolve } from "node:path";
+import { homedir } from "node:os";
+import type { AppConfig } from "./config.js";
+import type { Bridge } from "./bridge/server.js";
+import { BrowserRecovery, extensionRegistration } from "./readiness.js";
 import { fileURLToPath } from "node:url";
 
 /**
@@ -33,7 +37,7 @@ const SECRET_FILE = process.env.AB_HOST_HELPER_SECRET_FILE || "";
 function readSecret(): string | null {
   const candidates = [SECRET_FILE, `${process.env.HOME ?? ""}/.agent-chrome/host-helper-secret`];
   for (const f of candidates) {
-    if (f && existsSync(f)) return readFileSync(f, "utf8").trim();
+    try { if (f) return readFileSync(f, "utf8").trim() || null; } catch { /* try the default */ }
   }
   return null;
 }
@@ -45,6 +49,7 @@ async function call<T = unknown>(path: string, body: object = {}): Promise<T> {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ secret, ...body }),
+    signal: AbortSignal.timeout(3000),
   });
   const j = (await r.json()) as { error?: string } & T;
   if (!r.ok || j.error) throw new Error(j.error || `host-helper ${path} HTTP ${r.status}`);
@@ -57,7 +62,7 @@ export const hostHelper = {
   },
   async health(): Promise<boolean> {
     try {
-      const r = await fetch(`http://${HOST}:${PORT}/health`);
+      const r = await fetch(`http://${HOST}:${PORT}/health`, { signal: AbortSignal.timeout(1000) });
       return r.ok;
     } catch {
       return false;
@@ -66,75 +71,39 @@ export const hostHelper = {
   launchChrome: () => call<{ ok: true; pid: number }>("/launch-chrome"),
 };
 
-/** Is a Chrome running on the agent profile? (Unknown counts as yes.) */
-export function agentChromeRunning(profileDir: string): boolean {
+/** Identify only the agent profile, not personal Chrome or the Testo collectors. */
+function chromePid(profileDir: string): number | null {
   try {
-    // No leading "--" in the pattern: pgrep would read it as an option.
-    execFileSync("pgrep", ["-f", `user-data-dir=${profileDir}`], { stdio: "ignore" });
-    return true;
-  } catch (e) {
-    return (e as { status?: number }).status !== 1; // 1 = no match
-  }
-}
-
-/**
- * Is the agent bridge loaded into that Chrome profile, and switched on? Read
- * from the profile's own record of its extensions, which is what decides
- * whether opening a window is enough to get the bridge back, or whether the
- * browser has to be started again: Chrome with no window open unloads the
- * profile — and the extension, and its worker — on macOS.
- *
- * A profile that cannot be read claims the extension, so the cheap path is
- * tried first and a real launch still follows if the bridge stays down.
- */
-export function extensionLoaded(profileDir: string, extensionDir: string): boolean {
-  for (const file of ["Secure Preferences", "Preferences"]) {
-    let prefs: { extensions?: { settings?: Record<string, { path?: string; state?: number; disable_reasons?: number | number[] }> } };
-    try {
-      prefs = JSON.parse(readFileSync(resolve(profileDir, "Default", file), "utf8"));
-    } catch {
-      continue;
+    const lines = execFileSync("ps", ["-axww", "-o", "pid=,command="], { encoding: "utf8" });
+    const prefix = chromeBinary() + " ";
+    for (const line of lines.split("\n")) {
+      const match = /^\s*(\d+)\s+(.*)$/.exec(line);
+      if (!match || !match[2].startsWith(prefix)) continue;
+      const flag = ` --user-data-dir=${profileDir}`;
+      const i = match[2].indexOf(flag);
+      if (i >= 0 && (match[2].length === i + flag.length || match[2][i + flag.length] === " ")) return Number(match[1]);
     }
-    const settings = prefs?.extensions?.settings;
-    if (!settings) continue;
-    const entry = Object.values(settings).find((e) => e?.path && resolve(e.path) === resolve(extensionDir));
-    if (entry) return !(Array.isArray(entry.disable_reasons) ? entry.disable_reasons.length : entry.disable_reasons) && entry.state !== 0;
-    return false;
-  }
-  return true;
+  } catch { /* unknown; preference check and single flight still apply */ }
+  return null;
 }
 
-/**
- * Make sure a window exists: start Chrome when it is down (or has lost the
- * extension with its last window), otherwise open one in it.
- *
- * Single-flight: N callers that all find the bridge down make one wake, not N.
- * Settles before it hands back, because opening the window is what lets the
- * others find a connection and stop needing a wake of their own.
- * The blank window a wake opens is recorded here, daemon-wide, for exactly one
- * session to claim — the registry is module state, so every request's server
- * instance shares it.
- */
-export async function wakeBrowser(
-  profileDir: string,
-  extensionDir: string,
-): Promise<{ via: "launch" | "window"; wakeId: number; performed: boolean }> {
-  const performed = !waking;
-  if (!waking) waking = wake(profileDir, extensionDir).finally(() => (waking = null));
-  return { ...(await waking), performed };
-}
-
-let waking: Promise<{ via: "launch" | "window"; wakeId: number }> | null = null;
-
-async function wake(profileDir: string, extensionDir: string): Promise<{ via: "launch" | "window"; wakeId: number }> {
-  const wakeId = ++wakeSeq;
-  if (!extensionLoaded(profileDir, extensionDir) || !agentChromeRunning(profileDir)) {
-    await launchBrowser();
-    return { via: "launch", wakeId };
+const recoveries = new WeakMap<Bridge, BrowserRecovery>();
+export function browserRecovery(cfg: AppConfig, bridge: Bridge): BrowserRecovery {
+  let recovery = recoveries.get(bridge);
+  if (!recovery) {
+    recovery = new BrowserRecovery(bridge, () => ({ chromePid: chromePid(cfg.profileDir),
+      registration: extensionRegistration(cfg.profileDir, cfg.extensionDir), halted: existsSync(resolve(cfg.stateDir, "HALT")) }), async (state) => {
+      const wakeId = ++wakeSeq;
+      if (state.chromePid === null) {
+        await launchBrowser(cfg.profileDir);
+        return { via: "launch", wakeId };
+      }
+      openChromeWindow(cfg.profileDir);
+      return { via: "window", wakeId };
+    });
+    recoveries.set(bridge, recovery);
   }
-  openChromeWindow(profileDir);
-  await new Promise((r) => setTimeout(r, 750));
-  return { via: "window", wakeId };
+  return recovery;
 }
 
 /** Open a window in the Chrome that is already running, without relaunching it. */
@@ -147,51 +116,24 @@ export function openChromeWindow(profileDir: string): void {
   child.unref();
 }
 
-/**
- * Start the agent Chrome by whichever route works: the host helper when it
- * answers, otherwise spawning the launcher ourselves. The daemon runs as a
- * launchd agent in the user's GUI session, and a stdio server runs under the
- * user's terminal, so both can open a GUI app directly — the helper is only
- * needed when the server has no GUI session at all.
- *
- * A secret file on disk does not mean the helper is running (it outlives the
- * process), so a failed helper call falls through to the direct spawn.
- */
-export async function launchBrowser(): Promise<"host-helper" | "direct"> {
-  if (!launching) launching = doLaunch().finally(() => (launching = null));
-  return launching;
-}
-
-let launching: Promise<"host-helper" | "direct"> | null = null;
-
-async function doLaunch(): Promise<"host-helper" | "direct"> {
-  if (hostHelper.available()) {
-    try {
-      await hostHelper.launchChrome();
-      return "host-helper";
-    } catch {}
+/** Launch through exactly one route. If the helper request loses its reply, it
+ * may already have opened a window, so do not fall back after sending it. */
+async function launchBrowser(profileDir: string): Promise<void> {
+  if (profileDir === resolve(homedir(), ".agent-chrome/profile") && hostHelper.available() && await hostHelper.health()) {
+    await hostHelper.launchChrome();
+    return;
   }
   const child = spawn(resolve(repoRoot, "bin/launch-chrome.sh"), [], {
     cwd: repoRoot,
+    env: { ...process.env, AB_PROFILE_DIR: profileDir },
     detached: true,
     stdio: "ignore",
   });
   child.on("error", () => {});
   child.unref();
-  return "direct";
 }
 
-// ---- the blank window a wake leaves behind ----------------------------------
-
-/**
- * The blank window a wake opened, claimable by exactly one session.
- *
- * A wake opens one window and N callers may each want a window of their own;
- * handing the same tab to all of them would put several sessions in one page.
- * So the spare is claimed once, and the claim is tied to the wake that made
- * it: a caller that did not wake anything has no claim on a blank window it
- * happens to see.
- */
+// Wake-created spare windows may be adopted exactly once.
 let spare: { tabId: number; at: number; wakeId: number } | null = null;
 let wakeSeq = 0;
 const SPARE_MS = 30_000;

@@ -17,6 +17,8 @@ export async function activateOnce(attr, options = {}) {
   if (options.waitForHydration || strategy === "react" || Object.keys(el).some((k) => /^__react(Fiber|Props)\$/.test(k))) {
     while (!props()?.onClick && !el.form && Date.now() - started < (options.hydrationTimeoutMs ?? 4000)) await sleep(100);
   }
+  if (el.isConnected === false || el.disabled || el.getAttribute("aria-disabled") === "true")
+    return { ...base, error: "target disappeared or became disabled during preparation" };
   const form = el.form || el.closest("form");
   const handler = props()?.onClick;
   const formAction = el.getAttribute("formaction") || props()?.formAction;
@@ -33,6 +35,8 @@ export async function activateOnce(attr, options = {}) {
     // From this boundary on, an exception does NOT establish non-delivery.
     result.dispatch = "unknown";
     result.strategies.push(strategy);
+    const recipient = strategy === "form" || strategy === "form-action" ? form : el;
+    result.activationTarget = { kind: strategy === "pointer" ? "event_recipient" : "invocation_target", tag: recipient.tagName.toLowerCase() };
     if (strategy === "pointer") {
       const r = el.getBoundingClientRect();
       const o = { bubbles: true, cancelable: true, composed: true, clientX: r.left + r.width / 2,
