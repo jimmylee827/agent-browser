@@ -272,6 +272,8 @@ export async function startHarness({ log = false, waitMs = 45_000, setup = false
     ...process.env,
     AB_STATE_DIR: state,
     AB_PROFILE_DIR: profile,
+    AB_CHROME_BIN: CHROME,
+    AB_CHROME_LAUNCH_SCRIPT: resolve(root, "bin/launch-chrome.sh"),
     AB_BRIDGE_PORT: String(bridgePort),
     AB_CONTROL_PORT: String(controlPort),
     AB_EXTENSION_DIR: ext,
@@ -372,11 +374,28 @@ export async function startHarness({ log = false, waitMs = 45_000, setup = false
     return false;
   }
 
+  async function quitAgentChrome() {
+    const pending = new Promise((resolve) => {
+      const killer = spawn("pkill", ["-TERM", "-f", `user-data-dir=${profile}`]);
+      killer.on("error", resolve);
+      killer.on("exit", resolve);
+    });
+    await pending;
+    const until = Date.now() + 8000;
+    while (Date.now() < until) {
+      const s = await fetch(`${base}/status`).then((r) => r.json());
+      if (!s.chromeRunning && !s.bridgeConnected) return true;
+      await sleep(200);
+    }
+    return false;
+  }
+
   async function stop() {
     if (process.platform === "darwin")
       for (let i = 0; i < 20; i++) if (spawnSync("security", ["delete-generic-password", "-s", "agent-browser-test"], { stdio: "ignore" }).status !== 0) break;
     for (const c of clients) await c.close().catch(() => {});
-    chrome.kill("SIGTERM");
+    if (chrome.exitCode === null && chrome.signalCode === null) chrome.kill("SIGTERM");
+    else await quitAgentChrome().catch(() => {});
     daemon.kill("SIGTERM");
     for (const s of servers) s.close();
     await sleep(800);
@@ -395,6 +414,7 @@ export async function startHarness({ log = false, waitMs = 45_000, setup = false
     state,
     base,
     restartDaemon,
+    quitAgentChrome,
     reloadExtension,
     /** This instance's config/local.json: the server re-reads it when it changes. */
     localConfig: env.AB_LOCAL_CONFIG,

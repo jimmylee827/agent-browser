@@ -4,7 +4,7 @@ import type { Bridge } from "./bridge/server.js";
 import type { Audit } from "./audit.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { browserRecovery, hostHelper } from "./host-helper-client.js";
+import { browserRecovery, hostHelper, requireBrowser } from "./host-helper-client.js";
 import { buildStatus } from "./build.js";
 import { rejectBrowserOrigin } from "./http-guard.js";
 import { secondPassRedact, toHar, toNdjson, type NetEntry } from "./network.js";
@@ -102,6 +102,10 @@ export function startControl(
       }
     }
 
+    const liveRequest: Bridge["request"] = async (method, params, timeoutMs) => {
+      await requireBrowser(cfg, bridge);
+      return bridge.request(method, params, timeoutMs);
+    };
     try {
       if (url.pathname === "/command" && req.method === "POST" && mcp?.invokeOperation) {
         const body = JSON.parse((await readBody(req)) || "{}");
@@ -116,6 +120,13 @@ export function startControl(
         const result = await mcp.invokeOperation({ id: header(req, "x-ab-client") ?? "terminal" }, aliases[url.pathname], args) as { content?: { type: string; text?: string }[]; isError?: boolean };
         const text = result.content?.find((c) => c.type === "text")?.text;
         return send(res, result.isError ? 400 : 200, text ? JSON.parse(text) : result);
+      }
+      // Chrome normalizes command-line about:blank to its new-tab page.
+      // This inert, loopback-only document lets us identify just our wake tab.
+      if (req.method === "GET" && /^\/wake\/[0-9a-f-]{36}$/.test(url.pathname)) {
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "Content-Security-Policy": "default-src 'none'" });
+        res.end("<!doctype html><title>Agent Browser</title>");
+        return;
       }
       if (url.pathname === "/health") return send(res, 200, { serverRunning: true });
       if (url.pathname === "/status") {
@@ -145,21 +156,21 @@ export function startControl(
         return send(res, 200, { closed: await mcp.releaseClient(id) });
       }
       if (url.pathname === "/ping") {
-        return send(res, 200, await bridge.request("engine.ping", {}));
+        return send(res, 200, await liveRequest("engine.ping", {}));
       }
       if (url.pathname === "/observe") {
-        return send(res, 200, await bridge.request("engine.observe", {
+        return send(res, 200, await liveRequest("engine.observe", {
           mode: url.searchParams.get("mode") ?? "semantic",
         }));
       }
       if (url.pathname === "/locate") {
-        return send(res, 200, await bridge.request("engine.locate", {
+        return send(res, 200, await liveRequest("engine.locate", {
           role: url.searchParams.get("role") ?? undefined,
           name: url.searchParams.get("name") ?? undefined,
         }));
       }
       if (url.pathname === "/wait") {
-        return send(res, 200, await bridge.request("engine.waitForStable", {}));
+        return send(res, 200, await liveRequest("engine.waitForStable", {}));
       }
       if (url.pathname === "/visit") {
         // High-level visit: GENERAL policy (no allowlist restriction, only
@@ -171,7 +182,7 @@ export function startControl(
         try { host = new URL(to).hostname; } catch { return send(res, 400, { error: "bad url" }); }
         if (!host) return send(res, 400, { error: "missing url" });
         audit.log("control.visit", { host });
-        await bridge.request("engine.navigate", { url: to });
+        await liveRequest("engine.navigate", { url: to });
 
         // Poll engine.ping until the active tab has committed to the new
         // origin AND the content engine answers. Up to 15s for slow loads.
@@ -212,7 +223,7 @@ export function startControl(
         }
         if (!host) return send(res, 400, { error: "missing url" });
         audit.log("control.navigate", { host });
-        return send(res, 200, await bridge.request("engine.navigate", { url: to }));
+        return send(res, 200, await liveRequest("engine.navigate", { url: to }));
       }
       // Recorded traffic of one tab, for the CLI (`npm run ab -- network`).
       if (url.pathname === "/network" || url.pathname === "/network/export" || url.pathname === "/network/clear") {
@@ -221,10 +232,10 @@ export function startControl(
         if (!Number.isInteger(tabId) || !q.get("tabId")) return send(res, 400, { error: "tabId required (see `npm run ab -- tabs`)" });
         if (url.pathname === "/network/clear") {
           audit.log("control.network_clear", { tabId });
-          return send(res, 200, await bridge.request("net.clear", { tabId }));
+          return send(res, 200, await liveRequest("net.clear", { tabId }));
         }
         const exporting = url.pathname === "/network/export";
-        const r = await bridge.request<{ url?: string; entries: NetEntry[]; matched: number }>("net.query", {
+        const r = await liveRequest<{ url?: string; entries: NetEntry[]; matched: number }>("net.query", {
           tabId,
           urlPattern: q.get("url") ?? undefined,
           method: q.get("method") ?? undefined,
@@ -244,7 +255,7 @@ export function startControl(
         audit.log("control.network_export", { tabId, format, file });
         return send(res, file ? 200 : 500, file ? { file, format, entries: entries.length, matched: r.matched } : { error: "could not write the export" });
       }
-      if (url.pathname === "/tabs") return send(res, 200, await bridge.request("engine.tabs", { action: "list" }));
+      if (url.pathname === "/tabs") return send(res, 200, await liveRequest("engine.tabs", { action: "list" }));
       // Secrets a person approves for jobs to type (`npm run ab -- secrets`).
       // Values go in and never come out: GET lists names, kinds and hosts.
       const sm = url.pathname.match(/^\/secrets(?:\/([a-z0-9._-]+))?$/);
@@ -298,12 +309,12 @@ export function startControl(
       if (url.pathname === "/robust-click" && req.method === "POST") {
         const p = JSON.parse((await readBody(req)) || "{}");
         audit.log("control.robust_click", { ref: p.ref });
-        return send(res, 200, await bridge.request("engine.robustClick", p));
+        return send(res, 200, await liveRequest("engine.robustClick", p));
       }
       if (url.pathname === "/act" && req.method === "POST") {
         const p = JSON.parse((await readBody(req)) || "{}");
         audit.log("control.act", { action: p.action, ref: p.ref });
-        return send(res, 200, await bridge.request("engine.act", p));
+        return send(res, 200, await liveRequest("engine.act", p));
       }
       send(res, 404, {
         error: "not found",

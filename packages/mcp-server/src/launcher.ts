@@ -20,7 +20,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { spawn, execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, openSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, statSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -87,30 +87,51 @@ const launchctl = (...args: string[]) => {
 /** Start the daemon by the most durable route available, and wait for it. */
 async function startDaemon(): Promise<{ via: string } | { error: string }> {
   const domain = `gui/${process.getuid?.() ?? 501}`;
-  let via: string;
-  if (launchctl("print", `${domain}/${LABEL}`)) {
-    via = "launchd (restarted)";
-    launchctl("kickstart", "-k", `${domain}/${LABEL}`);
-  } else if (existsSync(PLIST)) {
-    via = "launchd (loaded)";
-    launchctl("bootstrap", domain, PLIST);
-  } else {
-    // Not installed as a daemon: run it as a detached process for now. It
-    // won't survive a logout; `npm run mcp:install` makes it permanent.
-    via = "detached process";
-    mkdirSync(cfg.stateDir, { recursive: true });
-    const log = openSync(resolve(cfg.stateDir, "mcp-server.err.log"), "a");
-    spawn(process.execPath, [resolve(here, "index.js")], {
-      detached: true,
-      stdio: ["ignore", log, log],
-      env: { ...process.env, AB_DISABLE_STDIO_MCP: "1" },
-    }).unref();
+  mkdirSync(cfg.stateDir, { recursive: true });
+  const lock = resolve(cfg.stateDir, "mcp-start.lock");
+  const deadline = Date.now() + 15_000;
+  let lease: number | undefined;
+  let via = "another launcher";
+  try {
+    while (Date.now() < deadline) {
+      if (await daemonUp()) return { via };
+      if (halted()) return { error: HALT_ADVICE };
+      if (lease === undefined) {
+        try { lease = openSync(lock, "wx", 0o600); }
+        catch (e) {
+          if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+          // A launcher killed while starting must not block future requests.
+          try { if (Date.now() - statSync(lock).mtimeMs > 60_000) unlinkSync(lock); } catch {}
+        }
+        if (lease !== undefined && !(await daemonUp()) && !halted()) {
+          if (launchctl("print", `${domain}/${LABEL}`)) {
+            via = "launchd";
+            launchctl("kickstart", `${domain}/${LABEL}`); // never kill a daemon still starting
+          } else if (existsSync(PLIST)) {
+            via = "launchd (loaded)";
+            launchctl("bootstrap", domain, PLIST);
+          } else {
+            via = "detached process";
+            const log = openSync(resolve(cfg.stateDir, "mcp-server.err.log"), "a");
+            try {
+              const child = spawn(process.execPath, [resolve(here, "index.js")], {
+                detached: true, stdio: ["ignore", log, log], env: { ...process.env, AB_DISABLE_STDIO_MCP: "1" },
+              });
+              child.on("error", () => {});
+              child.unref();
+            } finally { closeSync(log); }
+          }
+        }
+      }
+      await sleep(300);
+    }
+    return { error: `the browser server did not come up within 15s (tried: ${via}); see ${cfg.stateDir}/mcp-server.err.log` };
+  } finally {
+    if (lease !== undefined) {
+      closeSync(lease);
+      try { unlinkSync(lock); } catch {}
+    }
   }
-  for (let t0 = Date.now(); Date.now() - t0 < 15_000; ) {
-    if (await daemonUp()) return { via };
-    await sleep(300);
-  }
-  return { error: `the browser server did not come up within 15s (tried: ${via}); see ${cfg.stateDir}/mcp-server.err.log` };
 }
 
 const halted = () => existsSync(resolve(cfg.stateDir, "HALT"));

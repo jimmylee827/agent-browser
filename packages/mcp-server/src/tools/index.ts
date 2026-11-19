@@ -9,8 +9,8 @@ import type { ClientInfo } from "../control.js";
 import {
   browserRecovery,
   hostHelper,
-  noteSpareWindow,
-  takeSpareWindow,
+  requireBrowser,
+  takeWakeTab,
 } from "../host-helper-client.js";
 import { AbError, CATALOGUE, codeOf, HALT_ADVICE, POLICY_ADVICE } from "../errors.js";
 import { buildId, buildStatus, RUNNING } from "../build.js";
@@ -275,8 +275,20 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
       throw new AbError("NO_SESSION_TAB", "this session has no page yet — nothing to act on", {
         recovery: "call agent_browser_visit({url}) first (it opens this session's tab), or pass tabId to adopt an existing tab",
       });
-    const req = <T,>(method: string, params: Record<string, unknown> = {}, timeoutMs?: number) =>
-      ctx.bridge.request<T>(method, call.tabId !== undefined ? { ...params, tabId: call.tabId } : params, timeoutMs);
+    let first = true;
+    const req = async <T,>(method: string, params: Record<string, unknown> = {}, timeoutMs?: number) => {
+      // Only the first scoped RPC may recover a race before it was sent.
+      // Never start another wake in the observation tail of a dispatched action.
+      const mayRecover = first;
+      first = false;
+      const bound = call.tabId !== undefined ? { ...params, tabId: call.tabId } : params;
+      try { return await ctx.bridge.request<T>(method, bound, timeoutMs); }
+      catch (e) {
+        if (!mayRecover || !(e as AbError).detail?.bridgeNotSent) throw e;
+        await ensureBrowser();
+        return ctx.bridge.request<T>(method, bound, timeoutMs);
+      }
+    };
     return { s, req };
   }
 
@@ -316,19 +328,30 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
     sc.s.lastSeen.set(ctx.client.id, { at: Date.now(), navCount: p.tab?.navCount ?? at?.navCount, docGen: p.engine?.documentGeneration ?? at?.docGen });
   }
 
-  async function choosePrivacy(call: Call, s: Session, wanted?: boolean, canSwitch = false, adopting = false) {
+  async function choosePrivacy(call: Call, s: Session, wanted?: boolean, canSwitch = false, adopting = false, reopenGone = false) {
     if (s.legacy && wanted !== undefined) throw new AbError("BAD_REQUEST", "Incognito mode requires a named/private session, not default");
     if (s.tabId !== undefined && !s.legacy) {
-      const actual = await ctx.bridge.request<{ tab?: { incognito?: boolean; windowId?: number; url?: string } }>("engine.ping", { tabId: s.tabId });
-      const current = !!actual.tab?.incognito;
-      if (wanted !== undefined && wanted !== current) {
-        if (!canSwitch || adopting) throw new AbError("BAD_REQUEST", "requested privacy mode differs from the adopted/current tab; use a destination URL in a new context");
+      try {
+        const actual = await ctx.bridge.request<{ tab?: { incognito?: boolean; windowId?: number; url?: string } }>("engine.ping", { tabId: s.tabId });
+        const current = !!actual.tab?.incognito;
+        if (wanted !== undefined && wanted !== current) {
+          if (!canSwitch || adopting) throw new AbError("BAD_REQUEST", "requested privacy mode differs from the adopted/current tab; use a destination URL in a new context");
+          ctx.sessions.unbind(s);
+          s.ownWindow = false;
+        } else {
+          s.incognito = current;
+          if (actual.tab?.windowId !== undefined) s.windowId = actual.tab.windowId;
+          s.lastUrl = actual.tab?.url;
+        }
+      } catch (e) {
+        // A fresh URL in this session does not require its old tab to survive.
+        // History/actions and explicit tab IDs still require the exact old tab.
+        if (!reopenGone || codeOf(e) !== "TAB_GONE") throw e;
+        if (s.tabId !== undefined) s.opened?.delete(s.tabId);
         ctx.sessions.unbind(s);
         s.ownWindow = false;
-      } else {
-        s.incognito = current;
-        if (actual.tab?.windowId !== undefined) s.windowId = actual.tab.windowId;
-        s.lastUrl = actual.tab?.url;
+        s.windowType = undefined;
+        call.warnings.push("the previous session tab was closed; opening the requested URL in a new tab");
       }
     }
     if (wanted !== undefined) s.incognito = wanted;
@@ -343,6 +366,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
   /** Run fn under the session's lock, with the shared-tab check before and the record after. */
   async function inSession<T>(call: Call, sc: Scope, fn: () => Promise<T>, prepare?: () => Promise<void>): Promise<T> {
     return ctx.sessions.withLock(sc.s.key, async () => {
+      await ensureBrowser();
       await prepare?.();
       await choosePrivacy(call, sc.s);
       // Every ordinary session shares one window; for this call, its tab is the one in front.
@@ -376,21 +400,13 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
 
 
   /**
-   * The wake this call performed, if any. Only the caller that woke the
-   * browser may move into the blank window the wake opened — otherwise every
-   * parallel call would adopt the same tab and several sessions would share
-   * one page. (registerTools runs once per request, so this is per-call.)
-   */
-  let myWakeId: number | undefined;
-
-  /**
    * Open the session's first page: a tab in the shared agent window, or —
    * for a session with a viewport — a window of its own. Either way it moves
    * into the wake's blank window when this call woke the browser.
    */
   async function openSessionWindow(call: Call, s: Session, url?: string) {
     const first = s.mobile ? "about:blank" : url;
-    const spare = myWakeId === undefined ? undefined : takeSpareWindow(myWakeId);
+    const spare = s.incognito ? undefined : await takeWakeTab(ctx.bridge, (id) => !!ctx.sessions.ownerOfTab(id));
     if (ctx.windows && pooled(s)) {
       call.front ??= { key: s.key };
       const w = await ctx.windows.open(call.front, first, s.sound, spare);
@@ -417,23 +433,11 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
    * Bring the browser up if the bridge isn't connected. Shared by every tool
    * that needs a live browser so the wake path and its advice exist once.
    */
-  async function ensureBrowser(timeoutMs: number): Promise<{ already: boolean; launchedVia?: string; waitedMs?: number }> {
-    const recovery = browserRecovery(ctx.cfg, ctx.bridge);
+  async function ensureBrowser(timeoutMs = 48_000): Promise<{ already: boolean; launchedVia?: string; waitedMs?: number }> {
     const t0 = Date.now();
-    const r = await recovery.ensure(timeoutMs);
+    const r = await requireBrowser(ctx.cfg, ctx.bridge, timeoutMs);
     if (r.attempted && r.wake) ctx.audit.log(r.wake.via === "launch" ? "browser.launch" : "browser.new_window", {});
-    if (r.state !== "connected") {
-      const code = r.state === "halted" ? "HALTED" : r.state === "human" ? "EXTENSION_NOT_READY" : "BRIDGE_DOWN";
-      throw new AbError(code, r.advice ?? "Agent Browser did not connect", {
-        recovery: r.advice, readiness: recovery.status(),
-        ...(r.state === "human" || r.state === "suppressed" ? { agentCanFix: false, humanAction: r.advice } : {}),
-      });
-    }
-    if (!r.wake) return { already: true };
-    myWakeId = r.wake.wakeId;
-    const list = await ctx.bridge.request<{ tabs: { tabId: number; url: string; windowId: number }[] }>("engine.tabs", { action: "list" }).catch(() => null);
-    if (list) await noteSpareWindow(list.tabs, myWakeId, (tabId) => !!ctx.sessions.ownerOfTab(tabId));
-    return { already: false, launchedVia: r.wake.via, waitedMs: Date.now() - t0 };
+    return r.wake ? { already: false, launchedVia: r.wake.via, waitedMs: Date.now() - t0 } : { already: true };
   }
 
   // ============================================================
@@ -948,16 +952,21 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
     },
     async ({ url, history, text, snapshot, details, viewport, mobile, sound, incognito, strictViewport, headers, actionClass, overrideCooldown, allowPopups: popups, session, tabId, lock, leaseMs }, call) => {
       if (!url === !history) throw new AbError("BAD_REQUEST", "give exactly one of url or history", { recovery: "e.g. {url:\"https://…\"} or {history:\"back\"}" });
-      await ensureBrowser(45_000);
       const sc = scope(call, { session, tabId, lock, leaseMs }, url ? "open" : "tab");
       if ((viewport || mobile !== undefined || sound !== undefined) && sc.s.legacy)
         throw new AbError("BAD_REQUEST", "viewport, mobile and sound belong to a session's own tab; drop session \"default\"");
       if (headers && !url) throw new AbError("BAD_REQUEST", "headers require an explicit destination URL");
       const safeHeaders = headers ? requestHeaders(headers) : undefined;
       if (url && headers) httpUrl(url);
+      const navigationClass = actionClass ?? (Object.keys(safeHeaders ?? {}).some((k) => /authorization|api-key|token|secret/i.test(k)) ? "credential_entry" : undefined);
+      if (url) {
+        ctx.admission?.check(url, overrideCooldown);
+        const gate = ctx.policy.evaluate({ url, actionClass: navigationClass });
+        if (!gate.allow) throw new AbError("POLICY_BLOCKED", gate.reason, { recovery: POLICY_ADVICE, dispatch: "not_dispatched" });
+      }
       let mobileChanged = false;
       const prepare = async () => {
-        await choosePrivacy(call, sc.s, incognito, !!url, tabId !== undefined);
+        await choosePrivacy(call, sc.s, incognito, !!url, tabId !== undefined, !!url && tabId === undefined);
         if (strictViewport !== undefined) sc.s.strictViewport = strictViewport;
         if (viewport) sc.s.viewport = viewport;
         mobileChanged = mobile !== undefined && mobile !== !!sc.s.mobile;
@@ -974,7 +983,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         const t0 = Date.now();
         const current = url ?? (await ping(sc)).tab?.url ?? "";
         ctx.admission?.check(current, overrideCooldown);
-        const navigationGate = ctx.policy.evaluate({ url: current, actionClass: actionClass ?? (Object.keys(safeHeaders ?? {}).some((k) => /authorization|api-key|token|secret/i.test(k)) ? "credential_entry" : undefined) });
+        const navigationGate = ctx.policy.evaluate({ url: current, actionClass: navigationClass });
         if (!navigationGate.allow) throw new AbError("POLICY_BLOCKED", navigationGate.reason, { recovery: POLICY_ADVICE, dispatch: "not_dispatched" });
         if (overrideCooldown) ctx.audit.log("host.override", { tool: call.tool, url: current });
         let nav;
@@ -1126,7 +1135,6 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
       if (name === undefined && role === undefined && ref === undefined)
         throw new AbError("BAD_REQUEST", "say which element: name (and optionally role), or ref");
       if (action === "drag" && !to) throw new AbError("BAD_REQUEST", "drag needs `to`: an element {name, role} or {ref}, or a point {x, y}");
-      await ensureBrowser(45_000);
       const sc = scope(call, args, "tab");
 
       return inSession(call, sc, async () => {
@@ -1448,6 +1456,9 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
     if (args.encoding === "json") { try { JSON.parse(args.body!); } catch { throw new AbError("BAD_REQUEST", "body is not valid JSON"); } }
     if ((args.mode === "form" || args.encoding === "multipart") && headers["content-type"]) throw new AbError("BAD_REQUEST", "Chrome manages the form/multipart Content-Type and boundary");
     const sc = scope(call, args, "tab");
+    ctx.admission?.check(args.url, args.overrideCooldown);
+    const gate = ctx.policy.evaluate({ url: args.url, actionClass: args.actionClass ?? (headers.authorization ? "credential_entry" : undefined) });
+    if (!gate.allow) throw new AbError("POLICY_BLOCKED", gate.reason, { recovery: POLICY_ADVICE, dispatch: "not_dispatched" });
     return inSession(call, sc, async () => {
       ctx.admission?.check(args.url, args.overrideCooldown);
       const current = await ping(sc);
@@ -1483,7 +1494,10 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
 
   tool("browser_downloads", "Inspect downloads by ID, or deliberately list recent browser-wide downloads. Attribution to a tab is unknown; files persist after Incognito closes. Does not change locations or open files.", {
     id: z.number().int().nonnegative().optional(), limit: z.number().int().min(1).max(100).default(20),
-  }, async (args) => ctx.bridge.request<Record<string, unknown>>("engine.downloads", args));
+  }, async (args) => {
+    await ensureBrowser();
+    return ctx.bridge.request<Record<string, unknown>>("engine.downloads", args);
+  });
 
   tool("browser_status", "[advanced] Report whether the agent Chrome / bridge is connected. Prefer `agent_browser_status`.", {}, async () => ({
     bridgeConnected: ctx.bridge.connected(),
@@ -1556,6 +1570,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
     async (args, call) => {
       if (!args.url === !args.action) throw new AbError("BAD_REQUEST", "give exactly one of url or action");
       const sc = scope(call, args, args.url ? "open" : "tab");
+      if (args.url) ctx.admission?.check(args.url);
       if (DRY_RUN) return { dryRun: true, wouldNavigate: args.url ?? args.action };
       return inSession(call, sc, async () => {
         const destination = args.url ?? (await ping(sc)).tab?.url ?? "";
@@ -1570,7 +1585,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
         const r = await sc.req("engine.navigate", args.url ? { url: args.url } : { action: args.action });
         ctx.audit.log("tool.browser_navigate", { target: args.url ?? args.action, tabId: call.tabId });
         return r;
-      });
+      }, args.url && args.tabId === undefined ? () => choosePrivacy(call, sc.s, undefined, false, false, true) : undefined);
     },
   );
 
@@ -1790,6 +1805,9 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
       const s = ctx.sessions.get(r, ctx.client.id);
       call.session = s;
       return ctx.sessions.withLock(s.key, async () => {
+      if (s.legacy && incognito !== undefined) throw new AbError("BAD_REQUEST", "Incognito requires a named/private session");
+      if (action === "new" && url) ctx.admission?.check(url, args.overrideCooldown);
+      await ensureBrowser();
       type TabList = { tabs: { tabId: number; windowId: number; [k: string]: unknown }[]; activeTabId?: number; createdTabId?: number };
       const list = () => ctx.bridge.request<TabList>("engine.tabs", { action: "list" });
       const label = (t: { tabId: number; windowId: number }) => {
@@ -2064,6 +2082,7 @@ export function registerTools(server: McpServer, ctx: Ctx): void {
       const sc: Scope = args.job
         ? { s: ctx.sessions.jobSession(args.job), req: (m, p = {}, t) => ctx.bridge.request(m, { ...p, tabId: jobTab }, t) }
         : scope(call, args, "tab");
+      await ensureBrowser();
       if (!args.job) ctx.sessions.touch(sc.s, ctx.client.id);
       if (args.action === "clear") {
         ctx.audit.log("tool.browser_network", { action: "clear", tabId: call.tabId });

@@ -55,7 +55,7 @@ createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
 
   if (url.pathname === "/health" && req.method === "GET") {
-    return send(res, 200, { ok: true });
+    return send(res, 200, { ok: true, wakeMarker: true });
   }
 
   let body = {};
@@ -69,11 +69,15 @@ createServer(async (req, res) => {
 
   try {
     if (url.pathname === "/launch-chrome" && req.method === "POST") {
-      const child = spawn(resolve(root, "bin/launch-chrome.sh"), [], {
+      const marker = body.marker;
+      if (marker !== undefined && (typeof marker !== "string" || !/^http:\/\/127\.0\.0\.1:\d{1,5}\/wake\/[0-9a-f-]{36}$/.test(marker)))
+        return send(res, 400, { error: "invalid wake marker" });
+      const child = spawn(resolve(root, "bin/launch-chrome.sh"), marker ? [marker] : [], {
         cwd: root,
         detached: true,
         stdio: "ignore",
       });
+      child.on("error", (e) => log("spawn.launch_chrome_error", { message: e.message }));
       child.unref();
       log("spawn.launch_chrome", { pid: child.pid });
       return send(res, 200, { ok: true, pid: child.pid });

@@ -27,7 +27,7 @@ test("registration checks both preference files and distinguishes missing from u
 function harness() {
   let calls = 0;
   const state = { chromePid: 7, registration: "enabled", halted: false };
-  const bridge = { up: false, connectionEpoch: 0, connected() { return this.up; }, async waitForConnection() { return this.up; } };
+  const bridge = { up: false, healthyEpoch: 0, connected() { return this.up; }, async waitForConnection() { return this.up; } };
   const recovery = new BrowserRecovery(bridge, () => ({ ...state }), async () => ({ via: "window", wakeId: ++calls }));
   return { bridge, state, recovery, calls: () => calls };
 }
@@ -51,7 +51,7 @@ test("concurrent and repeated calls share one failed wake; new connection permit
   assert.equal(r.filter((x) => x.attempted).length, 1);
   assert.ok(r.every((x) => x.state === "failed"));
   assert.equal((await h.recovery.ensure(10_000)).state, "suppressed");
-  h.bridge.connectionEpoch++;
+  h.bridge.healthyEpoch++;
   assert.equal((await h.recovery.ensure(10_000)).state, "failed");
   assert.equal(h.calls(), 2);
 });
@@ -64,4 +64,30 @@ test("a launch creating a new PID does not open a second window in the same outa
   });
   assert.equal((await recovery.ensure(10_000)).wake.via, "launch");
   assert.equal((await recovery.ensure(10_000)).state, "suppressed");
+});
+
+
+test("a short caller can time out without canceling a shared recovery", async () => {
+  const state = { chromePid: 7, registration: "enabled", halted: false };
+  let calls = 0, finish;
+  const gate = new Promise((r) => { finish = r; });
+  const bridge = { connected: () => false, waitForConnection: async (ms) => ms === 1 ? false : gate };
+  const recovery = new BrowserRecovery(bridge, () => state, async () => ({ via: "window", wakeId: ++calls }), { graceMs: 1, wakeMs: 500 });
+  const short = recovery.ensure(5);
+  const long = recovery.ensure(1000);
+  assert.equal((await short).state, "waiting");
+  assert.equal(recovery.status().recoveryStage, "waiting_for_worker");
+  finish(true);
+  assert.equal((await long).state, "connected");
+  assert.equal(calls, 1);
+});
+
+test("one brief connection cannot grant another wake budget", async () => {
+  const h = harness();
+  assert.equal((await h.recovery.ensure(1000)).state, "failed");
+  h.bridge.up = true;
+  assert.equal((await h.recovery.ensure(1000)).state, "connected");
+  h.bridge.up = false;
+  assert.equal((await h.recovery.ensure(1000)).state, "suppressed");
+  assert.equal(h.calls(), 1);
 });

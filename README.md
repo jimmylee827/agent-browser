@@ -54,12 +54,14 @@ Most of it an agent can do itself; one step only a person can.
 
 ### When it is down
 
-1. `agent_browser_status`. If `staleBuild` is true: `agent_browser_ensure_running({restartIfStale: true})`.
-2. `agent_browser_ensure_running`.
-3. Still failing: the error's `code` and `humanAction` say what is wrong. Tell
-   the person in one sentence, and record the step as not done (carry the
-   result's `degraded` entries into the final report) — never report a page
-   that was not reached as empty.
+A valid browser request (for example `agent_browser_visit({url})`) starts or
+wakes the existing Agent Chrome profile as needed. You can close its window or
+quit it manually; the next request that needs Chrome handles startup. There is
+no new idle keep-open watchdog. `agent_browser_status` and `npm run doctor`
+only report state, and `agent_browser_ensure_running` is an optional explicit
+preflight. If the extension is disabled or missing, follow the reported human
+step. If startup fails, check the recovery result; do not repeatedly open
+windows or replay an action that might already have been sent.
 
 ## Install
 

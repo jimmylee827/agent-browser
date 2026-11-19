@@ -162,6 +162,54 @@ test("single action distinguishes foreground, selection, weak mutation and route
   assert.equal(tie.data.candidates.length, 2);
 });
 
+test("a direct MCP visit starts closed Agent Chrome without a separate wake or extra window", { skip }, async () => {
+  const C = await h.client(`cold-${Date.now()}`);
+  const previous = await C("agent_browser_visit", { url: h.url("probe-nav"), snapshot: "none" });
+  assert.equal(previous.isError, false, JSON.stringify(previous.data));
+  assert.ok(await h.quitAgentChrome(), "isolated Chrome should stop");
+  const d = await C("agent_browser_status");
+  assert.equal(d.data.ready, false);
+  assert.equal(d.data.chromeRunning, false);
+  assert.equal((await C("browser_observe", { session: "no-page-yet" })).data.code, "NO_SESSION_TAB");
+  assert.equal((await C("agent_browser_status")).data.chromeRunning, false, "status and invalid page request do not wake");
+  const url = h.url("probe-nav");
+  const r = await C("agent_browser_visit", { url, snapshot: "none", text: true });
+  assert.equal(r.isError, false, JSON.stringify(r.data));
+  assert.equal(r.data.url, url);
+  assert.match(r.data.text, /Header probe/);
+  assert.match(r.data.warning, /previous session tab was closed/);
+  const tabs = (await C("browser_tabs")).data.tabs;
+  assert.equal(new Set(tabs.map((t) => t.windowId)).size, 1, JSON.stringify(tabs));
+  assert.equal(tabs.length, 1, JSON.stringify(tabs));
+  const after = await C("browser_ping");
+  assert.equal(after.data.tab?.url, url);
+  const cli = spawnSync(process.execPath, ["scripts/ab.mjs", "status", "--json"], { env: { ...process.env, AB_CONTROL_PORT: new URL(h.base).port }, encoding: "utf8" });
+  assert.equal(cli.status, 0, cli.stderr);
+  assert.equal(JSON.parse(cli.stdout).ready, true);
+});
+
+
+test("a direct CLI visit reopens Agent Chrome after its last window is closed", { skip }, async () => {
+  // Only the isolated Chrome profile is connected. Use its browser close
+  // operation, not session release (which intentionally parks the last tab).
+  const C = await h.client(`windowless-${Date.now()}`);
+  const tabs = (await C("browser_tabs")).data.tabs;
+  assert.equal(tabs.length, 1);
+  await C("browser_tabs", { session: "default", action: "close", tabId: tabs[0].tabId });
+  const url = h.url("probe-nav");
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const r = await promisify(execFile)(process.execPath, ["scripts/ab.mjs", "visit", "--url", url, "--json"], {
+    env: { ...process.env, AB_CONTROL_PORT: new URL(h.base).port }, timeout: 65_000,
+  });
+  const page = JSON.parse(r.stdout);
+  assert.equal(page.url, url, r.stdout);
+  const after = (await C("browser_tabs")).data.tabs;
+  assert.equal(after.length, 1, JSON.stringify(after));
+  assert.equal(after[0].url, url);
+  assert.equal((await C("agent_browser_status")).data.ready, true);
+});
+
 test("ordinary article is not blocked; static block pauses subsequent host actions", { skip }, async () => {
   const article = await A("agent_browser_visit", { url: h.url("block-article.html") });
   assert.notEqual(article.data.outcome, "blocked");

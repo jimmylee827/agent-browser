@@ -10,6 +10,7 @@ interface Pending {
   reject: (e: Error) => void;
   timer: NodeJS.Timeout;
   ws: WebSocket;
+  method: string;
 }
 
 /**
@@ -38,7 +39,16 @@ export class Bridge {
   private pending = new Map<string, Pending>();
   /** What the connected extension said it is. */
   extension?: { version?: string };
-  connectionEpoch = 0;
+  private usable?: WebSocket;
+  private proven?: WebSocket;
+  healthyEpoch = 0;
+
+  private markHealthy(ws: WebSocket): void {
+    if (this.usable === ws && this.connected() && this.proven !== ws) {
+      this.proven = ws;
+      this.healthyEpoch++;
+    }
+  }
 
   constructor(
     private cfg: AppConfig,
@@ -84,14 +94,23 @@ export class Bridge {
         }
         authed = true;
         this.client = ws;
-        this.connectionEpoch++;
+        this.usable = undefined;
         this.extension = msg.extension;
         this.audit.log("bridge.connected", { ip });
         // What the extension needs from the config: where console capture may
         // run, and what network capture records. It has no other way to read
         // config/default.json.
         ws.send(JSON.stringify({ type: "auth_ok", config: extensionConfig(this.cfg) }));
-        ws.on("message", (b) => this.onMessage(b.toString()));
+        ws.on("message", (b) => this.onMessage(ws, b.toString()));
+        // An existing, tab-independent operation works with older workers too.
+        // Authentication alone does not mean the worker can serve a request.
+        void this.send<{ allowed: boolean }>("engine.incognitoAccess", {}, 3500, ws).then((result) => {
+          if (this.client !== ws || ws.readyState !== WebSocket.OPEN) return;
+          if (typeof result?.allowed !== "boolean") { ws.close(1011, "worker probe failed"); return; }
+          this.usable = ws;
+          const stable = setTimeout(() => this.markHealthy(ws), 20_000);
+          stable.unref();
+        }).catch(() => { if (this.client === ws) ws.close(1011, "worker probe failed"); });
 
         // Keep the MV3 service worker alive.
         //
@@ -111,6 +130,7 @@ export class Bridge {
         ws.on("close", () => {
           clearInterval(heartbeat);
           if (this.client === ws) this.client = undefined;
+          if (this.usable === ws) this.usable = undefined;
           this.audit.log("bridge.disconnected", {});
           // Nothing will ever answer a request sent on this socket. Fail them
           // now instead of leaving each to its 30s timeout — that is what made
@@ -129,7 +149,7 @@ export class Bridge {
     });
   }
 
-  private onMessage(raw: string): void {
+  private onMessage(ws: WebSocket, raw: string): void {
     let msg: { id?: string; ok?: boolean; result?: unknown; error?: string; code?: string; detail?: Record<string, unknown> };
     try {
       msg = JSON.parse(raw);
@@ -138,11 +158,19 @@ export class Bridge {
     }
     if (!msg.id) return;
     const p = this.pending.get(msg.id);
-    if (!p) return;
+    if (!p || p.ws !== ws) return;
     this.pending.delete(msg.id);
     clearTimeout(p.timer);
-    if (msg.ok) p.resolve(msg.result);
-    else {
+    if (msg.ok) {
+      if (p.method === "engine.ping") {
+        const page = msg.result as { engine?: { pong?: boolean; url?: string } } | undefined;
+        const url = page?.engine?.url;
+        // A real page answering proves the recovered browser served work,
+        // even if the person closes it again before the idle grace expires.
+        if (page?.engine?.pong === true && url && !url.startsWith(`http://127.0.0.1:${this.cfg.bridge.controlPort}/wake/`)) this.markHealthy(ws);
+      }
+      p.resolve(msg.result);
+    } else {
       // Keep the engine's code and detail: callers branch on them.
       const err = new Error(msg.error ?? "engine error") as Error & { code?: string; detail?: Record<string, unknown> };
       if (msg.code) err.code = msg.code;
@@ -157,7 +185,7 @@ export class Bridge {
   }
 
   connected(): boolean {
-    return !!this.client && this.client.readyState === WebSocket.OPEN;
+    return !!this.usable && this.client === this.usable && this.usable.readyState === WebSocket.OPEN;
   }
 
   /**
@@ -200,27 +228,34 @@ export class Bridge {
     }
   }
 
-  private send<T>(method: string, params: Record<string, unknown>, timeoutMs: number): Promise<T> {
-    if (this.halted()) {
+  private send<T>(method: string, params: Record<string, unknown>, timeoutMs: number, probeSocket?: WebSocket): Promise<T> {
+    if (!probeSocket && this.halted()) {
       this.audit.log("bridge.halted", { method });
       return Promise.reject(
         Object.assign(new Error("HALTED: kill switch active — the user stopped all browser actions"), { code: "HALTED" }),
       );
     }
-    if (!this.connected()) {
+    if (!probeSocket && !this.connected()) {
       return Promise.reject(
-        Object.assign(new Error("bridge not connected: the agent browser is not running or its extension is not attached"), { code: "BRIDGE_DOWN" }),
+        Object.assign(new Error("bridge not connected: the agent browser is not running or its extension is not attached"), { code: "BRIDGE_DOWN", detail: { dispatch: "not_dispatched", bridgeNotSent: true } }),
       );
     }
     const id = randomUUID();
+    const serialized = JSON.stringify({ id, method, params });
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(Object.assign(new Error(`bridge request timeout: ${method}`), { code: "BRIDGE_DOWN" }));
       }, timeoutMs);
-      const ws = this.client!;
-      this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer, ws });
-      ws.send(JSON.stringify({ id, method, params }));
+      const ws = probeSocket ?? this.usable!;
+      this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer, ws, method });
+      const sendFailed = (error: Error) => {
+        if (!this.pending.delete(id)) return;
+        clearTimeout(timer);
+        reject(Object.assign(new Error(`bridge send failed: ${error.message}`), { code: "BRIDGE_DOWN" }));
+      };
+      try { ws.send(serialized, (error) => { if (error) sendFailed(error); }); }
+      catch (e) { sendFailed(e as Error); }
     });
   }
 }

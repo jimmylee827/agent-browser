@@ -516,3 +516,10 @@ Never edit it without their yes, and never relabel an action to get past it.
 - Don't create, read or echo a secret, and don't put a password, code or card value in a step, a command or the chat: a step names a secret the user approved, and nothing else.
 - Don't copy recorded bodies into a report wholesale: take the fields the task needs. They can hold personal data the redaction does not know is personal.
 - Don't expect `isTrusted:true` events from synthetic input. A small minority of hardened sites gate on it; if one rejects the click, the tool surfaces the error rather than degrading stealth.
+
+### Request-time startup
+
+Use `agent_browser_visit({url})` directly. The browser-dependent tools start
+or wake Agent Chrome on demand; it is fine if the person closed it. Status is
+read-only and explicit ensure is optional. Respect a human-action result or
+an exhausted wake attempt. Never replay a possibly dispatched action.

@@ -1,4 +1,6 @@
 import { readFileSync, existsSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { AbError } from "./errors.js";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { homedir } from "node:os";
@@ -68,7 +70,13 @@ export const hostHelper = {
       return false;
     }
   },
-  launchChrome: () => call<{ ok: true; pid: number }>("/launch-chrome"),
+  async supportsWakeMarker(): Promise<boolean> {
+    try {
+      const r = await fetch(`http://${HOST}:${PORT}/health`, { signal: AbortSignal.timeout(1000) });
+      return r.ok && (await r.json() as { wakeMarker?: boolean }).wakeMarker === true;
+    } catch { return false; }
+  },
+  launchChrome: (marker: string) => call<{ ok: true; pid: number }>("/launch-chrome", { marker }),
 };
 
 /** Identify only the agent profile, not personal Chrome or the Testo collectors. */
@@ -94,12 +102,14 @@ export function browserRecovery(cfg: AppConfig, bridge: Bridge): BrowserRecovery
     recovery = new BrowserRecovery(bridge, () => ({ chromePid: chromePid(cfg.profileDir),
       registration: extensionRegistration(cfg.profileDir, cfg.extensionDir), halted: existsSync(resolve(cfg.stateDir, "HALT")) }), async (state) => {
       const wakeId = ++wakeSeq;
+      const marker = `http://127.0.0.1:${cfg.bridge.controlPort}/wake/${randomUUID()}`;
+      lastWake.set(bridge, { wakeId, marker, at: Date.now() });
       if (state.chromePid === null) {
-        await launchBrowser(cfg.profileDir);
-        return { via: "launch", wakeId };
+        await launchBrowser(cfg.profileDir, marker);
+        return { via: "launch", wakeId, marker };
       }
-      openChromeWindow(cfg.profileDir);
-      return { via: "window", wakeId };
+      openChromeWindow(cfg.profileDir, marker);
+      return { via: "window", wakeId, marker };
     });
     recoveries.set(bridge, recovery);
   }
@@ -107,8 +117,8 @@ export function browserRecovery(cfg: AppConfig, bridge: Bridge): BrowserRecovery
 }
 
 /** Open a window in the Chrome that is already running, without relaunching it. */
-export function openChromeWindow(profileDir: string): void {
-  const child = spawn(chromeBinary(), [`--user-data-dir=${profileDir}`, "--new-window", "about:blank"], {
+export function openChromeWindow(profileDir: string, marker: string): void {
+  const child = spawn(chromeBinary(), [`--user-data-dir=${profileDir}`, "--new-window", marker], {
     detached: true,
     stdio: "ignore",
   });
@@ -118,13 +128,14 @@ export function openChromeWindow(profileDir: string): void {
 
 /** Launch through exactly one route. If the helper request loses its reply, it
  * may already have opened a window, so do not fall back after sending it. */
-async function launchBrowser(profileDir: string): Promise<void> {
-  if (profileDir === resolve(homedir(), ".agent-chrome/profile") && hostHelper.available() && await hostHelper.health()) {
-    await hostHelper.launchChrome();
+async function launchBrowser(profileDir: string, marker: string): Promise<void> {
+  if (profileDir === resolve(homedir(), ".agent-chrome/profile") && hostHelper.available() && await hostHelper.supportsWakeMarker()) {
+    await hostHelper.launchChrome(marker);
     return;
   }
-  const child = spawn(resolve(repoRoot, "bin/launch-chrome.sh"), [], {
-    cwd: repoRoot,
+  const script = process.env.AB_CHROME_LAUNCH_SCRIPT ?? resolve(repoRoot, "bin/launch-chrome.sh");
+  const child = spawn(script, [marker], {
+    cwd: dirname(dirname(script)),
     env: { ...process.env, AB_PROFILE_DIR: profileDir },
     detached: true,
     stdio: "ignore",
@@ -133,47 +144,33 @@ async function launchBrowser(profileDir: string): Promise<void> {
   child.unref();
 }
 
-// Wake-created spare windows may be adopted exactly once.
-let spare: { tabId: number; at: number; wakeId: number } | null = null;
+// Only adopt the tab explicitly opened for this wake, never a guess based on
+// tab IDs or a user's blank window. An older helper may not support a marker.
+const lastWake = new WeakMap<Bridge, { wakeId: number; marker: string; at: number }>();
 let wakeSeq = 0;
-const SPARE_MS = 30_000;
-/** Wakes whose spare has been armed or claimed already: one window, one claim. */
-const settled = new Set<number>();
-const settle = (id: number) => {
-  settled.add(id);
-  // A daemon runs for weeks; only recent wakes can still be claimed.
-  if (settled.size > 64) for (const old of settled) if (old <= id - 64) settled.delete(old);
-};
-
-/** Record the blank window a wake just opened, for one session to move into. */
-export async function noteSpareWindow(
-  tabs: { tabId: number; url: string; windowId: number }[],
-  wakeId: number,
-  owned: (tabId: number) => boolean,
-): Promise<void> {
-  if (settled.has(wakeId)) return;
-  const perWindow = new Map<number, { tabId: number; url: string }[]>();
-  for (const t of tabs) perWindow.set(t.windowId, [...(perWindow.get(t.windowId) ?? []), t]);
-  // A lone blank tab no session holds; the newest one is the wake's (Chrome
-  // numbers tabs in the order it makes them).
-  const blank = [...perWindow.values()]
-    .filter((g) => g.length === 1 && !owned(g[0].tabId) && /^(chrome:\/\/(newtab|new-tab-page)\/?|about:blank|)$/.test(g[0].url))
-    .map((g) => g[0].tabId)
-    .sort((a, b) => b - a)[0];
-  if (blank === undefined) return;
-  settle(wakeId);
-  spare = { tabId: blank, at: Date.now(), wakeId };
+export async function takeWakeTab(bridge: Bridge, owned: (tabId: number) => boolean): Promise<number | undefined> {
+  const last = lastWake.get(bridge);
+  if (!last || Date.now() - last.at > 90_000) return;
+  const list = await bridge.request<{ tabs: { tabId: number; url: string; windowId: number }[] }>("engine.tabs", { action: "list" }).catch(() => null);
+  if (lastWake.get(bridge) !== last) return;
+  const tab = list?.tabs.find((t) => t.url === last.marker && !owned(t.tabId) &&
+    list.tabs.filter((x) => x.windowId === t.windowId).length === 1);
+  if (!tab) return;
+  lastWake.delete(bridge);
+  return tab.tabId;
 }
 
-/** Claim the spare tab — once per wake, and only for the caller that woke it. */
-export function takeSpareWindow(wakeId: number): number | undefined {
-  if (!spare || spare.wakeId !== wakeId) return undefined;
-  const { tabId, at } = spare;
-  spare = null;
-  settle(wakeId);
-  return Date.now() - at > SPARE_MS ? undefined : tabId;
+export async function requireBrowser(cfg: AppConfig, bridge: Bridge, timeoutMs = 48_000) {
+  if (bridge.connected() && !existsSync(resolve(cfg.stateDir, "HALT"))) return { state: "connected" as const };
+  const recovery = browserRecovery(cfg, bridge);
+  const result = await recovery.ensure(timeoutMs);
+  if (result.state === "connected") return result;
+  const human = result.state === "human" || result.state === "suppressed";
+  const code = result.state === "halted" ? "HALTED" : result.state === "human" ? "EXTENSION_NOT_READY" : "BRIDGE_DOWN";
+  throw new AbError(code, result.advice ?? "Agent Browser did not connect", {
+    recovery: result.advice, readiness: recovery.status(),
+    ...(human ? { agentCanFix: false, humanAction: result.advice } : {}),
+  });
 }
-
-// ---------------------------------------------------------------------------
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
